@@ -14,10 +14,6 @@ from .patch_core import promote_to_iterable
 import wrapt
 
 
-__all__ = [
-    "conv2d_wrapper"
-]
-
 
 
 from modulus.distributed.shard_utils.patch_core import (
