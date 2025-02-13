@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retraining recipe for DoMINO from a pretrained model checkpoint
 - Prototype support for domain parallelism of using ShardTensor (new).
 - Enable DeviceMesh initialization via DistributedManager.
+- Added Datacenter CFD use case.
 
 ### Changed
 
@@ -25,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Moved non-dimensionaliztion out of domino datapipe to datapipe in domino example
 - Updated utils in `modulus.launch.logging` to avoid unnecessary `wandb` and `mlflow` imports
 - Moved to experiment-based Hydra config in Lagrangian-MGN example
+- Make data caching optional in `MeshDatapipe`
 
 ### Deprecated
 
@@ -45,7 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Moved pytz and nvtx to optional
 - Update the base image for the Dockerfile
 - Introduce Multi-Storage Client (MSC) as an optional dependency.
-- Introduce `wrapt` as an optional dependency, needed when using ShardTensor's automatic domain parallelism
+- Introduce `wrapt` as an optional dependency, needed when using
+  ShardTensor's automatic domain parallelism
 
 ## [0.9.0] - 2024-12-04
 

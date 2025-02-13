@@ -14,11 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ruff: noqa: F401
-
-from .conv_patches import (
-    conv1d_wrapper,
-    conv2d_wrapper,
-    conv3d_wrapper,
-)
-from .natten_patches import na2d_wrapper
+hydra:
+  job:
+    chdir: True
+  run:
+    dir: ./outputs
