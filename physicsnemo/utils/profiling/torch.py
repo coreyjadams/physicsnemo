@@ -43,7 +43,6 @@ class TorchProfilerConfig:
     name: str = "torch"
     torch_prof_activities: Optional[Tuple[ProfilerActivity, ...]] = None
     record_shapes: bool = True
-    profile_memory: bool = True
     with_stack: bool = False
     profile_memory: bool = True
     with_flops: bool = True

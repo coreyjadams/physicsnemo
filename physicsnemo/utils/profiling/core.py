@@ -21,8 +21,6 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from physicsnemo.distributed import DistributedManager
-
 
 class PhysicsNeMoProfilerWrapper(ContextDecorator):
     """
@@ -197,6 +195,8 @@ class PhysicsNeMoProfilerWrapper(ContextDecorator):
             Path: The created output directory path
         """
         out_dir = top / Path(self._name)
+        # This is here to prevent circular import:
+        from physicsnemo.distributed import DistributedManager
 
         # If the model is distributed, control the location of the output:
         if DistributedManager.is_initialized():
