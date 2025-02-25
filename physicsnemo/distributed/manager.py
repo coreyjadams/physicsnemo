@@ -121,6 +121,8 @@ class DistributedManager(object):
             obj._global_mesh = None  # Lazy initialized right when it's first needed
         if not hasattr(obj, "_mesh_dims"):
             obj._mesh_dims = {}  # Dictionary mapping axis names to sizes
+        if not hasattr(obj, "_mesh_groups"):
+            obj._mesh_groups = {}  # Used to cache  groups for multidim mesh access
 
         return obj
 
@@ -506,6 +508,34 @@ class DistributedManager(object):
         self._mesh_dims = {key: val for key, val in zip(mesh_dim_names, mesh_shape)}
 
         return self._global_mesh
+
+    def get_mesh_group(self, mesh: dist.DeviceMesh) -> dist.ProcessGroup:
+        """
+        Get the process group for a given mesh.
+
+        Creating a group is an expensive operation, so we cache the result manually.
+
+        We hash the mesh and use that as the key.
+        """
+
+        key = hash(mesh)
+
+        if key in self._mesh_groups.keys():
+            return self._mesh_groups[key]
+        else:
+
+            if mesh.ndim != 1:
+                # We need to get all ranks in this mesh and spawn a group.
+                # The mesh.mesh object is a GPU tensor and using it will block.
+                ranks = mesh.mesh.cpu()
+                ranks = list(ranks.flatten().tolist())
+                group = dist.new_group(ranks=ranks, use_local_synchronization=True)
+                self._mesh_groups[key] = group
+                return group
+
+            else:
+                self._mesh_groups[key] = mesh.get_group()
+                return mesh.get_group()
 
     @staticmethod
     def setup(
