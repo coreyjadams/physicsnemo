@@ -38,8 +38,8 @@ from physicsnemo.distributed._shard_redistribute import (
 from physicsnemo.distributed._shard_tensor_spec import (
     ShardTensorSpec,
     _infer_shard_tensor_spec_from_local_chunks,
+    _stride_from_contiguous_shape_C_style,
 )
-from physicsnemo.distributed.utils import compute_split_shapes, split_tensor_along_dim
 
 
 class _ToTorchTensor(torch.autograd.Function):
@@ -94,11 +94,16 @@ class _ToTorchTensor(torch.autograd.Function):
         shard_tensor_spec = ctx.shard_tensor_spec
         mesh = shard_tensor_spec.mesh
 
-        grad_placements = ctx.grad_placements or shard_tensor_spec.placements
+        if ctx.grad_placements is not None:
+            grad_placements = ctx.grad_placements
+            grad_sharding_shapes = shard_tensor_spec.sharding_shapes
+        else:
+            grad_placements = shard_tensor_spec.placements
+            grad_sharding_shapes = "infer"
 
         # Generate a spec based on grad outputs and the expected placements:
         grad_tensor_spec = _infer_shard_tensor_spec_from_local_chunks(
-            grad_output, mesh, grad_placements
+            grad_output, mesh, grad_placements, grad_sharding_shapes
         )
 
         return (
@@ -125,6 +130,7 @@ class _FromTorchTensor(torch.autograd.Function):
         local_input: torch.Tensor,
         device_mesh: DeviceMesh,
         placements: Tuple[Placement, ...],
+        sharding_shapes: Union[str, Dict[int, List[Tuple[int, ...]]]] = "even",
     ) -> "ShardTensor":
         """Convert a local torch.Tensor to a ShardTensor in forward pass.
 
@@ -133,17 +139,24 @@ class _FromTorchTensor(torch.autograd.Function):
             local_input: Local tensor to convert to ShardTensor
             device_mesh: Device mesh specifying process groups
             placements: Tuple of placement rules for sharding
+            sharding_shapes: Controls how shard tensor spec is generated:
+                - "blocking_infer": Use blocking collective communication to infer shapes
+                - "chunk": Use torch.chunk shapes to infer shapes from global shape (no communication)
+                - "infer": Assume shapes are not even, but defer inference until needed.
+                    Note that infer will launch async RPC calls to infer the shapes, but won't
+                    block on them until they are called upon.
+                - Manual dict mapping mesh dim to list of shard shapes: Use provided shapes.  Must pass on each rank!
 
         Returns:
             ShardTensor constructed from the local input tensor
         """
         ctx.previous_placement = placements
         ctx.previous_mesh = device_mesh
-        # This function is simpler than the corresponding DTensor implementation on the surface
-        # because under the hood, we always do checks here.
 
+        # This function is simpler than the corresponding DTensor implementation on the surface
+        # because under the hood, we have some logic here to infer the sharding shapes.
         shard_tensor_spec = _infer_shard_tensor_spec_from_local_chunks(
-            local_input, device_mesh, placements
+            local_input, device_mesh, placements, sharding_shapes
         )
 
         shard_tensor = ShardTensor(
@@ -179,7 +192,7 @@ class _FromTorchTensor(torch.autograd.Function):
         if grad_output.placements != previous_placement:
             raise RuntimeError("Resharding gradients not yet implemented")
 
-        return grad_output.to_local(), None, None
+        return grad_output.to_local(), None, None, None
 
 
 class ShardTensor(DTensor):
@@ -299,11 +312,9 @@ class ShardTensor(DTensor):
         return f"ShardTensor(local_tensor={self._local_tensor}, device_mesh={self._spec.mesh}, placements={self._spec.placements})"
 
     @classmethod
-    def from_dtensor(
-        cls, dtensor: DTensor, force_sharding_inference: bool = False
-    ) -> "ShardTensor":
+    def from_dtensor(cls, dtensor: DTensor) -> "ShardTensor":
         """
-        Convert a DTensor to a ShardTensor.
+        Convert a DTensor to a ShardTensor.  We assume the DTensor is properly constructed.
 
         Args:
             dtensor: DTensor to convert
@@ -311,79 +322,27 @@ class ShardTensor(DTensor):
         Returns:
             Equivalent ShardTensor
         """
+        # Always ensure sharding is turned on:
+        cls._enable_shard_patches = True
 
         # DTensor is locked to sharding a tensor according to chunk format.
         # We can use that to infer sharding sizes with no communication.
 
-        mesh = dtensor._spec.mesh
-        placements = dtensor._spec.placements
+        # Create the spec by inferring the sharding sizes from the DTensor:
+        spec = _infer_shard_tensor_spec_from_local_chunks(
+            dtensor._local_tensor,
+            dtensor._spec.mesh,
+            dtensor._spec.placements,
+            sharding_shapes="chunk",
+            global_shape=dtensor.shape,
+        )
 
-        if force_sharding_inference:
-            shard_tensor_spec = _infer_shard_tensor_spec_from_local_chunks(
-                dtensor._local_tensor, dtensor._spec.mesh, dtensor._spec.placements
-            )
-            return ShardTensor.__new__(
-                cls,
-                local_tensor=dtensor._local_tensor,
-                spec=shard_tensor_spec,
-                requires_grad=dtensor.requires_grad,
-            )
-        else:
-            temp_sharding_sizes = {}
-            for i in range(mesh.ndim):
-                if isinstance(placements[i], Shard):
-                    # Compute the chunk size for this dimension:
-                    input_dim = dtensor.shape[placements[i].dim]
-                    chunked_shapes = compute_split_shapes(input_dim, mesh.size(i))
-                    # This needs to be a tuple of torch.Size
-
-                    temp_sharding_sizes[i] = chunked_shapes
-
-            # To create the full, final sharding shapes, we update the global shape with
-            sharding_sizes = {}
-            # Initialize sharding_sizes with same keys as temp_sharding_sizes
-            # Each value is a list of torch.Size equal to mesh size for that dimension
-            for mesh_dim in temp_sharding_sizes.keys():
-                placement = placements[mesh_dim]
-                # We should not have the mesh dim in this dict if it wasn't sharded above:
-                tensor_dim = placement.dim
-
-                sharding_sizes[mesh_dim] = [
-                    torch.Size(dtensor.shape) for _ in temp_sharding_sizes[mesh_dim]
-                ]
-                # For each shard along this mesh dimension
-                for i, shard_size in enumerate(temp_sharding_sizes[mesh_dim]):
-                    # Replace size at sharded dim with actual shard size
-                    updated_shard_size = torch.Size(
-                        tuple(
-                            (
-                                shard_size if j == tensor_dim else s
-                                for j, s in enumerate(sharding_sizes[mesh_dim][i])
-                            )
-                        )
-                    )
-                    sharding_sizes[mesh_dim][i] = updated_shard_size
-
-            # Cast to tuples:
-            for mesh_dim in temp_sharding_sizes.keys():
-                sharding_sizes[mesh_dim] = tuple(sharding_sizes[mesh_dim])
-
-            spec = ShardTensorSpec(
-                mesh=dtensor._spec.mesh,
-                placements=dtensor._spec.placements,
-                tensor_meta=dtensor._spec.tensor_meta,
-                _sharding_sizes=sharding_sizes,  # Leave this to none for a lazy init and assume it's not breaking to make this cast.
-                _local_shape=dtensor._local_tensor.shape,
-            )
-
-            cls._enable_shard_patches = True
-
-            return ShardTensor.__new__(
-                cls,
-                local_tensor=dtensor._local_tensor,
-                spec=spec,
-                requires_grad=dtensor.requires_grad,
-            )
+        return ShardTensor.__new__(
+            cls,
+            local_tensor=dtensor._local_tensor,
+            spec=spec,
+            requires_grad=dtensor.requires_grad,
+        )
 
     @classmethod
     @torch._disable_dynamo
@@ -400,6 +359,10 @@ class ShardTensor(DTensor):
         if func in cls._function_registry:
             return cls._function_registry[func](*args, **kwargs)
 
+        # We assume that if we reach this point, the operator has not been
+        # intercepted by a wrapper or in the registry.  So the DTensor
+        # default behavior is likely to be correct.
+
         dispatch_res = DTensor._op_dispatcher.dispatch(func, args, kwargs or {})
 
         # dispatch_res = ShardTensor._op_dispatcher.dispatch(func, args, kwargs or {})
@@ -407,13 +370,11 @@ class ShardTensor(DTensor):
         # Return a shard tensor instead of a dtensor.
         # ShardTensor inherits from DTensor and can lazy-init from for efficiency
         if isinstance(dispatch_res, DTensor):
-            return ShardTensor.from_dtensor(dispatch_res, force_sharding_inference=True)
+            return ShardTensor.from_dtensor(dispatch_res)
 
         if isinstance(dispatch_res, Iterable):
             return type(dispatch_res)(
-                ShardTensor.from_dtensor(d, force_sharding_inference=True)
-                if isinstance(d, DTensor)
-                else d
+                ShardTensor.from_dtensor(d) if isinstance(d, DTensor) else d
                 for d in dispatch_res
             )
 
@@ -424,7 +385,7 @@ class ShardTensor(DTensor):
         local_tensor: torch.Tensor,
         device_mesh: Optional[DeviceMesh] = None,
         placements: Optional[Sequence[Placement]] = None,
-        infer_shape: Optional[bool] = True,
+        sharding_shapes: Union[str, Dict[int, List[Tuple[int, ...]]]] = "infer",
     ) -> "ShardTensor":
         """
         Generate a new ShardTensor from local torch tensors. Uses
@@ -439,48 +400,44 @@ class ShardTensor(DTensor):
                 of the same rank and concatable across the mesh dimensions
             device_mesh: Target Device Mesh, if not specified will use the current mesh
             placements: Target placements, must have same number of elements as device_mesh.ndim
-            infer_shape: If False, assumes even distribution like DTensor. Default True.
-
+            sharding_shapes: Passed to _infer_shard_tensor_spec_from_local_chunks to control
+                how the sharding sizes are inferred.
         Returns:
             A new ShardTensor instance
         """
 
-        if infer_shape:
+        # this turns on shard patches globally for this process.
+        ShardTensor._enable_shard_patches = True
 
-            # This implementation follows the pytorch DTensor Implementation Closely.
-            device_mesh = device_mesh or _mesh_resources.get_current_mesh()
-            device_type = device_mesh.device_type
+        # This implementation follows the pytorch DTensor Implementation Closely.
+        device_mesh = device_mesh or _mesh_resources.get_current_mesh()
+        device_type = device_mesh.device_type
 
-            # convert the local tensor to desired device base on device mesh's device_type
-            if device_type != local_tensor.device.type and not local_tensor.is_meta:
-                local_tensor = local_tensor.to(device_type)
+        # convert the local tensor to desired device base on device mesh's device_type
+        if device_type != local_tensor.device.type and not local_tensor.is_meta:
+            local_tensor = local_tensor.to(device_type)
 
-            # set default placements to replicated if not specified
-            if placements is None:
-                placements = [Replicate() for _ in range(device_mesh.ndim)]
-            else:
-                placements = list(placements)
-                for idx, placement in enumerate(placements):
-                    # normalize shard dim to be positive
-                    if placement.is_shard():
-                        placement = cast(Shard, placement)
-                        if placement.dim < 0:
-                            placements[idx] = Shard(placement.dim + local_tensor.ndim)
-
-            # `from_local` is differentiable, and the gradient of the dist tensor this function
-            # created should flow back the gradients to the local_tensor, so we call an autograd
-            # function to construct the dist tensor instead.
-            ShardTensor._enable_shard_patches = True
-            return _FromTorchTensor.apply(  # pyre-ignore[16]: autograd func
-                local_tensor,
-                device_mesh,
-                tuple(placements),
-            )
+        # set default placements to replicated if not specified
+        if placements is None:
+            placements = [Replicate() for _ in range(device_mesh.ndim)]
         else:
-            ShardTensor._enable_shard_patches = True
-            return ShardTensor.from_dtensor(
-                DTensor.from_local(local_tensor, device_mesh, placements)
-            )
+            placements = list(placements)
+            for idx, placement in enumerate(placements):
+                # normalize shard dim to be positive
+                if placement.is_shard():
+                    placement = cast(Shard, placement)
+                    if placement.dim < 0:
+                        placements[idx] = Shard(placement.dim + local_tensor.ndim)
+
+        # `from_local` is differentiable, and the gradient of the dist tensor this function
+        # created should flow back the gradients to the local_tensor, so we call an autograd
+        # function to construct the dist tensor instead.
+        return _FromTorchTensor.apply(  # pyre-ignore[16]: autograd func
+            local_tensor,
+            device_mesh,
+            tuple(placements),
+            sharding_shapes,
+        )
 
     def offsets(self, mesh_dim: Optional[int] = None) -> List[int]:
         """
@@ -576,6 +533,9 @@ def scatter_tensor(
     global_src: int,
     mesh: DeviceMesh,
     placements: Tuple[Placement, ...],
+    global_shape: Optional[torch.Size] = None,
+    dtype: Optional[torch.dtype] = None,
+    requires_grad: bool = False,
 ) -> "ShardTensor":
     """
     Take a tensor from source rank and distribute it across devices on the mesh according to placements.
@@ -605,64 +565,60 @@ def scatter_tensor(
 
     is_src = dm.rank == global_src
 
-    # For multi-dimensional meshes, create a flattened process group
-    if mesh.ndim != 1:
-        global_ranks = mesh.mesh.flatten().tolist()
-        mesh_group = dist.new_group(ranks=global_ranks, use_local_synchronization=True)
-    else:
-        mesh_group = mesh.get_group()
+    # For multi-dimensional meshes, we use a flattened process group
+    mesh_group = dm.get_mesh_group(mesh)
 
     # Broadcast tensor metadata from source
-    axis_rank = dist.get_rank(mesh_group)
-    if dm.rank == global_src:
-        meta = [TensorMeta(tensor.shape, tensor.stride(), tensor.dtype)]
+    if global_shape is None or dtype is None:
+        if dm.rank == global_src:
+            meta = [TensorMeta(tensor.shape, tensor.stride(), tensor.dtype)]
+        else:
+            meta = [None]
+
+        dist.broadcast_object_list(meta, src=global_src, group=mesh_group)
+
+        local_meta = meta[0]
     else:
-        meta = [None]
+        stride = _stride_from_contiguous_shape_C_style(global_shape)
+        local_meta = TensorMeta(global_shape, stride, dtype)
 
-    dist.broadcast_object_list(meta, src=global_src, group=mesh_group)
-    dist.barrier(group=mesh_group)
-    local_meta = meta[0]
+    # This needs to be optimized, but I want to get the whole pipeline optimized first.
+    # This only gets done when scatter_tensor is called and it should be relatively small
+    # in full applications.
 
-    # Cast the shape to a list to be mutable:
-    local_shape = list(local_meta.shape)
+    # What isn't optimmized?  Broadcasting the full tensor when placement is likely
+    # Shard on at least one mesh dimension.  It would be more efficient to iteratively
+    # scatter along Shard dimensions.  BUT, the focus is on performance of full applications
+    # and this is a once-per-iteration cost.
 
-    if is_src:
-        chunks = [tensor]
-    else:
-        chunks = None
+    # Broadcast the tensor to all ranks
+    if tensor is None and not is_src:
+        # Tensor is allowed to be none if not on the root rank
+        tensor = torch.empty(local_meta.shape, dtype=local_meta.dtype, device=dm.device)
 
-    # Split tensor according to shard placements
-    for dim, placement in enumerate(placements):
-        if isinstance(placement, Shard):
-            tensor_dim = placement.dim
-            axis_rank = dist.get_rank(group=mesh.get_group(dim))
-            axis_size = dist.get_world_size(group=mesh.get_group(dim))
+    dist.broadcast(tensor, src=global_src, group=mesh_group)
 
-            sections = compute_split_shapes(local_shape[tensor_dim], axis_size)
-
-            if is_src:
-                new_chunks = []
-                for t in chunks:
-                    new_chunks += split_tensor_along_dim(t, tensor_dim, axis_size)
-                chunks = new_chunks
-            local_shape[tensor_dim] = sections[axis_rank]
-
-    # Convert the shape back to a tuple:
-    local_shape = tuple(local_shape)
-
-    # Allocate local tensor
-    local_chunk = torch.empty(
-        local_shape,
-        dtype=local_meta.dtype,
-        device=torch.device(f"cuda:{dm.local_rank}"),
+    # Create a fully-replicated spec:
+    spec = ShardTensorSpec(
+        mesh=mesh,
+        placements=[Replicate() for _ in range(mesh.ndim)],
+        tensor_meta=local_meta,
+        _sharding_sizes={},
     )
 
-    # Scatter chunks across mesh
-    dist.scatter(local_chunk, chunks, src=global_src, group=mesh_group)
-
-    # Construct ShardTensor from local tensor
-    return ShardTensor.from_local(
-        local_tensor=local_chunk,
-        device_mesh=mesh,
-        placements=placements,
+    # Make a "fully-replicated" tensor on all ranks:
+    st = ShardTensor.__new__(
+        ShardTensor,
+        local_tensor=tensor,
+        spec=spec,
+        requires_grad=requires_grad,
     )
+
+    # Redistribute the tensor to the desired placements:
+    st = st.redistribute(mesh, placements, async_op=False)
+    # This is an unoptimal step but is functional:
+    if requires_grad:
+        st = st.detach()
+        st.requires_grad = True
+
+    return st

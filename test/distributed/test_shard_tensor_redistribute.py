@@ -68,7 +68,10 @@ def shard_tensor_factory(mesh_names, mesh_sizes, requires_grad=False, uneven=Tru
     )
 
     st = ShardTensor.from_local(
-        raw_data, device_mesh=domain_mesh, placements=placements, infer_shape=True
+        raw_data,
+        device_mesh=domain_mesh,
+        placements=placements,
+        sharding_shapes="infer",
     )
     return st
 
@@ -132,8 +135,8 @@ def test_shard_tensor_reduction(data_parallel_size, domain_H, domain_W, op):
     if domain_H == 1 and domain_W == 1:
         pytest.skip("No point testing this without parallelism in the domain axes")
 
-    # if op == torch.mean:
-    # pytest.xfail("Mean reduction not yet supported for uneven tensor shapes")
+    if op == torch.mean:
+        pytest.xfail("Mean reduction not yet supported for uneven tensor shapes")
 
     remaining_gpus = num_gpus
     mesh_names = ["data_parallel"]
@@ -149,7 +152,7 @@ def test_shard_tensor_reduction(data_parallel_size, domain_H, domain_W, op):
         mesh_sizes.append(domain_W)
         remaining_gpus = int(remaining_gpus / domain_W)
 
-    verbose = False  # Change to True for debug
+    verbose = False
 
     torch.multiprocessing.set_start_method("spawn", force=True)
 
@@ -251,7 +254,7 @@ def test_shard_tensor_redistribute1d(data_parallel_size, domain_H, redistributio
     if case_name == "shard_to_shard" and len(mesh_sizes) <= 2:
         pytest.skip("Not enough dimensions for shard-to-shard test")
 
-    verbose = False  # Change to True for debug
+    verbose = False
 
     torch.multiprocessing.set_start_method("spawn", force=True)
 
@@ -334,7 +337,7 @@ def test_shard_tensor_redistribute2d(
     if case_name == "shard_to_shard" and len(mesh_sizes) <= 2:
         pytest.skip("Not enough dimensions for shard-to-shard test")
 
-    verbose = False  # Change to True for debug
+    verbose = False
 
     torch.multiprocessing.set_start_method("spawn", force=True)
 
@@ -345,8 +348,3 @@ def test_shard_tensor_redistribute2d(
         join=True,
         daemon=True,
     )
-
-
-if __name__ == "__main__":
-
-    test_shard_tensor_reduction(-1, 2, 2, torch.sum)

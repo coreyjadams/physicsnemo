@@ -206,7 +206,8 @@ class HaloPaddingConvND(torch.autograd.Function):
             )
 
         placements = stensor.placements
-        local_tensor = stensor.to_local()
+        # Don't track with autograd to get the local tensor:
+        local_tensor = stensor._local_tensor
 
         # Apply halo padding for each sharded dimension
         for mesh_dim in range(mesh.ndim):
@@ -353,7 +354,10 @@ class PartialConvND(torch.autograd.Function):
 
         # Wrap result in ShardTensor with specified distribution
         output = ShardTensor.from_local(
-            local_chunk, output_spec.mesh, output_spec.placements
+            local_chunk,
+            output_spec.mesh,
+            output_spec.placements,
+            sharding_shapes="infer",
         )
 
         ctx.requires_input_grad = inputs.requires_grad

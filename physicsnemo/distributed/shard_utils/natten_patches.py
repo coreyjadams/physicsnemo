@@ -248,8 +248,7 @@ class UnSliceHaloND(torch.autograd.Function):
         ctx,
         local_tensor: torch.Tensor,
         halo: tuple[int, ...],
-        mesh: torch.distributed.device_mesh.DeviceMesh,
-        placements: tuple[torch.distributed.tensor.placement_types.Placement, ...],
+        spec: "ShardTensorSpec",  # noqa F821
     ) -> "ShardTensor":
         """Forward pass to remove halo regions.
 
@@ -267,25 +266,29 @@ class UnSliceHaloND(torch.autograd.Function):
             ValueError: If halo size does not match mesh rank
         """
         # Save context for backward pass
+        ctx.spec = spec
         ctx.halo = halo
-        ctx.mesh = mesh
-        ctx.placements = placements
 
-        if len(halo) != mesh.ndim:
+        if len(halo) != spec.mesh.ndim:
             raise ValueError(
-                f"Halo size ({len(halo)}) must match mesh rank ({mesh.ndim})"
+                f"Halo size ({len(halo)}) must match mesh rank ({spec.mesh.ndim})"
             )
 
         # Remove halos along sharded dimensions
-        for mesh_dim in range(mesh.ndim):
-            if isinstance(placements[mesh_dim], Shard):
-                tensor_dim = placements[mesh_dim].dim
+        for mesh_dim in range(spec.mesh.ndim):
+            if isinstance(spec.placements[mesh_dim], Shard):
+                tensor_dim = spec.placements[mesh_dim].dim
                 local_tensor = halo_unpadding_1d(
-                    local_tensor, mesh, mesh_dim, tensor_dim, halo[mesh_dim]
+                    local_tensor, spec.mesh, mesh_dim, tensor_dim, halo[mesh_dim]
                 )
 
         # Convert to ShardTensor
-        stensor = ShardTensor.from_local(local_tensor, mesh, placements)
+        stensor = ShardTensor.from_local(
+            local_tensor,
+            spec.mesh,
+            spec.placements,
+            sharding_shapes=spec.sharding_sizes(),
+        )
         return stensor
 
     @staticmethod
@@ -303,9 +306,10 @@ class UnSliceHaloND(torch.autograd.Function):
             - Gradient tensor with halo regions added back
             - None for other inputs (halo, mesh, placements)
         """
-        mesh = ctx.mesh
+        mesh = ctx.spec.mesh
         halo = ctx.halo
-        placements = ctx.placements
+
+        placements = ctx.spec.placements
 
         # Configure padding parameters
         edge_padding_s = [0] * len(halo)
@@ -381,7 +385,7 @@ if natten_spec is not None:
             x = wrapped(lq, lk, lv, kernel_size, dilation)
 
             # Remove halos and convert back to ShardTensor
-            x = UnSliceHaloND.apply(x, halo, q._spec.mesh, q._spec.placements)
+            x = UnSliceHaloND.apply(x, halo, q._spec)
             return x
 
         else:
