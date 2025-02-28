@@ -41,6 +41,8 @@ from physicsnemo.distributed._shard_tensor_spec import (
     _stride_from_contiguous_shape_C_style,
 )
 
+aten = torch.ops.aten
+
 
 class _ToTorchTensor(torch.autograd.Function):
     """Autograd function to convert a ShardTensor to a regular PyTorch tensor.
@@ -355,13 +357,19 @@ class ShardTensor(DTensor):
     ) -> Union["ShardTensor", Iterable["ShardTensor"], object]:
         # Leverage DTensor Dispatch as much as possible, but, enable
         # the ability to operate on this output in the future:
-
         if func in cls._function_registry:
             return cls._function_registry[func](*args, **kwargs)
 
         # We assume that if we reach this point, the operator has not been
         # intercepted by a wrapper or in the registry.  So the DTensor
         # default behavior is likely to be correct.
+
+        if func == aten.view.default:
+            # For view, we need input tensors to be contiguous:
+            for arg in args:
+                if isinstance(arg, ShardTensor) or isinstance(arg, DTensor):
+                    if not arg._local_tensor.is_contiguous():
+                        arg._local_tensor = arg._local_tensor.contiguous()
 
         dispatch_res = DTensor._op_dispatcher.dispatch(func, args, kwargs or {})
 

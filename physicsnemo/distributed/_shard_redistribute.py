@@ -67,7 +67,6 @@ def _to_replicate_tensor(
         # Get the mesh for the group:
         mesh = current_spec.mesh
         group = mesh.get_group(mesh_dim)
-        dist.barrier()
 
         # Ensure contiguous data for the reduction:
         local_tensor = local_tensor.contiguous()
@@ -93,7 +92,7 @@ def _to_replicate_tensor(
         ]
         dist.all_gather(output, local_tensor, group=group)
 
-        return torch.cat(output, dim=tensor_dim)
+        return torch.cat(output, dim=tensor_dim).contiguous()
 
 
 def _select_slice_from_replicate(
@@ -516,7 +515,7 @@ class ShardRedistribute(torch.autograd.Function):
             target_spec = current_spec
 
         return shard_tensor.ShardTensor(
-            output,
+            output.contiguous(),
             target_spec,
             requires_grad=input.requires_grad,
         )
