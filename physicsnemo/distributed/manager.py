@@ -221,7 +221,7 @@ class DistributedManager(object):
             Name of desired mesh, by default None
         """
 
-        if name in self._global_mesh.axis_names:
+        if name in self._mesh_dims.keys():
             return self._global_mesh[name]
         elif name is None:
             return self._global_mesh
