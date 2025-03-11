@@ -397,7 +397,7 @@ def compute_sharding_sizes_from_chunking_global_shape(
     # Initialize shapes for all sharded dimensions, but using the global shape.
     # We will update next.
     sharding_sizes = {
-        mesh_dim: [global_shape for _ in chunks]
+        mesh_dim: [list(global_shape) for _ in chunks]
         for mesh_dim, chunks in temp_sharding_sizes.items()
     }
 
