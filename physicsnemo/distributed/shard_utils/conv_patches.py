@@ -63,7 +63,11 @@ def conv_output_shape(
 
 
 def compute_halo_from_kernel_stride_and_dilation(
-    kernel_size: int, stride: int, dilation: int, padding: int
+    kernel_size: int,
+    stride: int,
+    dilation: int,
+    padding: int,
+    transposed: bool,
 ) -> int:
     """Compute the halo size needed for a convolution kernel along a single dimension.
 
@@ -90,6 +94,14 @@ def compute_halo_from_kernel_stride_and_dilation(
         else:
             raise MissingShardPatch(
                 "Sharded Convolution is not implemented for even kernels without matching stride and padding 0. "
+                "If you need this functionality, please open an issue at https://github.com/NVIDIA/PhysicsNemo/issues"
+            )
+
+    if transposed:
+        # Support currently only for even kernels with padding 0 and stride = kernel_size
+        if kernel_size % 2 != 0 or padding != 0 or stride != kernel_size:
+            raise MissingShardPatch(
+                "Sharded Convolution is not implemented for transposed convolutions with non-matching stride or padding. "
                 "If you need this functionality, please open an issue at https://github.com/NVIDIA/PhysicsNemo/issues"
             )
 
@@ -154,6 +166,7 @@ def compute_halo_configs_from_conv_args(
             stride[kernel_dim],
             dilation[kernel_dim],
             padding[kernel_dim],
+            conv_kwargs["transposed"],
         )
 
         if halo_size > 0:
@@ -380,6 +393,14 @@ def conv_transpose2d_wrapper(wrapped, instance, args, kwargs):
     return generic_conv_nd_wrapper(wrapped, instance, args, kwargs)
 
 
+@wrapt.patch_function_wrapper(
+    "torch.nn.functional", "conv_transpose3d", enabled=ShardTensor.patches_enabled
+)
+def conv_transpose3d_wrapper(wrapped, instance, args, kwargs):
+
+    return generic_conv_nd_wrapper(wrapped, instance, args, kwargs)
+
+
 def generic_conv_nd_wrapper(
     wrapped, instance, args, kwargs
 ) -> Union[torch.Tensor, ShardTensor]:
@@ -402,7 +423,17 @@ def generic_conv_nd_wrapper(
     Raises:
         UndeterminedShardingError: If input tensor types are invalid or incompatible
     """
-    input, weight, bias, conv_kwargs = repackage_conv_args(*args, **kwargs)
+
+    print(f"Wrapped: {wrapped.__name__}")
+
+    if "transpose" in wrapped.__name__:
+        input, weight, bias, conv_kwargs = repackage_conv_transposed_args(
+            *args, **kwargs
+        )
+    else:
+        input, weight, bias, conv_kwargs = repackage_conv_args(*args, **kwargs)
+
+    print(f"conv_kwargs: {conv_kwargs}")
 
     # Handle regular torch tensor inputs
     if (
@@ -451,7 +482,6 @@ def repackage_conv_args(
     padding: Union[int, Tuple[int, ...]] = 0,
     dilation: Union[int, Tuple[int, ...]] = 1,
     groups: int = 1,
-    transposed: bool = False,
     output_padding: Union[int, Tuple[int, ...]] = 0,
     *args,
     **kwargs,
@@ -492,9 +522,65 @@ def repackage_conv_args(
         "stride": stride,
         "padding": padding,
         "dilation": dilation,
-        "transposed": transposed,
+        "transposed": False,
+        "groups": groups,
+        "output_padding": output_padding,
+    }
+
+    return input, weight, bias, return_kwargs
+
+
+def repackage_conv_transposed_args(
+    input: Union[torch.Tensor, ShardTensor],
+    weight: Union[torch.Tensor, DTensor],
+    bias: Union[torch.Tensor, DTensor, None] = None,
+    stride: Union[int, Tuple[int, ...]] = 1,
+    padding: Union[int, Tuple[int, ...]] = 0,
+    output_padding: Union[int, Tuple[int, ...]] = 0,
+    groups: int = 1,
+    dilation: Union[int, Tuple[int, ...]] = 1,
+    *args,
+    **kwargs,
+) -> Tuple[
+    Union[torch.Tensor, ShardTensor],
+    Union[torch.Tensor, DTensor],
+    Union[torch.Tensor, DTensor, None],
+    dict,
+]:
+    """Repackages convolution arguments into standard format.
+
+    Takes the full set of arguments that could be passed to a convolution operation
+    and separates them into core tensor inputs (input, weight, bias) and
+    configuration parameters packaged as a kwargs dict.
+
+    Args:
+        input: Input tensor to convolve
+        weight: Convolution kernel weights
+        bias: Optional bias tensor
+        stride: Convolution stride length(s)
+        padding: Input padding size(s)
+        dilation: Kernel dilation factor(s)
+        groups: Number of convolution groups
+        transposed: Whether this is a transposed convolution
+        output_padding: Additional output padding for transposed convs
+        *args: Additional positional args (unused)
+        **kwargs: Additional keyword args (unused)
+
+    Returns:
+        Tuple containing:
+        - Input tensor
+        - Weight tensor
+        - Bias tensor (or None)
+        - Dict of convolution configuration parameters
+    """
+    # Package all non-tensor parameters into a kwargs dictionary
+    return_kwargs = {
+        "stride": stride,
+        "padding": padding,
+        "dilation": dilation,
         "output_padding": output_padding,
         "groups": groups,
+        "transposed": True,
     }
 
     return input, weight, bias, return_kwargs
