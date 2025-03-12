@@ -424,16 +424,12 @@ def generic_conv_nd_wrapper(
         UndeterminedShardingError: If input tensor types are invalid or incompatible
     """
 
-    print(f"Wrapped: {wrapped.__name__}")
-
     if "transpose" in wrapped.__name__:
         input, weight, bias, conv_kwargs = repackage_conv_transposed_args(
             *args, **kwargs
         )
     else:
         input, weight, bias, conv_kwargs = repackage_conv_args(*args, **kwargs)
-
-    print(f"conv_kwargs: {conv_kwargs}")
 
     # Handle regular torch tensor inputs
     if (
