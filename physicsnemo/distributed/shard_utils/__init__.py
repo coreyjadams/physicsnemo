@@ -17,5 +17,8 @@
 
 def register_shard_wrappers():
 
+    from .attention_patches import sdpa_wrapper
     from .conv_patches import generic_conv_nd_wrapper
     from .natten_patches import na2d_wrapper
+    from .normalization_patches import group_norm_wrapper
+    from .pooling_patches import generic_avg_pool_nd_wrapper
