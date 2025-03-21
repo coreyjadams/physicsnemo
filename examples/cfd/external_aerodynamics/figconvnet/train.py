@@ -326,7 +326,8 @@ def train(config: DictConfig, signal_handler: SignalHandler):
             if config.train.lr_scheduler_mode == "iteration":
                 scheduler.step()
             tot_iter += 1
-            torch.cuda.empty_cache()
+            # This is a bottleneck for performance.
+            # torch.cuda.empty_cache()
 
         if config.train.lr_scheduler_mode == "epoch":
             scheduler.step()
