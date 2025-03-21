@@ -264,8 +264,7 @@ class PointFeatureConv(nn.Module):
         # Get the neighbors
         in_vertices = in_point_features.vertices
         out_vertices = out_point_features.vertices
-        
-        
+
         if self.neighbor_search_vertices_scaler is not None:
             neighbor_search_vertices_scaler = self.neighbor_search_vertices_scaler
         if neighbor_search_vertices_scaler is not None:
@@ -293,6 +292,7 @@ class PointFeatureConv(nn.Module):
                 neighbors_index
             ]
             num_reps = self.radius_or_k
+            total_count = None
         elif self.neighbor_search_type == "radius":
             with record_function("PointFeatureConv.forward.neighbor_radius_search"):
                 neighbors = batched_neighbor_radius_search(
@@ -307,6 +307,7 @@ class PointFeatureConv(nn.Module):
             ]
             neighbors_row_splits = neighbors.neighbors_row_splits
             num_reps = neighbors_row_splits[1:] - neighbors_row_splits[:-1]
+            total_count = neighbors.total_count
         else:
             raise ValueError(
                 f"neighbor_search_type must be radius or knn, got {self.neighbor_search_type}"
@@ -317,15 +318,21 @@ class PointFeatureConv(nn.Module):
                 out_point_features.features.view(-1, out_num_channels).contiguous(),
                 num_reps,
                 dim=0,
+                output_size=total_count,
             )
         # TODO - CJA - num_reps is a GPU tensor used to dynamically allocate new data.
-        # It causes a sync point and blocks forward execution. 
+        # It causes a sync point and blocks forward execution.
         with record_function("PointFeatureConv.forward.interleave_edge_features"):
             edge_features = [rep_in_features, self_features]
             if self.use_rel_pos or self.use_rel_pos_encode:
-                in_rep_vertices = in_point_features.vertices.view(-1, 3)[neighbors_index]
+                in_rep_vertices = in_point_features.vertices.view(-1, 3)[
+                    neighbors_index
+                ]
                 self_vertices = torch.repeat_interleave(
-                    out_point_features.vertices.view(-1, 3).contiguous(), num_reps, dim=0
+                    out_point_features.vertices.view(-1, 3).contiguous(),
+                    num_reps,
+                    dim=0,
+                    output_size=total_count,
                 )
                 if self.use_rel_pos_encode:
                     edge_features.append(

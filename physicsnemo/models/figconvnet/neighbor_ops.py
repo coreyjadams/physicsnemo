@@ -22,8 +22,10 @@ from jaxtyping import Float, Int
 from torch import Tensor
 
 from physicsnemo.models.figconvnet.warp_neighbor_search import (
-    batched_radius_search_warp,
     radius_search_warp,
+)
+from physicsnemo.models.figconvnet.warp_neighbor_search_refactored import (
+    batched_radius_search_warp,
 )
 
 
@@ -37,15 +39,19 @@ class NeighborSearchReturn:
     # M is the number of queries
     _neighbors_row_splits: Int[Tensor, "M + 1"]  # noqa: F821
 
+    _total_count: int = None
+
     def __init__(self, *args):
         # If there are two args, assume they are neighbors_index and neighbors_row_splits
         # If there is one arg, assume it is a NeighborSearchReturnType
-        if len(args) == 2:
+        if len(args) == 3:
             self._neighbors_index = args[0].long()
             self._neighbors_row_splits = args[1].long()
+            self._total_count = args[2]
         elif len(args) == 1:
             self._neighbors_index = args[0].neighbors_index.long()
             self._neighbors_row_splits = args[0].neighbors_row_splits.long()
+            self._total_count = args[0].total_count
         else:
             raise ValueError(
                 "NeighborSearchReturn must be initialized with 1 or 2 arguments"
@@ -58,6 +64,10 @@ class NeighborSearchReturn:
     @property
     def neighbors_row_splits(self):
         return self._neighbors_row_splits
+
+    @property
+    def total_count(self):
+        return self._total_count
 
     def to(self, device: Union[str, int, torch.device]):
         self._neighbors_index.to(device)
@@ -109,13 +119,16 @@ def batched_neighbor_radius_search(
     ), f"Batch size mismatch, {inp_positions.shape[0]} != {out_positions.shape[0]}"
 
     if search_method == "warp":
-        neighbor_index, neighbor_dist, neighbor_offset = batched_radius_search_warp(
-            inp_positions, out_positions, radius
-        )
+        (
+            neighbor_index,
+            neighbor_dist,
+            neighbor_offset,
+            total_count,
+        ) = batched_radius_search_warp(inp_positions, out_positions, radius)
     else:
         raise ValueError(f"search_method {search_method} not supported.")
 
-    return NeighborSearchReturn(neighbor_index, neighbor_offset)
+    return NeighborSearchReturn(neighbor_index, neighbor_offset, total_count)
 
 
 @torch.no_grad()

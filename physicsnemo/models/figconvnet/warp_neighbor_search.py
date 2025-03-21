@@ -21,8 +21,10 @@ import torch
 import warp as wp
 from jaxtyping import Float
 from torch import Tensor
-
 from torch.autograd.profiler import record_function
+
+from physicsnemo.utils.profiling import profile
+
 
 @wp.kernel
 def _radius_search_count(
@@ -32,22 +34,29 @@ def _radius_search_count(
     result_count: wp.array(dtype=wp.int32),
     radius: wp.float32,
 ):
+    """
+    Loop through the queries and count the number of points within a radius of each query.
+    """
     tid = wp.tid()
 
     # create grid query around point
     qp = queries[tid]
+    # This creates a query into the hashgrid.
+    # Below it will iterate over all the points with `radius` around qp
     query = wp.hash_grid_query(hashgrid, qp, radius)
     index = int(0)
     result_count_tid = int(0)
 
+    # the index of each neighbor is stored in `index`
     while wp.hash_grid_query_next(query, index):
+        # Get the actual neighbor:
         neighbor = points[index]
 
         # compute distance to neighbor point
         dist = wp.length(qp - neighbor)
         if dist <= radius:
             result_count_tid += 1
-
+    # Store the number of neighbors for this query
     result_count[tid] = result_count_tid
 
 
@@ -61,16 +70,23 @@ def _radius_search_query(
     result_point_dist: wp.array(dtype=wp.float32),
     radius: wp.float32,
 ):
+    """
+    Loop through the queries and find the neighbors within a radius of each query.
+    Return, via result_*, the following:
+    - The offset of the first neighbor for each query
+    """
     tid = wp.tid()
 
     # create grid query around point
     qp = queries[tid]
     query = wp.hash_grid_query(hashgrid, qp, radius)
+
     index = int(0)
     result_count = int(0)
     offset_tid = result_offset[tid]
 
     while wp.hash_grid_query_next(query, index):
+        # Get the neighbor
         neighbor = points[index]
 
         # compute distance to neighbor point
@@ -81,6 +97,7 @@ def _radius_search_query(
             result_count += 1
 
 
+@profile
 def _radius_search_warp(
     points: wp.array(dtype=wp.vec3),
     queries: wp.array(dtype=wp.vec3),
@@ -88,10 +105,21 @@ def _radius_search_warp(
     grid_dim: Union[int, Tuple[int, int, int]] = (128, 128, 128),
     device: str = "cuda",
 ):
+    """
+    Perform a search to find, for each query, which of the points are within a
+    the radius of that query.  First, this function builds a hash grid from
+    the points, radius, and the grid dim.  This makes lookup of nearby points
+    more efficient.
+
+    Once the hash grid is built, we launch a kernel to
+
+
+    """
+
     # convert grid_dim to Tuple if it is int
     if isinstance(grid_dim, int):
         grid_dim = (grid_dim, grid_dim, grid_dim)
-
+    # The first step is
     result_count = wp.zeros(shape=len(queries), dtype=wp.int32)
     grid = wp.HashGrid(
         dim_x=grid_dim[0],
@@ -102,6 +130,7 @@ def _radius_search_warp(
     grid.build(points=points, radius=2 * radius)
 
     # For 10M radius search, the result can overflow and fail
+    # This function will fill the result_count with the number of neighbors for each query
     wp.launch(
         kernel=_radius_search_count,
         dim=len(queries),
@@ -113,48 +142,20 @@ def _radius_search_warp(
         ############################################################
         # Original implementation
         ############################################################
-        # torch_offset = torch.zeros(len(result_count) + 1, device=device, dtype=torch.int32)
-        # result_count_torch = wp.to_torch(result_count)
-        # torch.cumsum(result_count_torch, dim=0, out=torch_offset[1:])
-        # total_count = torch_offset[-1].item()
-        # print(f"total_count: {total_count}")
-        # assert (
-        #     total_count < 2**31 - 1
-        # ), f"Total result count is too large: {total_count} > 2**31 - 1"
-
-        # result_point_idx = wp.zeros(shape=(total_count,), dtype=wp.int32)
-        # result_point_dist = wp.zeros(shape=(total_count,), dtype=wp.float32)
-
-
-        ############################################################
-        # New implementation
-        ############################################################
-        torch_offset = torch.zeros(len(result_count) + 1, device=device, dtype=torch.int32)
+        torch_offset = torch.zeros(
+            len(result_count) + 1, device=device, dtype=torch.int32
+        )
         result_count_torch = wp.to_torch(result_count)
         torch.cumsum(result_count_torch, dim=0, out=torch_offset[1:])
-        # Allocate a pinned tensor on the CPU:
-        torch_count = torch.empty(1, dtype=torch.int32, pin_memory=True)
-        total_count.copy_(torch_offset[-1], non_blocking=True)
+        # The last element of torch_offset is the total number of points within radius of any query
+        total_count = torch_offset[-1].item()
+        assert (
+            total_count < 2**31 - 1
+        ), f"Total result count is too large: {total_count} > 2**31 - 1"
 
-        total_count = torch_offset[-1].to(torch.int64)
-        # total_count = torch_offset[-1].item()
-        # print(f"total_count: {total_count}")
-        # assert (
-        #     total_count < 2**31 - 1
-        # ), f"Total result count is too large: {total_count} > 2**31 - 1"
-
-        # Create result tensors on GPU without copying total_count to host
-        result_point_idx_torch = torch.zeros(total_count, device=device, dtype=torch.int32)
-        result_point_dist_torch = torch.zeros(total_count, device=device, dtype=torch.float32)
-        
-
-
-        result_point_idx = wp.from_torch(result_point_idx_torch)
-        result_point_dist = wp.from_torch(result_point_dist_torch)
-        
-        ############################################################
-        # End of new implementation
-        ############################################################
+        # This creates tensors that will store the index and distance of each neighbor
+        result_point_idx = wp.zeros(shape=(total_count,), dtype=wp.int32)
+        result_point_dist = wp.zeros(shape=(total_count,), dtype=wp.float32)
 
     wp.launch(
         kernel=_radius_search_query,
@@ -171,9 +172,10 @@ def _radius_search_warp(
         device=device,
     )
 
-    return (result_point_idx, result_point_dist, torch_offset)
+    return (result_point_idx, result_point_dist, torch_offset, total_count)
 
 
+@profile
 def radius_search_warp(
     points: Float[Tensor, "N 3"],
     queries: Float[Tensor, "M 3"],
@@ -196,15 +198,22 @@ def radius_search_warp(
         neighbor_distance: [Q]
         neighbor_split: [M + 1]
     """
+
     # Convert from warp to torch
     assert points.is_contiguous(), "points must be contiguous"
     assert queries.is_contiguous(), "queries must be contiguous"
+    # Make sure we're using the same stream as pytorch:
     with record_function("radius_search_warp.points_from_torch"):
         points_wp = wp.from_torch(points, dtype=wp.vec3)
     with record_function("radius_search_warp.queries_from_torch"):
         queries_wp = wp.from_torch(queries, dtype=wp.vec3)
 
-    result_point_idx, result_point_dist, torch_offset = _radius_search_warp(
+    (
+        result_point_idx,
+        result_point_dist,
+        torch_offset,
+        total_count,
+    ) = _radius_search_warp(
         points=points_wp,
         queries=queries_wp,
         radius=radius,
@@ -219,7 +228,7 @@ def radius_search_warp(
         result_point_dist = wp.to_torch(result_point_dist)
 
     # Neighbor index, Neighbor Distance, Neighbor Split
-    return result_point_idx, result_point_dist, torch_offset
+    return result_point_idx, result_point_dist, torch_offset, total_count
 
 
 def batched_radius_search_warp(
@@ -239,7 +248,7 @@ def batched_radius_search_warp(
         grid_dim: Union[int, Tuple[int, int, int]]
         device: str
 
-    Returns:
+    Returns:n
         neighbor_index: [Q]
         neighbor_distance: [Q]
         neighbor_split: [B*M + 1]
@@ -250,14 +259,29 @@ def batched_radius_search_warp(
     neighbor_split_list = []
     index_offset = 0
     split_offset = 0
+    total_count = 0
+
+    # Create a stream for each batch item except the first one
+    # For batch size 1, this implicitly uses the default stream
+
     for b in range(B):
-        neighbor_index, neighbor_distance, neighbor_split = radius_search_warp(
+        # Put each items search in a unique stream
+        # Get the stream from the cache or create a new one
+
+        (
+            neighbor_index,
+            neighbor_distance,
+            neighbor_split,
+            this_count,
+        ) = radius_search_warp(
             points=points[b],
             queries=queries[b],
             radius=radius,
             grid_dim=grid_dim,
             device=device,
         )
+
+        total_count += this_count
         neighbor_index_list.append(neighbor_index + index_offset)
         neighbor_distance_list.append(neighbor_distance)
         # if b is last, append all neighbor_split since the last element is the total count
@@ -274,6 +298,7 @@ def batched_radius_search_warp(
         torch.cat(neighbor_index_list),
         torch.cat(neighbor_distance_list),
         torch.cat(neighbor_split_list),
+        total_count,
     )
 
 
@@ -296,13 +321,16 @@ if __name__ == "__main__":
     radii = [0.05, 0.01, 0.005]
     for radius in radii:
         print(f"Testing radius: {radius}")
-        result_point_idx, result_point_dist, torch_offset = batched_radius_search_warp(
-            points=points, queries=queries, radius=radius
-        )
+        (
+            result_point_idx,
+            result_point_dist,
+            torch_offset,
+            total_count,
+        ) = batched_radius_search_warp(points=points, queries=queries, radius=radius)
         print(result_point_idx.shape)
         print(result_point_dist.shape)
         print(torch_offset.shape)
-        print()
+        print(f"total_count: {total_count}")
 
         import ipdb
 
