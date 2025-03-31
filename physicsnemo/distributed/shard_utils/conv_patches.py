@@ -19,11 +19,19 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 import wrapt
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Shard
 
-from physicsnemo.distributed import ShardTensor, ShardTensorSpec
-from physicsnemo.distributed.shard_utils.patch_core import (
+from physicsnemo.utils.version_check import check_module_requirements
+
+check_module_requirements("physicsnemo.distributed.shard_tensor")
+
+
+from torch.distributed.tensor import DTensor  # noqa: E402
+from torch.distributed.tensor.placement_types import (  # noqa: E402
+    Shard,
+)
+
+from physicsnemo.distributed import ShardTensor, ShardTensorSpec  # noqa: E402
+from physicsnemo.distributed.shard_utils.patch_core import (  # noqa: E402
     MissingShardPatch,
     UndeterminedShardingError,
 )

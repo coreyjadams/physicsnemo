@@ -72,6 +72,9 @@ class LineProfileWrapper(PhysicsNeMoProfilerWrapper, metaclass=_Profiler_Singlet
         Args:
             output_top: Path to the directory where profiling results should be saved
         """
+        if not lp_avail:
+            return
+
         if not self.enabled:
             return
 

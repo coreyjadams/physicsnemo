@@ -21,6 +21,7 @@ import logging
 import os
 import tarfile
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Union
 
@@ -138,7 +139,10 @@ class Module(torch.nn.Module):
         Examples
         --------
         >>> from physicsnemo.models import Module
-        >>> fcn = Module.instantiate({'__name__': 'FullyConnected', '__module__': 'physicsnemo.models.mlp', '__args__': {'in_features': 10}})
+        >>> from physicsnemo.registry import ModelRegistry
+        >>> registry = ModelRegistry()
+        >>> model_entry = registry.factory('FullyConnected')
+        >>> fcn = model_entry(**{'in_features': 10})
         >>> fcn
         FullyConnected(
           (layers): ModuleList(
@@ -166,12 +170,28 @@ class Module(torch.nn.Module):
             _cls = registry.factory(_cls_name)
         else:
             try:
+                # Check if module is using modulus import and change it to physicsnemo instead
+                if arg_dict["__module__"].split(".")[0] == "modulus":
+                    warnings.warn(
+                        "Using modulus import in model checkpoint. This is deprecated and will be removed in future versions. Please use physicsnemo instead."
+                    )
+                    arg_module = (
+                        "physicsnemo" + arg_dict["__module__"][len("modulus") :]
+                    )
+                else:
+                    arg_module = arg_dict["__module__"]
+
                 # Otherwise, try to import the class
-                _mod = importlib.import_module(arg_dict["__module__"])
+                _mod = importlib.import_module(arg_module)
                 _cls = getattr(_mod, arg_dict["__name__"])
             except AttributeError:
                 # Cross fingers and hope for the best (maybe the class name changed)
                 _cls = cls
+
+        # This works with the importlib.metadata.EntryPoint
+        if isinstance(_cls, importlib.metadata.EntryPoint):
+            _cls = _cls.load()
+
         return _cls(**arg_dict["__args__"])
 
     def debug(self):

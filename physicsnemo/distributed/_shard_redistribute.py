@@ -21,22 +21,37 @@ import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor._dtensor_spec import (
+
+from physicsnemo.distributed.autograd import (
+    all_gather_v,
+)
+from physicsnemo.utils.version_check import check_module_requirements
+
+# This is to make sure the torch minimum version is installed.
+check_module_requirements("physicsnemo.distributed.shard_tensor")
+
+from torch.distributed.tensor._dtensor_spec import (  # noqa: E402
     TensorMeta,
 )
-from torch.distributed.tensor._redistribute import (
+from torch.distributed.tensor._redistribute import (  # noqa: E402
     _gen_transform_infos,
 )
-from torch.distributed.tensor.placement_types import (
+from torch.distributed.tensor.placement_types import (  # noqa: E402
     Partial,
     Placement,
     Replicate,
     Shard,
 )
-from torch.profiler import record_function
 
-import physicsnemo.distributed.shard_tensor as shard_tensor
-from physicsnemo.distributed._shard_tensor_spec import ShardTensorSpec
+import physicsnemo.distributed.shard_tensor as shard_tensor  # noqa: E402
+from physicsnemo.distributed._shard_tensor_spec import ShardTensorSpec  # noqa: E402
+
+# TODO:
+# DTensor makes assumptions about sharding sizes.
+# I need to figure out the target spec  manually, based on input/output placements.
+# I'm already intercepting the collectives and using the right input sizes.
+# But the output placements are containing the wrong sharding sizes.
+# It should all "just work" once that's fixed.
 
 
 # Worker functions for the collectives specific to uneven shaped tensors:

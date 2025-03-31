@@ -21,27 +21,31 @@ from warnings import warn
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._dtensor_spec import (
+
+from physicsnemo.distributed import DistributedManager
+from physicsnemo.distributed.utils import compute_split_shapes, split_tensor_along_dim
+from physicsnemo.utils.version_check import check_module_requirements
+
+# Prevent importing this module if the minimum version of pytorch is not met.
+check_module_requirements("physicsnemo.distributed.shard_tensor")
+
+from torch.distributed.tensor import DTensor  # noqa: E402
+from torch.distributed.tensor._dtensor_spec import (  # noqa: E402
     TensorMeta,
 )
-from torch.distributed.tensor.placement_types import (
+from torch.distributed.tensor.placement_types import (  # noqa: E402
     Placement,
     Replicate,
     Shard,
 )
 
-from physicsnemo.distributed import DistributedManager
-from physicsnemo.distributed._shard_redistribute import (
+from physicsnemo.distributed._shard_redistribute import (  # noqa: E402
     ShardRedistribute,
 )
-from physicsnemo.distributed._shard_tensor_spec import (
+from physicsnemo.distributed._shard_tensor_spec import (  # noqa: E402
     ShardTensorSpec,
     _infer_shard_tensor_spec_from_local_chunks,
-    _stride_from_contiguous_shape_C_style,
 )
-
-aten = torch.ops.aten
 
 
 class _ToTorchTensor(torch.autograd.Function):
@@ -132,7 +136,7 @@ class _FromTorchTensor(torch.autograd.Function):
         local_input: torch.Tensor,
         device_mesh: DeviceMesh,
         placements: Tuple[Placement, ...],
-        sharding_shapes: Union[str, Dict[int, List[Tuple[int, ...]]]] = "even",
+        sharding_shapes: Union[str, Dict[int, List[Tuple[int, ...]]]] = "chunk",
     ) -> "ShardTensor":
         """Convert a local torch.Tensor to a ShardTensor in forward pass.
 

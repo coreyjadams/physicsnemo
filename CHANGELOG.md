@@ -6,7 +6,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.0a0] - 2025-01-XX
+## [1.1.0a0] - 2025-05-XX
+
+### Added
+
+- Added ReGen score-based data assimilation example
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+### Dependencies
+
+## [1.0.1] - 2025-03-25
+
+### Added
+
+- Added version checks to ensure compatibility with older PyTorch for distributed
+  utilities and ShardTensor
+
+### Fixed
+
+- `EntryPoint` error that occured during physicsnemo checkpoint loading
+
+## [1.0.0] - 2025-03-18
 
 ### Added
 
@@ -30,19 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   imports
 - Moved to experiment-based Hydra config in Lagrangian-MGN example
 - Make data caching optional in `MeshDatapipe`
+- The use of older `importlib_metadata` library is removed
 
 ### Deprecated
 
 - ProcessGroupConfig is tagged for future deprecation in favor of DeviceMesh.
 
-### Removed
-
 ### Fixed
 
 - Update pytests to skip when the required dependencies are not present
 - Bug in data processing script in domino training example
-
-### Security
+- Fixed NCCL_ASYNC_ERROR_HANDLING deprecation warning
 
 ### Dependencies
 

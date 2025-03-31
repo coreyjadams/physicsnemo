@@ -26,8 +26,9 @@ import torch
 import torch.distributed as dist
 
 from physicsnemo.distributed.config import ProcessGroupConfig, ProcessGroupNode
+from physicsnemo.utils.version_check import check_min_version, require_version
 
-warnings.simplefilter("default", DeprecationWarning)
+# warnings.simplefilter("default", DeprecationWarning)
 
 
 class PhysicsNeMoUndefinedGroupError(Exception):
@@ -121,8 +122,6 @@ class DistributedManager(object):
             obj._global_mesh = None  # Lazy initialized right when it's first needed
         if not hasattr(obj, "_mesh_dims"):
             obj._mesh_dims = {}  # Dictionary mapping axis names to sizes
-        if not hasattr(obj, "_mesh_groups"):
-            obj._mesh_groups = {}  # Used to cache  groups for multidim mesh access
 
         return obj
 
@@ -178,18 +177,24 @@ class DistributedManager(object):
         """
         Returns the global mesh.  If it's not initialized, it will be created when this is called.
         """
+
+        # Properties don't mesh with decorators.  So in this function, I call the check manually:
+        check_min_version("torch", "2.4")
+
         if self._global_mesh is None:
             # Fully flat mesh (1D) by default:
             self.initialize_mesh(mesh_shape=(-1,), mesh_dim_names=("world",))
 
         return self._global_mesh
 
+    @require_version("torch", "2.4")
     def mesh_names(self):
         """
         Return mesh axis names
         """
         return self._mesh_dims.keys()
 
+    @require_version("torch", "2.4")
     def mesh_sizes(self):
         """
         Return mesh axis sizes
@@ -209,6 +214,7 @@ class DistributedManager(object):
         else:
             raise PhysicsNeMoUndefinedGroupError(name)
 
+    @require_version("torch", "2.4")
     def mesh(self, name=None):
         """
         Return a device_mesh with the given name.
@@ -221,7 +227,7 @@ class DistributedManager(object):
             Name of desired mesh, by default None
         """
 
-        if name in self._mesh_dims.keys():
+        if name in self._global_mesh.axis_names:
             return self._global_mesh[name]
         elif name is None:
             return self._global_mesh
@@ -389,7 +395,11 @@ class DistributedManager(object):
         addr = os.getenv("MASTER_ADDR", "localhost")
         port = os.getenv("MASTER_PORT", "12355")
         # https://pytorch.org/docs/master/notes/cuda.html#id5
-        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
+        # was changed in version 2.2
+        if torch.__version__ < (2, 2):
+            os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
+        else:
+            os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
         initialization_method = os.getenv(
             "PHYSICSNEMO_DISTRIBUTED_INITIALIZATION_METHOD"
         )
@@ -424,9 +434,10 @@ class DistributedManager(object):
         # Set per rank numpy random seed for data sampling
         np.random.seed(seed=DistributedManager().rank)
 
+    @require_version("torch", "2.4")
     def initialize_mesh(
         self, mesh_shape: Tuple[int, ...], mesh_dim_names: Tuple[str, ...]
-    ) -> dist.DeviceMesh:
+    ) -> "torch.distributed.DeviceMesh":
         """
         Initialize a global device mesh over the entire distributed job.
 
@@ -509,6 +520,7 @@ class DistributedManager(object):
 
         return self._global_mesh
 
+    @require_version("torch", "2.4")
     def get_mesh_group(self, mesh: dist.DeviceMesh) -> dist.ProcessGroup:
         """
         Get the process group for a given mesh.
@@ -747,13 +759,14 @@ class DistributedManager(object):
         config: ProcessGroupConfig, verbose: bool = False
     ):  # pragma: no cover
 
-        warnings.warn(
-            "DistributedManager.create_groups_from_config is no longer the most simple "
-            "way to organize process groups.  Please switch to DeviceMesh, "
-            "and DistributedManager.initialize_mesh",
-            category=DeprecationWarning,
-            stacklevel=2,
-        )
+        if torch.__version__ > "2.4":
+            warnings.warn(
+                "DistributedManager.create_groups_from_config is no longer the most simple "
+                "way to organize process groups.  Please switch to DeviceMesh, "
+                "and DistributedManager.initialize_mesh",
+                category=DeprecationWarning,
+                stacklevel=2,
+            )
 
         # Traverse process group tree in breadth first order
         # to create nested process groups

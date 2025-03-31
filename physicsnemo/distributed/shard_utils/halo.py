@@ -470,11 +470,11 @@ def perform_halo_collective(
         id_of_right = local_rank + 1 if local_rank < local_size - 1 else None
         id_of_left = local_rank - 1 if local_rank > 0 else None
 
-        halo_from_right = torch.empty_like(halo_to_left)
-        halo_from_left = torch.empty_like(halo_to_right)
+        halo_from_right = torch.empty_like(template_halo)
+        halo_from_left = torch.empty_like(template_halo)
 
         p2p_op_list = []
-        torch.cuda.set_device(device)
+        torch.cuda.set_device(template_halo.device)
 
         # Post receives
         if id_of_right is not None:

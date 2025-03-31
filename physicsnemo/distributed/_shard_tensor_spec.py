@@ -20,17 +20,20 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor._dtensor_spec import (
+
+from physicsnemo.utils.version_check import check_module_requirements
+
+check_module_requirements("physicsnemo.distributed.shard_tensor")
+
+
+from torch.distributed.tensor._dtensor_spec import (  # noqa: E402
     DTensorSpec,
     TensorMeta,
 )
-from torch.distributed.tensor.placement_types import (
+from torch.distributed.tensor.placement_types import (  # noqa: E402
     Placement,
     Shard,
 )
-from torch.profiler import record_function
-
-from physicsnemo.distributed.utils import compute_split_shapes
 
 
 @dataclass(kw_only=True)
@@ -105,6 +108,7 @@ class ShardTensorSpec(DTensorSpec):
             Dictionary of shard sizes by mesh dim, or tuple of sizes for specific dim
         """
         if self._sharding_sizes is None:
+<<<<<<< HEAD
             if mesh_dim is None:
                 shard_shapes_by_dim, global_shape = _all_gather_shard_shapes(
                     self._local_shape, self.placements, self.mesh
@@ -118,6 +122,13 @@ class ShardTensorSpec(DTensorSpec):
                     self.mesh.get_group(mesh_dim),
                     do_checks=False,
                 )
+=======
+            shard_shapes_by_dim, global_shape = _all_gather_shard_shapes(
+                self._local_shape, self.placements, self.mesh
+            )
+            self._sharding_sizes = shard_shapes_by_dim
+            self.tensor_meta = self.tensor_meta._replace(shape=global_shape)
+>>>>>>> main
         if mesh_dim is not None:
             if mesh_dim in self._sharding_sizes:
                 return self._sharding_sizes[mesh_dim]
@@ -308,7 +319,7 @@ def _gather_shard_shapes_for_dim(
             for d in range(len(local_shape)):
                 if d == tensor_dim:
                     continue  # skip the sharded dimension
-                if not all(local_shape[d] == all_s[d] for all_s in all_shapes):
+                if not all([local_shape[d] == all_s[d] for all_s in all_shapes]):
                     raise ValueError(
                         f"Dimension mismatch detected at non-sharded dimension {d}. "
                         "All local shapes must match except along sharded dimension."
