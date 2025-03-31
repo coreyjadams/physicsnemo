@@ -6,7 +6,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.0a0] - 2025-01-XX
+## [1.1.0a0] - 2025-05-XX
+
+### Added
+
+- Added ReGen score-based data assimilation example
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+### Dependencies
+
+## [1.0.1] - 2025-03-25
+
+### Added
+
+- Added version checks to ensure compatibility with older PyTorch for distributed
+  utilities and ShardTensor
+
+### Fixed
+
+- `EntryPoint` error that occured during physicsnemo checkpoint loading
+
+## [1.0.0] - 2025-03-18
 
 ### Added
 
@@ -17,6 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Prototype support for domain parallelism of using ShardTensor (new).
 - Enable DeviceMesh initialization via DistributedManager.
 - Added Datacenter CFD use case.
+- Add leave-in profiling utilities to physicsnemo, to easily enable torch/python/nsight
+  profiling in all aspects of the codebase.
 
 ### Changed
 
@@ -24,22 +55,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Enhancements and bug fixes to DoMINO model and training example
 - Enhancement to parameterize DoMINO model with inlet velocity
 - Moved non-dimensionaliztion out of domino datapipe to datapipe in domino example
-- Updated utils in `modulus.launch.logging` to avoid unnecessary `wandb` and `mlflow` imports
+- Updated utils in `physicsnemo.launch.logging` to avoid unnecessary `wandb` and `mlflow`
+  imports
 - Moved to experiment-based Hydra config in Lagrangian-MGN example
 - Make data caching optional in `MeshDatapipe`
+- The use of older `importlib_metadata` library is removed
 
 ### Deprecated
 
 - ProcessGroupConfig is tagged for future deprecation in favor of DeviceMesh.
 
-### Removed
-
 ### Fixed
 
 - Update pytests to skip when the required dependencies are not present
 - Bug in data processing script in domino training example
-
-### Security
+- Fixed NCCL_ASYNC_ERROR_HANDLING deprecation warning
 
 ### Dependencies
 
@@ -120,8 +150,8 @@ Shallow-Water-Equation example.
 
 ### Changed
 
-- Raise `ModulusUndefinedGroupError` when querying undefined process groups
-- Changed Indexing error in `examples/cfd/swe_nonlinear_pino` for `modulus` loss function
+- Raise `PhysicsNeMoUndefinedGroupError` when querying undefined process groups
+- Changed Indexing error in `examples/cfd/swe_nonlinear_pino` for `physicsnemo` loss function
 - Safeguarding against uninitialized usage of `DistributedManager`
 
 ### Removed
@@ -150,7 +180,7 @@ intended for distributed message-passing.
 - Performance optimizations to CorrDiff.
 - Physics-Informed Nonlinear Shallow Water Equations example.
 - Warp neighbor search routine with a minimal example.
-- Strict option for loading Modulus checkpoints.
+- Strict option for loading PhysicsNeMo checkpoints.
 - Regression only or diffusion only inference for CorrDiff.
 - Support for organization level model files on NGC file system
 - Physics-Informed Magnetohydrodynamics example.
@@ -163,7 +193,7 @@ intended for distributed message-passing.
 
 ### Deprecated
 
-- `modulus.models.diffusion.preconditioning.EDMPrecondSR`. Use `EDMPecondSRV2` instead.
+- `physicsnemo.models.diffusion.preconditioning.EDMPrecondSR`. Use `EDMPecondSRV2` instead.
 
 ### Removed
 
@@ -221,7 +251,7 @@ intended for distributed message-passing.
 weather models
 - Added distributed FFT utility.
 - Added ruff as a linting tool.
-- Ported utilities from Modulus Launch to main package.
+- Ported utilities from PhysicsNeMo Launch to main package.
 - EDM diffusion models and recipes for training and sampling.
 - NGC model registry download integration into package/filesystem.
 - Denoising diffusion tutorial.
@@ -229,12 +259,12 @@ weather models
 ### Changed
 
 - The AFNO input argument `img_size` to `inp_shape`
-- Integrated the network architecture layers from Modulus-Sym.
+- Integrated the network architecture layers from PhysicsNeMo-Sym.
 - Updated the SFNO model, and the training and inference recipes.
 
 ### Fixed
 
-- Fixed modulus.Module `from_checkpoint` to work from custom model classes
+- Fixed physicsnemo.Module `from_checkpoint` to work from custom model classes
 
 ### Dependencies
 
@@ -257,11 +287,11 @@ weather models
 
 ### Changed
 
-- Updating file system cache location to modulus folder
+- Updating file system cache location to physicsnemo folder
 
 ### Fixed
 
-- Fixed modulus uninstall in CI docker image
+- Fixed physicsnemo uninstall in CI docker image
 
 ### Security
 
@@ -302,7 +332,7 @@ weather models
 ### Fixed
 
 - Fixed issue with torch-harmonics version locking
-- Fixed the Modulus editable install
+- Fixed the PhysicsNeMo editable install
 - Fixed AMP bug in static capture
 
 ### Security
