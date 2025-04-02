@@ -22,8 +22,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
-# from physicsnemo.distributed.shard_tensor import ShardTensor
-
 """Halo exchange utilities for distributed tensor operations.
 
 This module provides functionality for halo padding operations in distributed computing
@@ -59,9 +57,10 @@ class HaloConfig:
     tensor_dim: int
     halo_size: int
     edge_padding_size: int = 0
-    communication_method: str = "a2a"
 
+    CommMethod = Literal["p2p", "a2a"]
     VALID_COMM_METHODS = ["p2p", "a2a"]
+    communication_method: CommMethod = "a2a"
 
     def __post_init__(self):
         """Validate configuration parameters after initialization.
@@ -216,14 +215,14 @@ class UnHaloPadding(torch.autograd.Function):
         ctx.config = config
 
         # Chop off the halos
-        _left, unpadded_tensor, __right = slice_halo_regions(
+        _left, unpadded_tensor, _right = slice_halo_regions(
             tensor,
             mesh,
             config,
         )
 
         ctx.left_shape = _left.shape
-        ctx.right_shape = __right.shape
+        ctx.right_shape = _right.shape
 
         return unpadded_tensor
 

@@ -36,8 +36,8 @@ from physicsnemo.distributed.shard_utils.patch_core import (  # noqa: E402
     UndeterminedShardingError,
 )
 
-from .halo import HaloConfig, halo_padding
-from .patch_core import promote_to_iterable
+from .halo import HaloConfig, halo_padding  # noqa: E402
+from .patch_core import promote_to_iterable  # noqa: E402
 
 aten = torch.ops.aten
 
@@ -45,6 +45,9 @@ __all__ = [
     "conv1d_wrapper",
     "conv2d_wrapper",
     "conv3d_wrapper",
+    "conv_transpose1d_wrapper",
+    "conv_transpose2d_wrapper",
+    "conv_transpose3d_wrapper",
 ]
 
 
@@ -74,7 +77,7 @@ def compute_halo_from_kernel_stride_and_dilation(
     kernel_size: int,
     stride: int,
     dilation: int,
-    padding: int,
+    padding: Union[int, str],
     transposed: bool,
 ) -> int:
     """Compute the halo size needed for a convolution kernel along a single dimension.
@@ -124,6 +127,40 @@ def compute_halo_from_kernel_stride_and_dilation(
     return halo_size
 
 
+def padding_from_str_and_params(
+    padding: str,
+    input_shape: Tuple[int, ...],
+    kernel_size: int,
+    stride: int,
+    dilation: int,
+) -> int:
+    """Convert a string padding specification to a numerical value.
+
+    Args:
+        padding: String padding specification
+        conv_kwargs: Dictionary of convolution arguments
+        dim: Dimension index
+    """
+
+    if padding == "same":
+        total_padding = max(
+            0,
+            (
+                (input_shape - 1) * stride
+                + 1
+                + (kernel_size - 1) * dilation
+                - input_shape
+            ),
+        )
+        return total_padding // 2
+    elif padding == "valid":
+        return 0
+    elif padding == "none":
+        return 0
+    else:
+        raise ValueError(f"Invalid padding specification: {padding}")
+
+
 def compute_halo_configs_from_conv_args(
     input: ShardTensor,
     kernel_size: Tuple[int, ...],
@@ -150,7 +187,19 @@ def compute_halo_configs_from_conv_args(
     dilation = conv_kwargs["dilation"]
 
     # This is to update and set the padding to 0 on the sharded dims:
-    padding = list(conv_kwargs["padding"])
+    padding = conv_kwargs["padding"]
+
+    if isinstance(padding, str):
+        # Convert this to numerical values:
+        padding = [
+            padding_from_str_and_params(
+                padding, input.shape[i], kernel_size[i], stride[i], dilation[i]
+            )
+            for i in range(len(kernel_size))
+        ]
+    else:
+        # Ensure it's a list:
+        padding = list(padding)
 
     # All parameters are assumed to be iterables of the same length
     halo_configs = []
@@ -301,11 +350,9 @@ class PartialConvND(torch.autograd.Function):
         # Save local tensors to avoid distributed dispatch in backward pass
         ctx.save_for_backward(inputs, weights, bias)
 
-        # conv_kwargs["padding"] = tuple(padding)
         ctx.conv_kwargs = conv_kwargs
         # Perform local convolution on this shard
         local_chunk = aten.convolution.default(inputs, weights, bias, **conv_kwargs)
-
         # Wrap result in ShardTensor with specified distribution
         output = ShardTensor.from_local(
             local_chunk,
@@ -459,6 +506,7 @@ def generic_conv_nd_wrapper(
 
         # Promote scalar args to match kernel dimensions
         promotables = ["stride", "padding", "dilation", "output_padding"]
+
         conv_kwargs = {
             key: promote_to_iterable(p, kernel_shape) if key in promotables else p
             for key, p in conv_kwargs.items()
