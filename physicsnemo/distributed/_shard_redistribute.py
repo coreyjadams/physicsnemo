@@ -22,9 +22,6 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch.distributed.device_mesh import DeviceMesh
 
-from physicsnemo.distributed.autograd import (
-    all_gather_v,
-)
 from physicsnemo.utils.version_check import check_module_requirements
 
 # This is to make sure the torch minimum version is installed.
@@ -78,36 +75,34 @@ def _to_replicate_tensor(
     Note:
         This function handles uneven sharding by using all_gather_v instead of regular all_gather
     """
-    with record_function("to_replicate_tensor"):
-        # Get the mesh for the group:
-        mesh = current_spec.mesh
-        group = mesh.get_group(mesh_dim)
+    # Get the mesh for the group:
+    mesh = current_spec.mesh
+    group = mesh.get_group(mesh_dim)
 
-        # Ensure contiguous data for the reduction:
-        local_tensor = local_tensor.contiguous()
+    # Ensure contiguous data for the reduction:
+    local_tensor = local_tensor.contiguous()
 
-        # # Get all sizes:
-        with record_function("to_replicate_tensor__get_sizes"):
-            # TODO: We don't need to summon all sizes across all mesh dimensions.
-            # Optimize the spec function to only get the sizes for the relevant mesh dimensions.
-            sizes = current_spec.sharding_sizes()
+    # # Get all sizes:
+    # TODO: We don't need to summon all sizes across all mesh dimensions.
+    # Optimize the spec function to only get the sizes for the relevant mesh dimensions.
+    sizes = current_spec.sharding_sizes()
 
-            # Consecutive redistributes _don't_ update full sizes.
-            # So, extract the shape from this tensor, and assume all other tensor
-            # dims match.
-            tensor_dim_sizes = tuple(s[tensor_dim] for s in sizes[mesh_dim])
-            base_shapes = [list(local_tensor.shape) for _ in tensor_dim_sizes]
-            for i, t in enumerate(tensor_dim_sizes):
-                base_shapes[i][tensor_dim] = tensor_dim_sizes[i]
+    # Consecutive redistributes _don't_ update full sizes.
+    # So, extract the shape from this tensor, and assume all other tensor
+    # dims match.
+    tensor_dim_sizes = tuple(s[tensor_dim] for s in sizes[mesh_dim])
+    base_shapes = [list(local_tensor.shape) for _ in tensor_dim_sizes]
+    for i, t in enumerate(tensor_dim_sizes):
+        base_shapes[i][tensor_dim] = tensor_dim_sizes[i]
 
-        # Create a spot for the output:
-        output = [
-            torch.empty(s, device=local_tensor.device, dtype=local_tensor.dtype)
-            for s in base_shapes
-        ]
-        dist.all_gather(output, local_tensor, group=group)
+    # Create a spot for the output:
+    output = [
+        torch.empty(s, device=local_tensor.device, dtype=local_tensor.dtype)
+        for s in base_shapes
+    ]
+    dist.all_gather(output, local_tensor, group=group)
 
-        return torch.cat(output, dim=tensor_dim).contiguous()
+    return torch.cat(output, dim=tensor_dim).contiguous()
 
 
 def _select_slice_from_replicate(
@@ -250,176 +245,172 @@ def redistribute_local_shard_tensor(
     ``Partial()`` -> ``Replicate()``: ``all_reduce``needs to become a weighted ``all_reduce``, depending on operation.
     ``Partial()`` -> ``Shard(dim)``: ``reduce_scatter`` needs to become a weighted ``reduce_scatter``, depending on operation
     """
-    with record_function("redistribute_local_shard_tensor"):
-        if current_spec.mesh != target_spec.mesh:
-            # TODO: alltoall/permute reshuffling to change device_mesh if they are not the same
-            raise NotImplementedError("Cross device mesh comm not supported yet!")
 
-        new_local_tensor = None
-        device_mesh = current_spec.mesh
+    if current_spec.mesh != target_spec.mesh:
+        # TODO: alltoall/permute reshuffling to change device_mesh if they are not the same
+        raise NotImplementedError("Cross device mesh comm not supported yet!")
 
-        my_coordinate = device_mesh.get_coordinate()
+    new_local_tensor = None
+    device_mesh = current_spec.mesh
 
-        if my_coordinate is None:
-            # if rank is not part of mesh, we skip redistribute and simply return local_tensor,
-            # which should be an empty tensor
-            return local_tensor
+    my_coordinate = device_mesh.get_coordinate()
 
-        # This is an internal-focused step.  If the target_spec has the same placements and mesh
-        # as the current, but is missing sharding sizes, we can use the current spec's sharding sizes.
-        # if target_spec._sharding_sizes is None:
-        #     if target_spec.placements == current_spec.placements and target_spec.mesh == current_spec.mesh:
-        #         target_spec._sharding_sizes = current_spec.sharding_sizes()
+    if my_coordinate is None:
+        # if rank is not part of mesh, we skip redistribute and simply return local_tensor,
+        # which should be an empty tensor
+        return local_tensor
 
-        # For sharded tensors, we use the same order of transformation as DTensor.
-        # However, often we need to ignore the provided logical shape and substitute
-        # a sharded shape instead.
-        # This is done by providing a target_sharding_sizes dict above.
+    # This is an internal-focused step.  If the target_spec has the same placements and mesh
+    # as the current, but is missing sharding sizes, we can use the current spec's sharding sizes.
+    # if target_spec._sharding_sizes is None:
+    #     if target_spec.placements == current_spec.placements and target_spec.mesh == current_spec.mesh:
+    #         target_spec._sharding_sizes = current_spec.sharding_sizes()
 
-        with record_function("redistribute_local_shard_tensor__gen_transform_infos"):
-            transform_infos = _gen_transform_infos(current_spec, target_spec)
+    # For sharded tensors, we use the same order of transformation as DTensor.
+    # However, often we need to ignore the provided logical shape and substitute
+    # a sharded shape instead.
+    # This is done by providing a target_sharding_sizes dict above.
 
-        if len(transform_infos) == 0:
-            return local_tensor
+    transform_infos = _gen_transform_infos(current_spec, target_spec)
 
-        for transform_info in transform_infos:
-            i = transform_info.mesh_dim
-            current, target = transform_info.src_dst_placements
-            device_mesh.size(mesh_dim=i)
+    if len(transform_infos) == 0:
+        return local_tensor
 
-            if current == target:
-                # short cut, just use the original local tensor
-                new_local_tensor = local_tensor
-                continue
+    for transform_info in transform_infos:
+        i = transform_info.mesh_dim
+        current, target = transform_info.src_dst_placements
+        device_mesh.size(mesh_dim=i)
 
-            # logger.debug("redistribute from %s to %s on mesh dim %s", current, target, i)
-            if target.is_replicate():
-                # Case 1: target is Replicate
-                if current.is_partial():
-                    partial_spec = cast(Partial, current)
-                    new_local_tensor = partial_spec._reduce_value(
-                        local_tensor, device_mesh, i
-                    )
-                elif current.is_shard():
-                    current_placement = cast(Shard, current)
-                    new_local_tensor = _to_replicate_tensor(
-                        local_tensor,
-                        device_mesh,
-                        mesh_dim=i,
-                        tensor_dim=current_placement.dim,
-                        current_spec=current_spec,
-                    )
+        if current == target:
+            # short cut, just use the original local tensor
+            new_local_tensor = local_tensor
+            continue
+
+        # logger.debug("redistribute from %s to %s on mesh dim %s", current, target, i)
+        if target.is_replicate():
+            # Case 1: target is Replicate
+            if current.is_partial():
+                partial_spec = cast(Partial, current)
+                new_local_tensor = partial_spec._reduce_value(
+                    local_tensor, device_mesh, i
+                )
+            elif current.is_shard():
+                current_placement = cast(Shard, current)
+                new_local_tensor = _to_replicate_tensor(
+                    local_tensor,
+                    device_mesh,
+                    mesh_dim=i,
+                    tensor_dim=current_placement.dim,
+                    current_spec=current_spec,
+                )
+            else:
+                raise RuntimeError(
+                    f"redistribute from {current} to {target} not supported yet"
+                )
+        elif target.is_shard():
+            # Case 2: target is Shard
+            target_placement = cast(Shard, target)
+            if current.is_partial():
+                partial_spec = cast(Partial, current)
+                new_local_tensor = partial_spec._reduce_shard_value(
+                    local_tensor, device_mesh, i, target_placement
+                )
+            elif current.is_replicate():
+                # split the tensor and return the corresponding cloned local shard
+                # Are there suggested placements for the shards?
+                if target_placement.dim in target_sharding_sizes:
+                    size_hint = target_sharding_sizes[target_placement.dim]
                 else:
+                    size_hint = None
+                new_local_tensor, size_hint = _select_slice_from_replicate(
+                    local_tensor,
+                    target_spec,
+                    i,
+                    my_coordinate[i],
+                    size_hint,
+                )
+                if (
+                    size_hint is not None
+                    and target_placement.dim in target_sharding_sizes
+                ):
+                    target_sharding_sizes[target_placement.dim] = size_hint
+
+            else:
+                if not current.is_shard():
                     raise RuntimeError(
-                        f"redistribute from {current} to {target} not supported yet"
+                        f"Current placement should be shard but found {current}"
                     )
-            elif target.is_shard():
-                # Case 2: target is Shard
-                target_placement = cast(Shard, target)
-                if current.is_partial():
-                    partial_spec = cast(Partial, current)
-                    new_local_tensor = partial_spec._reduce_shard_value(
-                        local_tensor, device_mesh, i, target_placement
-                    )
-                elif current.is_replicate():
-                    # split the tensor and return the corresponding cloned local shard
-                    # Are there suggested placements for the shards?
+                shard_spec = cast(Shard, current)
+                if shard_spec.dim != target_placement.dim:
+                    # Here we need to essentially transpose the tensor along two dimensions.
+                    # We cached shardings that appear in both the input and output shards, along tensor dimensions.
+                    # So, if the target tensor dimension is in there,
+                    # That is how we're going to shard the local tensor on the tensor_dim,
+                    # and it also defines how we'll receive the tensor .
                     if target_placement.dim in target_sharding_sizes:
                         size_hint = target_sharding_sizes[target_placement.dim]
                     else:
                         size_hint = None
-                    new_local_tensor, size_hint = _select_slice_from_replicate(
+
+                    new_local_tensor, size_hint = _to_new_shard_dim(
                         local_tensor,
-                        target_spec,
-                        i,
-                        my_coordinate[i],
+                        target_spec,  # Send the whole spec so we can infer full recv sizes.
+                        i,  # The mesh dim we're transposing sharding on.
                         size_hint,
+                        current.dim,  # Current tensor dimension.
+                        target_placement.dim,  # Target tensor dimension.
                     )
                     if (
-                        size_hint is not None
+                        size_hint is None
                         and target_placement.dim in target_sharding_sizes
                     ):
-                        target_sharding_sizes[target_placement.dim] = size_hint
+                        target_sharding_sizes.pop(target_placement.dim)
+                    if size_hint is not None and current.dim in target_sharding_sizes:
+                        target_sharding_sizes.pop(current.dim)
 
-                else:
-                    if not current.is_shard():
-                        raise RuntimeError(
-                            f"Current placement should be shard but found {current}"
-                        )
-                    shard_spec = cast(Shard, current)
-                    if shard_spec.dim != target_placement.dim:
-                        # Here we need to essentially transpose the tensor along two dimensions.
-                        # We cached shardings that appear in both the input and output shards, along tensor dimensions.
-                        # So, if the target tensor dimension is in there,
-                        # That is how we're going to shard the local tensor on the tensor_dim,
-                        # and it also defines how we'll receive the tensor .
-                        if target_placement.dim in target_sharding_sizes:
-                            size_hint = target_sharding_sizes[target_placement.dim]
-                        else:
-                            size_hint = None
-
-                        new_local_tensor, size_hint = _to_new_shard_dim(
-                            local_tensor,
-                            target_spec,  # Send the whole spec so we can infer full recv sizes.
-                            i,  # The mesh dim we're transposing sharding on.
-                            size_hint,
-                            current.dim,  # Current tensor dimension.
-                            target_placement.dim,  # Target tensor dimension.
-                        )
-                        if (
-                            size_hint is None
-                            and target_placement.dim in target_sharding_sizes
-                        ):
-                            target_sharding_sizes.pop(target_placement.dim)
-                        if (
-                            size_hint is not None
-                            and current.dim in target_sharding_sizes
-                        ):
-                            target_sharding_sizes.pop(current.dim)
-
-            elif target.is_partial():
-                if current.is_replicate():
-                    partial_spec = cast(Partial, target)
-                    # skip the replicate to partial transformation when we are in backward pass
-                    # In this case we keep the grad as replicate, this is because we don't
-                    # want to convert the replicated gradients back to partial, although
-                    # that's logically conform with the same layout, converting the gradients
-                    # back to partial is actually useless as you would have to do reduce later
-                    # which would be more expensive than keeping it replicate! For this reason,
-                    # we keep the replicate grad here.
-                    new_local_tensor = (
-                        partial_spec._partition_value(local_tensor, device_mesh, i)
-                        if not is_backward
-                        else local_tensor
-                    )
-                elif current.is_shard():
-                    if not is_backward:
-                        raise RuntimeError(
-                            f"redistribute from {current} to {target} not supported yet"
-                        )
-                    # for backward shard -> partial, we just need to convert the shard to replicate
-                    current_placement = cast(Shard, current)
-                    # TODO - resolve sharding to partials?
-                    new_local_tensor = current_placement._to_replicate_tensor(
-                        local_tensor, device_mesh, i, transform_info.logical_shape
-                    )
-                else:
-                    # partial -> partial no op, should never hit
-                    new_local_tensor = local_tensor
-
-            if new_local_tensor is None:
-                raise RuntimeError(
-                    "Failed to create new local tensor during redistribution"
+        elif target.is_partial():
+            if current.is_replicate():
+                partial_spec = cast(Partial, target)
+                # skip the replicate to partial transformation when we are in backward pass
+                # In this case we keep the grad as replicate, this is because we don't
+                # want to convert the replicated gradients back to partial, although
+                # that's logically conform with the same layout, converting the gradients
+                # back to partial is actually useless as you would have to do reduce later
+                # which would be more expensive than keeping it replicate! For this reason,
+                # we keep the replicate grad here.
+                new_local_tensor = (
+                    partial_spec._partition_value(local_tensor, device_mesh, i)
+                    if not is_backward
+                    else local_tensor
                 )
-            local_tensor = new_local_tensor
+            elif current.is_shard():
+                if not is_backward:
+                    raise RuntimeError(
+                        f"redistribute from {current} to {target} not supported yet"
+                    )
+                # for backward shard -> partial, we just need to convert the shard to replicate
+                current_placement = cast(Shard, current)
+                # TODO - resolve sharding to partials?
+                new_local_tensor = current_placement._to_replicate_tensor(
+                    local_tensor, device_mesh, i, transform_info.logical_shape
+                )
+            else:
+                # partial -> partial no op, should never hit
+                new_local_tensor = local_tensor
 
         if new_local_tensor is None:
-            raise RuntimeError("redistribute failed!")
+            raise RuntimeError(
+                "Failed to create new local tensor during redistribution"
+            )
+        local_tensor = new_local_tensor
 
-        if not async_op and isinstance(new_local_tensor, funcol.AsyncCollectiveTensor):
-            new_local_tensor = new_local_tensor.wait()
+    if new_local_tensor is None:
+        raise RuntimeError("redistribute failed!")
 
-        return new_local_tensor
+    if not async_op and isinstance(new_local_tensor, funcol.AsyncCollectiveTensor):
+        new_local_tensor = new_local_tensor.wait()
+
+    return new_local_tensor
 
 
 def get_tensor_sharding_shapes_by_dim(

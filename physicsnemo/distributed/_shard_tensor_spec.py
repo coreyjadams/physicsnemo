@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
+from physicsnemo.distributed.utils import compute_split_shapes
 from physicsnemo.utils.version_check import check_module_requirements
 
 check_module_requirements("physicsnemo.distributed.shard_tensor")
@@ -108,7 +109,6 @@ class ShardTensorSpec(DTensorSpec):
             Dictionary of shard sizes by mesh dim, or tuple of sizes for specific dim
         """
         if self._sharding_sizes is None:
-<<<<<<< HEAD
             if mesh_dim is None:
                 shard_shapes_by_dim, global_shape = _all_gather_shard_shapes(
                     self._local_shape, self.placements, self.mesh
@@ -122,13 +122,6 @@ class ShardTensorSpec(DTensorSpec):
                     self.mesh.get_group(mesh_dim),
                     do_checks=False,
                 )
-=======
-            shard_shapes_by_dim, global_shape = _all_gather_shard_shapes(
-                self._local_shape, self.placements, self.mesh
-            )
-            self._sharding_sizes = shard_shapes_by_dim
-            self.tensor_meta = self.tensor_meta._replace(shape=global_shape)
->>>>>>> main
         if mesh_dim is not None:
             if mesh_dim in self._sharding_sizes:
                 return self._sharding_sizes[mesh_dim]
@@ -288,42 +281,35 @@ def _gather_shard_shapes_for_dim(
     """
     local_size = dist.get_world_size(group=local_group)
 
-    with record_function("all_gather_shard_shapes__shape_tensor"):
-        if not isinstance(local_shape, torch.Tensor):
-            shape = torch.tensor(local_shape, device="cpu", pin_memory=True)
+    if not isinstance(local_shape, torch.Tensor):
+        shape = torch.tensor(local_shape, device="cpu", pin_memory=True)
 
-    with record_function("all_gather_shard_shapes__to_cuda"):
-        local_shape = shape.to(device="cuda", non_blocking=True)
+    local_shape = shape.to(device="cuda", non_blocking=True)
 
-    with record_function("all_gather_shard_shapes__shape_output_list"):
-        all_shapes = [
-            torch.zeros_like(local_shape, device="cuda") for _ in range(local_size)
-        ]
+    all_shapes = [
+        torch.zeros_like(local_shape, device="cuda") for _ in range(local_size)
+    ]
 
-    with record_function("all_gather_shard_shapes__all_gather"):
-        dist.all_gather(all_shapes, local_shape, group=local_group)
+    dist.all_gather(all_shapes, local_shape, group=local_group)
 
-    with record_function("all_gather_shard_shapes__to_cpu"):
-        all_shapes = [torch.Size(s.cpu().tolist()) for s in all_shapes]
+    all_shapes = [torch.Size(s.cpu().tolist()) for s in all_shapes]
 
     if do_checks:
-        with record_function("all_gather_shard_shapes__check_rank"):
-            # Check that all shapes are the same rank
-            if not all(len(local_shape) == len(all_s) for all_s in all_shapes):
-                raise ValueError(
-                    "Rank mismatch detected when attempting to infer shapes and sizes"
-                )
+        # Check that all shapes are the same rank
+        if not all(len(local_shape) == len(all_s) for all_s in all_shapes):
+            raise ValueError(
+                "Rank mismatch detected when attempting to infer shapes and sizes"
+            )
 
-        with record_function("all_gather_shard_shapes__check_dim"):
-            # Every dimension must be equal for this list, along the sharded axis
-            for d in range(len(local_shape)):
-                if d == tensor_dim:
-                    continue  # skip the sharded dimension
-                if not all([local_shape[d] == all_s[d] for all_s in all_shapes]):
-                    raise ValueError(
-                        f"Dimension mismatch detected at non-sharded dimension {d}. "
-                        "All local shapes must match except along sharded dimension."
-                    )
+        # Every dimension must be equal for this list, along the sharded axis
+        for d in range(len(local_shape)):
+            if d == tensor_dim:
+                continue  # skip the sharded dimension
+            if not all([local_shape[d] == all_s[d] for all_s in all_shapes]):
+                raise ValueError(
+                    f"Dimension mismatch detected at non-sharded dimension {d}. "
+                    "All local shapes must match except along sharded dimension."
+                )
 
     return tuple(all_shapes)
 
@@ -334,38 +320,33 @@ def _all_gather_shard_shapes(
     target_mesh: DeviceMesh,
     do_checks: bool = False,
 ):
-    with record_function("all_gather_shard_shapes"):
-        shard_shapes_by_dim = {}
-        global_shape = [s for s in local_shape]
-        # We start by assuming the global shape is the local shape and fix it on sharded axes
-        for mesh_axis, placement in enumerate(placements):
+    shard_shapes_by_dim = {}
+    global_shape = [s for s in local_shape]
+    # We start by assuming the global shape is the local shape and fix it on sharded axes
+    for mesh_axis, placement in enumerate(placements):
 
-            if isinstance(placement, Shard):
+        if isinstance(placement, Shard):
 
-                tensor_dim = placement.dim
-                local_group = target_mesh.get_group(mesh_axis)
+            tensor_dim = placement.dim
+            local_group = target_mesh.get_group(mesh_axis)
 
-                shard_shapes_for_dim = _gather_shard_shapes_for_dim(
-                    local_shape, tensor_dim, local_group, do_checks
-                )
-                with record_function("all_gather_shard_shapes__build_local_meta"):
-                    local_meta = tuple(
-                        # torch.Size(tuple(s)) for s in zip(all_shapes)
-                        shard_shapes_for_dim
-                    )
+            shard_shapes_for_dim = _gather_shard_shapes_for_dim(
+                local_shape, tensor_dim, local_group, do_checks
+            )
+            local_meta = tuple(
+                # torch.Size(tuple(s)) for s in zip(all_shapes)
+                shard_shapes_for_dim
+            )
 
-                shard_shapes_by_dim[mesh_axis] = local_meta
+            shard_shapes_by_dim[mesh_axis] = local_meta
 
-                # To infer the global shape _for this axis_,
-                # we have to loop over each axis in the rank list
-                # To check what placement is there.
-                # This assumes full sharding:
-                with record_function("all_gather_shard_shapes__global_shape"):
-                    global_shape[tensor_dim] = sum(
-                        [all_s[tensor_dim] for all_s in local_meta]
-                    )
+            # To infer the global shape _for this axis_,
+            # we have to loop over each axis in the rank list
+            # To check what placement is there.
+            # This assumes full sharding:
+            global_shape[tensor_dim] = sum([all_s[tensor_dim] for all_s in local_meta])
 
-        return shard_shapes_by_dim, tuple(global_shape)
+    return shard_shapes_by_dim, tuple(global_shape)
 
 
 def compute_sharding_sizes_from_chunking_global_shape(

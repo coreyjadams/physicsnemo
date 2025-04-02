@@ -532,6 +532,10 @@ class DistributedManager(object):
 
         key = hash(mesh)
 
+        # Initialize a cache for the groups
+        if not hasattr(self, "_mesh_groups"):
+            self._mesh_groups = {}
+
         if key in self._mesh_groups.keys():
             return self._mesh_groups[key]
         else:

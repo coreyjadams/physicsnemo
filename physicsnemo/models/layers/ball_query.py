@@ -107,7 +107,7 @@ class BallQuery(torch.autograd.Function):
     ):
         # Only works for batch size 1
         if points1.shape[0] != 1:
-            raise AssertionError("nly works for batch size 1")
+            raise AssertionError("Ball Query only works for batch size 1")
 
         # Convert from torch to warp
         ctx.points1 = wp.from_torch(
