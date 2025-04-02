@@ -105,3 +105,63 @@ def unbind_rules(op_schema: OpSchema) -> OutputSharding:
             for _ in range(unbind_dim_shape)
         ]
         return OutputSharding(output_spec_list)
+
+
+@register_prop_rule(aten.select.int, schema_info=RuntimeSchemaInfo(1))
+def select_rules(op_schema: OpSchema) -> OutputSharding:
+    """
+    Need to add rules for unbinding for stormcast and attention in general
+    """
+
+    args_schema = op_schema.args_schema
+    # Select mandates these:
+    dim = args_schema[-2]
+    # We don't really need the actual index to propagate.  But here's how
+    # we'd access it:
+    # index = args_schema[-1]
+
+    # if the chunking dimension is along a dimension that is sharded, we have to handle that.
+    # If it's along an unsharded dimension, there is nearly nothing to do.
+
+    input_spec = args_schema[0]
+
+    input_placements = input_spec.placements
+
+    shards = [s for s in input_placements if isinstance(s, Shard)]
+
+    # We are reducing tensor rank and returning one sharding per tensor:
+    original_shape = list(input_spec.shape)
+
+    output_stride = _stride_from_contiguous_shape_C_style(original_shape)
+
+    if dim in [i.dim for i in shards]:
+        raise Exception("No implementation for unbinding along sharding axis yet.")
+
+    else:
+
+        # Need to create a new global meta:
+        new_meta = TensorMeta(
+            torch.Size(tuple(original_shape)),
+            stride=output_stride,
+            dtype=input_spec.tensor_meta.dtype,
+        )
+        # The placements get adjusted too
+        new_placements = []
+        for p in input_spec.placements:
+            if isinstance(p, Replicate):
+                new_placements.append(p)
+            elif isinstance(p, Shard):
+                if p.dim > dim:
+                    new_placements.append(Shard(p.dim - 1))
+                else:
+                    new_placements.append(p)
+            elif isinstance(p, Partial):
+                raise Exception("Partial placement not supported yet for select")
+
+        output_spec = DTensorSpec(
+            mesh=input_spec.mesh,
+            placements=tuple(new_placements),
+            tensor_meta=new_meta,
+        )
+
+        return OutputSharding(output_spec)
