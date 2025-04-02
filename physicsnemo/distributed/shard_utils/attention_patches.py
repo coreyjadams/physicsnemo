@@ -371,6 +371,200 @@ class RingSDPA(torch.autograd.Function):
         return grad_q, grad_k, grad_v, grad_attn_mask, None, None, None
 
 
+class RingSDPABlocking(torch.autograd.Function):
+    """
+    Performs scaled dot product attention on sharded Q, K, V.
+
+    The ring allreduce happens in a blocking manner.  This isn't more efficient, but
+    it is useful for understanding the algorithm and debugging.
+
+    For details about the ring attention, see: https://arxiv.org/abs/2310.01889
+    Note that the original implementation is a combination of JAX + flash attention + ring attention.
+    Here, instead, we leverage the underlying and built-in pytorch efficienct attention.
+
+    A key difference with this algorithm is how we track the per-block normalizations.  The pytorch
+    function returns log_sumexp, which we use for a running normalization.  But it has to be kept in log
+    space to prevent underflow/overflow as well as precision issues.  See the helper functions
+    `add_log_sumexp` and `stable_signed_accumulate` for more details.
+    """
+
+    # comm_stream = torch.cuda.Stream()
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        mesh: DeviceMesh,
+        ring_config: RingPassingConfig,
+        attn_args: dict,
+    ) -> torch.Tensor:
+        """
+        Forward pass for the ring attention implementation.  This implementation
+        will overlap the communication with the computation.  Note that there is an
+        explicit sync in each iteration to prevent the communication stream from getting
+        ahead of the computation stream, by waiting on the all_to_all operation to complete.
+        """
+
+        ctx.attn_args = attn_args
+        ctx.mesh = mesh
+        ctx.ring_config = ring_config
+
+        # Create buffers to store outputs
+        log_global_output = None
+        sign_global_output = None
+        global_log_sumexp = None
+
+        # For the first iteration, use local tensors
+        current_k, current_v = k, v
+
+        for i in range(ring_config.mesh_size):
+
+            # Perform computation on current k,v while communication happens
+            (
+                output,
+                log_sumexp,
+                philox_seed,
+                philox_offset,
+            ) = aten._scaled_dot_product_efficient_attention(
+                q,
+                current_k,
+                current_v,
+                attn_mask,
+                compute_log_sumexp=True,
+                **attn_args,
+            )
+
+            # Add an extra dimension to the log_sumexp:
+            log_sumexp = log_sumexp.unsqueeze(-1)
+            log_output = torch.log(torch.abs(output))
+            sign_output = torch.sign(output)
+
+            log_global_output, sign_global_output = stable_signed_accumulate(
+                log_global_output,
+                sign_global_output,
+                log_output,
+                sign_output,
+                log_sumexp,
+            )
+
+            global_log_sumexp = add_log_sumexp(global_log_sumexp, log_sumexp)
+
+            # send k and v to the next rank:
+            current_k = perform_ring_iteration(current_k, ctx.mesh, ctx.ring_config)
+            current_v = perform_ring_iteration(current_v, ctx.mesh, ctx.ring_config)
+
+        # Compute the final output
+        stable_output = sign_global_output * torch.exp(
+            log_global_output - global_log_sumexp
+        )
+
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            attn_mask,
+            stable_output,
+            global_log_sumexp,
+            philox_seed,
+            philox_offset,
+        )
+        ctx.grad_input_mask = (True, True, True, attn_mask is not None)
+
+        return stable_output
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        None,
+        None,
+        None,
+    ]:
+        """
+        Backward pass for the ring SDPA.
+
+        Currently, this is not overlapping communication with the computation.
+        Note that the backward pass has 2x communication: send k, v but also grad_k, grad_v.
+
+        """
+        (
+            q,
+            k,
+            v,
+            attn_mask,
+            output,
+            log_sumexp,
+            philox_seed,
+            philox_offset,
+        ) = ctx.saved_tensors
+        attn_args = ctx.attn_args
+
+        grad_q = torch.zeros_like(
+            q, device=q.device, memory_format=torch.contiguous_format
+        )
+        grad_k = torch.zeros_like(
+            k, device=k.device, memory_format=torch.contiguous_format
+        )
+        grad_v = torch.zeros_like(
+            v, device=v.device, memory_format=torch.contiguous_format
+        )
+        grad_attn_mask = None
+
+        # TODO: overlap communication with computation.
+        # This needs to be done in two stages.  First, we can send k, v along the ring before computing
+        # the gradients.  We also need to send grad_k, grad_v along the ring and accumulate them.
+
+        # Since the next iteration's grad_k, grad_v do not depend on the current iteration's gradient
+        # outputs, we can still overlap.  But we need two sync spots instead of one.
+        # Algorithm therefore looks like this:
+        # 1. If iteration != N-1, send k, v to the next GPU asycn after combining them into one tensor.
+        # 2. If iteration != 0, wait for grad_k, grad_v to be received from the previous GPU and split them.
+        # 2. Compute the gradients on the local block (grad_q, grad_k, grad_v)
+        # 3. Accumulate the gradients on the local block.
+        # 5. If iteration != N-1, wait for k, v to be received from the previous GPU (and split them) before the next iteration
+        # 4. If iteration != 0, send grad_k, grad_v to the next GPU after combining them into one tensor.
+
+        for i in range(ctx.ring_config.mesh_size):
+
+            (
+                block_grad_q,
+                block_grad_k,
+                block_grad_v,
+                block_grad_attn_mask,
+            ) = aten._scaled_dot_product_efficient_attention_backward(
+                grad_output,
+                q,
+                k,
+                v,
+                attn_mask,
+                output,
+                log_sumexp,
+                philox_seed,
+                philox_offset,
+                grad_input_mask=ctx.grad_input_mask,
+                **attn_args,
+            )
+
+            grad_q += block_grad_q
+            grad_k += block_grad_k
+            grad_v += block_grad_v
+
+            # Send k, v, grad_k, grad_v to the next rank:
+            k = perform_ring_iteration(k, ctx.mesh, ctx.ring_config)
+            v = perform_ring_iteration(v, ctx.mesh, ctx.ring_config)
+            grad_k = perform_ring_iteration(grad_k, ctx.mesh, ctx.ring_config)
+            grad_v = perform_ring_iteration(grad_v, ctx.mesh, ctx.ring_config)
+
+        return grad_q, grad_k, grad_v, grad_attn_mask, None, None, None
+
+
 def ring_sdpa(
     q: ShardTensor,
     k: ShardTensor,

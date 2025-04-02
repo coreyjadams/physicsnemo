@@ -25,8 +25,9 @@ try:
         from .conv_patches import generic_conv_nd_wrapper
         from .natten_patches import na2d_wrapper
         from .normalization_patches import group_norm_wrapper
+        from .point_cloud_ops import ball_query_wrapper
         from .pooling_patches import generic_avg_pool_nd_wrapper
-        
+        from .unpooling_patches import interpolate_wrapper
+
 except ImportError:
     pass
-
