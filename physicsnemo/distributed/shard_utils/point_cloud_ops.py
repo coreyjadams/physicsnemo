@@ -27,6 +27,7 @@ from physicsnemo.utils.version_check import check_module_requirements
 check_module_requirements("physicsnemo.distributed.shard_tensor")
 
 from torch.distributed.tensor.placement_types import (  # noqa: E402
+    Replicate,
     Shard,
 )
 
@@ -92,8 +93,7 @@ def ring_ball_query(
 
     # Get the shard sizes for the point cloud going around the ring.
     # We've already checked that the mesh is 1D so call the '0' index.
-    shard_sizes = points2._spec.sharding_sizes()[0]
-    print(f"shard_sizes: {shard_sizes}")
+    p2_shard_sizes = points2._spec.sharding_sizes()[0]
 
     # Call the differentiable version of the ring-ball-query:
     mapping_shard, num_neighbors_shard, outputs_shard = RingBallQuery.apply(
@@ -103,7 +103,7 @@ def ring_ball_query(
         lengths2,
         mesh,
         ring_config,
-        shard_sizes,
+        p2_shard_sizes,
         wrapped,
         *args,
         **kwargs,
@@ -114,15 +114,51 @@ def ring_ball_query(
     # Requires a little work to fish out parameters but that's it.
     # For now, using blocking inference to get the output shapes.
 
+    # For the output shapes, we can compute the output sharding if needed.  If the placement
+    # is Replicate, just infer since there aren't shardings.
+    if type(points1._spec.placements[0]) == Replicate:
+        map_shard_shapes = "infer"
+        neighbors_shard_shapes = "infer"
+        outputs_shard_shapes = "infer"
+    elif type(points1._spec.placements[0]) == Shard:
+
+        p1_shard_sizes = points1._spec.sharding_sizes()[0]
+
+        # This conversion to shard tensor can be done explicitly computing the output shapes.
+
+        b = mapping_shard.shape[0]
+        mp = mapping_shard.shape[-1]
+        d = points1.shape[-1]
+        mapping_shard_output_sharding = {
+            0: tuple(torch.Size([b, s[1], mp]) for s in p1_shard_sizes),
+        }
+        num_neighbors_shard_output_sharding = {
+            0: tuple(torch.Size([b, s[1]]) for s in p1_shard_sizes),
+        }
+        outputs_shard_output_sharding = {
+            0: tuple(torch.Size([b, s[1], mp, d]) for s in p1_shard_sizes),
+        }
+
+        map_shard_shapes = mapping_shard_output_sharding
+        # map_shard_shapes = "infer"
+        neighbors_shard_shapes = num_neighbors_shard_output_sharding
+        outputs_shard_shapes = outputs_shard_output_sharding
+
     # Convert back to ShardTensor
     mapping_shard = ShardTensor.from_local(
-        mapping_shard, points1._spec.mesh, points1._spec.placements, "infer"
+        mapping_shard, points1._spec.mesh, points1._spec.placements, map_shard_shapes
     )
     num_neighbors_shard = ShardTensor.from_local(
-        num_neighbors_shard, points1._spec.mesh, points1._spec.placements, "infer"
+        num_neighbors_shard,
+        points1._spec.mesh,
+        points1._spec.placements,
+        neighbors_shard_shapes,
     )
     outputs_shard = ShardTensor.from_local(
-        outputs_shard, points1._spec.mesh, points1._spec.placements, "infer"
+        outputs_shard,
+        points1._spec.mesh,
+        points1._spec.placements,
+        outputs_shard_shapes,
     )
     return mapping_shard, num_neighbors_shard, outputs_shard
 

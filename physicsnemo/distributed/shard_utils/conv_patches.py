@@ -248,6 +248,34 @@ def compute_halo_configs_from_conv_args(
     return halo_configs
 
 
+def compute_output_shape(
+    sharding_shape: Tuple[int, ...],
+    conv_kwargs: Dict[str, Any],
+    kernel_size: Tuple[int, ...],
+) -> Tuple[int, ...]:
+    """
+    For a specified input shape, determine the output shape after a convolution.
+
+    """
+
+    output_shape = []
+    tensor_rank = len(sharding_shape[2:])
+    for tensor_dim in range(tensor_rank):
+        num = (
+            sharding_shape[tensor_dim + 2]
+            + 2 * conv_kwargs["padding"][tensor_dim]
+            - (kernel_size[tensor_dim] - 1) * conv_kwargs["dilation"][tensor_dim]
+            - 1
+        )
+        o = num / conv_kwargs["stride"][tensor_dim] + 1
+        output_shape.append(int(o))
+
+    # To compute the output shape, we first need to know the real input shape.
+    # For this function, there are two changes
+
+    return tuple(output_shape)
+
+
 def partial_conv_nd(
     input: ShardTensor,
     weight: torch.nn.Parameter,
@@ -278,6 +306,36 @@ def partial_conv_nd(
     # It also *updates* conv_kwargs in place to set padding to 0 on the sharded dims
     halo_configs = compute_halo_configs_from_conv_args(input, kernel_size, conv_kwargs)
 
+    # We get one halo_config per sharded dim.
+
+    sharding_shapes = input._spec.sharding_sizes()
+    # # First, update the shapes to take into account the halo and edge paddings:
+
+    real_input_shapes = {}
+    for mesh_dim, sharing_tuple in sharding_shapes.items():
+        tensor_dim = halo_configs[mesh_dim].tensor_dim
+        real_input_shapes[mesh_dim] = []
+        for i, s in enumerate(sharing_tuple):
+            padding = halo_configs[mesh_dim].halo_size
+
+            if i == 0 or i == len(sharing_tuple) - 1:
+                # On the edge of the split, the additional size is halo + edge padding
+                padding += halo_configs[mesh_dim].edge_padding_size
+            else:
+                # Otherwise, its 2xhalo size added on.
+                padding += halo_configs[mesh_dim].halo_size
+
+            updated_shape = list(s)
+            updated_shape[tensor_dim] += padding
+
+            real_input_shapes[mesh_dim].append(updated_shape)
+
+    # # Now, from the real input shapes, we can compute the real output shape on every rank:
+    # real_output_shapes = {
+    #     dim : tuple( compute_output_shape(s, conv_kwargs, kernel_size) for s in real_input_shapes[dim] )
+    #     for dim in real_input_shapes
+    # }
+
     input_spec = input._spec
     local_input = input.to_local()
 
@@ -286,7 +344,27 @@ def partial_conv_nd(
         local_input = halo_padding(local_input, input._spec.mesh, halo_config)
 
     # Perform the convolution on the padded tensor
-    output = perform_convolution(local_input, weight, bias, input_spec, conv_kwargs)
+    local_output = perform_convolution(
+        local_input, weight, bias, input_spec, conv_kwargs
+    )
+
+    batch_channel_shape = tuple(local_output.shape[:2])
+    # Update the output shapes to take into account the batch anc channel dims:
+    real_output_shapes = {
+        dim: tuple(
+            batch_channel_shape + compute_output_shape(s, conv_kwargs, kernel_size)
+            for s in real_input_shapes[dim]
+        )
+        for dim in real_input_shapes
+    }
+
+    # Convert the local output to a ShardTensor
+    output = ShardTensor.from_local(
+        local_output,
+        input_spec.mesh,
+        input_spec.placements,
+        sharding_shapes=real_output_shapes,
+    )
 
     return output
 
@@ -354,15 +432,16 @@ class PartialConvND(torch.autograd.Function):
         # Perform local convolution on this shard
         local_chunk = aten.convolution.default(inputs, weights, bias, **conv_kwargs)
         # Wrap result in ShardTensor with specified distribution
-        output = ShardTensor.from_local(
-            local_chunk,
-            input_spec.mesh,
-            input_spec.placements,
-            sharding_shapes="infer",
-        )
+        # output = ShardTensor.from_local(
+        #     local_chunk,
+        #     input_spec.mesh,
+        #     input_spec.placements,
+        #     sharding_shapes="infer",
+        # )
 
-        ctx.requires_input_grad = inputs.requires_grad
-        return output
+        # ctx.requires_input_grad = inputs.requires_grad
+        # return output
+        return local_chunk
 
     @staticmethod
     def backward(
