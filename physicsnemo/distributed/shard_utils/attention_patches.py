@@ -20,14 +20,20 @@ import torch
 import torch.distributed as dist
 import wrapt
 from torch.autograd.profiler import record_function
-from torch.distributed import DeviceMesh
-from torch.distributed.tensor.placement_types import Shard
 
-from physicsnemo.distributed import ShardTensor
-from physicsnemo.distributed.shard_utils.patch_core import (
+from physicsnemo.utils.version_check import check_module_requirements
+
+check_module_requirements("physicsnemo.distributed.shard_tensor")
+
+
+from torch.distributed import DeviceMesh  # noqa: E402
+
+from physicsnemo.distributed import ShardTensor  # noqa: E402
+from physicsnemo.distributed.shard_utils.patch_core import (  # noqa: E402
+    MissingShardPatch,
     UndeterminedShardingError,
 )
-from physicsnemo.distributed.shard_utils.ring import (
+from physicsnemo.distributed.shard_utils.ring import (  # noqa: E402
     RingPassingConfig,
     perform_ring_iteration,
 )
@@ -585,10 +591,9 @@ def ring_sdpa(
     """
 
     mesh = q._spec.mesh
-    for mesh_dim, placement in enumerate(q._spec.placements):
-        if isinstance(placement, Shard):
-            tensor_dim = placement.dim
-            break
+
+    # We can be confident of this because 1D meshes are enforced
+    mesh_dim = 0
 
     local_group = mesh.get_group(mesh_dim)
     local_size = dist.get_world_size(group=local_group)
@@ -596,7 +601,6 @@ def ring_sdpa(
     # Create a config object to simplify function args for message passing:
     ring_config = RingPassingConfig(
         mesh_dim=mesh_dim,
-        tensor_dim=tensor_dim,
         mesh_size=local_size,
         communication_method="p2p",
     )
@@ -653,6 +657,14 @@ def sdpa_wrapper(
     if all([type(_t) == torch.Tensor for _t in (q, k, v)]):
         return wrapped(*args, **kwargs)
     elif all([type(_t) == ShardTensor for _t in (q, k, v)]):
+
+        # Make sure all tensors are on the same mesh
+        if not (q._spec.mesh == k._spec.mesh == v._spec.mesh):
+            raise MissingShardPatch("q, k, and v must all be on the same mesh")
+
+        # Make sure the mesh is 1D
+        if q._spec.mesh.ndim != 1:
+            raise MissingShardPatch("q must be on a 1D mesh")
 
         return ring_sdpa(q, k, v, attn_mask, **kwargs)
 

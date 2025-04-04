@@ -16,7 +16,7 @@
 
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Union
 
 import torch
 import torch.distributed as dist
@@ -37,13 +37,14 @@ class RingPassingConfig:
         communication_method (str): Method for exchanging data ("p2p" or "a2a")
     """
 
-    mesh_dim: int
-    tensor_dim: int
-    mesh_size: int
-
-    CommMethod = Literal["p2p", "a2a"]
     VALID_COMM_METHODS = ["p2p", "a2a"]
-    communication_method: CommMethod = "a2a"
+    VALID_RING_DIRECTIONS = ["forward", "backward"]
+
+    mesh_dim: int
+    mesh_size: int
+    ring_direction: Literal["forward", "backward"] = "forward"
+
+    communication_method: Literal["p2p", "a2a"] = "a2a"
 
     def __post_init__(self) -> None:
         """Validate configuration parameters after initialization.
@@ -58,11 +59,18 @@ class RingPassingConfig:
                 f"Must be one of {self.VALID_COMM_METHODS}"
             )
 
+        if self.ring_direction not in self.VALID_RING_DIRECTIONS:
+            raise ValueError(
+                f"Invalid ring direction: {self.ring_direction}. "
+                f"Must be one of {self.VALID_RING_DIRECTIONS}"
+            )
+
 
 def perform_ring_iteration(
     tensor: torch.Tensor,
     mesh: DeviceMesh,
     ring_config: RingPassingConfig,
+    recv_shape: Union[torch.Size, None] = None,
 ) -> torch.Tensor:
     """
     Performs a ring collective communication where all tensors are the same size.
@@ -92,7 +100,14 @@ def perform_ring_iteration(
     id_for_send = local_rank + 1 if local_rank < local_size - 1 else 0
     id_for_recv = local_rank - 1 if local_rank > 0 else local_size - 1
 
-    tensor_recv = torch.empty_like(tensor)
+    if ring_config.ring_direction == "reverse":
+        # Swap
+        id_for_send, id_for_recv = id_for_recv, id_for_send
+
+    if recv_shape is None:
+        tensor_recv = torch.empty_like(tensor)
+    else:
+        tensor_recv = torch.empty(recv_shape, dtype=dtype, device=device)
 
     if ring_config.communication_method == "p2p":
 
