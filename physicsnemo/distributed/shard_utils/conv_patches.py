@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 import wrapt
 
+from physicsnemo.utils.profiling import profile
 from physicsnemo.utils.version_check import check_module_requirements
 
 check_module_requirements("physicsnemo.distributed.shard_tensor")
@@ -51,6 +52,7 @@ __all__ = [
 ]
 
 
+@profile
 def conv_output_shape(
     L_in: int, padding: int, stride: int, kernel_size: int, dilation: int
 ) -> int:
@@ -73,6 +75,7 @@ def conv_output_shape(
     return int(L_out)
 
 
+@profile
 def compute_halo_from_kernel_stride_and_dilation(
     kernel_size: int,
     stride: int,
@@ -127,6 +130,7 @@ def compute_halo_from_kernel_stride_and_dilation(
     return halo_size
 
 
+@profile
 def padding_from_str_and_params(
     padding: str,
     input_shape: Tuple[int, ...],
@@ -161,6 +165,7 @@ def padding_from_str_and_params(
         raise ValueError(f"Invalid padding specification: {padding}")
 
 
+@profile
 def compute_halo_configs_from_conv_args(
     input: ShardTensor,
     kernel_size: Tuple[int, ...],
@@ -237,6 +242,7 @@ def compute_halo_configs_from_conv_args(
                     halo_size=halo_size,
                     edge_padding_size=padding[kernel_dim],
                     communication_method="a2a",
+                    async_op=True,
                 )
             )
             # Set the padding to 0 on the sharded dims:
@@ -248,6 +254,7 @@ def compute_halo_configs_from_conv_args(
     return halo_configs
 
 
+@profile
 def compute_output_shape(
     sharding_shape: Tuple[int, ...],
     conv_kwargs: Dict[str, Any],
@@ -276,6 +283,7 @@ def compute_output_shape(
     return tuple(output_shape)
 
 
+@profile
 def partial_conv_nd(
     input: ShardTensor,
     weight: torch.nn.Parameter,
@@ -369,6 +377,7 @@ def partial_conv_nd(
     return output
 
 
+@profile
 def perform_convolution(
     inputs: torch.Tensor,
     weights: torch.nn.Parameter,
@@ -401,6 +410,7 @@ class PartialConvND(torch.autograd.Function):
     """
 
     @staticmethod
+    @profile
     def forward(
         ctx,
         inputs: torch.Tensor,
@@ -444,6 +454,7 @@ class PartialConvND(torch.autograd.Function):
         return local_chunk
 
     @staticmethod
+    @profile
     def backward(
         ctx, grad_output: "ShardTensor"
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None, None]:
@@ -605,6 +616,7 @@ def generic_conv_nd_wrapper(
         raise UndeterminedShardingError(msg)
 
 
+@profile
 def repackage_conv_args(
     input: Union[torch.Tensor, ShardTensor],
     weight: Union[torch.Tensor, DTensor],
@@ -661,6 +673,7 @@ def repackage_conv_args(
     return input, weight, bias, return_kwargs
 
 
+@profile
 def repackage_conv_transposed_args(
     input: Union[torch.Tensor, ShardTensor],
     weight: Union[torch.Tensor, DTensor],

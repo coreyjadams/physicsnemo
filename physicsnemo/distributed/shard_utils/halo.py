@@ -20,7 +20,10 @@ from typing import Literal, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.autograd.profiler import record_function
 from torch.distributed.device_mesh import DeviceMesh
+
+from physicsnemo.utils.profiling import profile
 
 """Halo exchange utilities for distributed tensor operations.
 
@@ -57,6 +60,7 @@ class HaloConfig:
     tensor_dim: int
     halo_size: int
     edge_padding_size: int = 0
+    async_op: bool = False
 
     CommMethod = Literal["p2p", "a2a"]
     VALID_COMM_METHODS = ["p2p", "a2a"]
@@ -75,7 +79,14 @@ class HaloConfig:
                 f"Must be one of {self.VALID_COMM_METHODS}"
             )
 
+        if self.async_op and self.communication_method == "p2p":
+            raise ValueError(
+                "Async halo padding is not supported with p2p communication. "
+                "Must be a2a."
+            )
 
+
+@profile
 def halo_padding(
     tensor: torch.Tensor,
     mesh: DeviceMesh,
@@ -96,6 +107,7 @@ def halo_padding(
     return HaloPadding.apply(tensor, mesh, halo_config)
 
 
+@profile
 def unhalo_padding(
     tensor: torch.Tensor,
     mesh: DeviceMesh,
@@ -267,6 +279,7 @@ class UnHaloPadding(torch.autograd.Function):
         return grad_input, None, None
 
 
+@profile
 def halo_padding_fwd_primitive(
     local_tensor: torch.Tensor,
     mesh: DeviceMesh,
@@ -293,7 +306,7 @@ def halo_padding_fwd_primitive(
     # for the other ranks to make this selection anyways.
 
     # Select halo regions to exchange
-    left_indices = torch.arange(0, halo_config.halo_size).to(local_tensor.device)
+    left_indices = torch.arange(0, halo_config.halo_size, device=local_tensor.device)
     max_index = local_tensor.shape[halo_config.tensor_dim]
     right_indices = max_index - 1 - left_indices
     right_indices = torch.flip(right_indices, (0,))
@@ -313,6 +326,7 @@ def halo_padding_fwd_primitive(
         halo_to_left,
         halo_to_right,
         halo_config.communication_method,
+        halo_config.async_op,
     )
 
     # Combine local tensor with received halos
@@ -327,6 +341,7 @@ def halo_padding_fwd_primitive(
     return padded_output
 
 
+@profile
 def slice_halo_regions(
     local_tensor: torch.Tensor,
     mesh: DeviceMesh,
@@ -373,6 +388,7 @@ def slice_halo_regions(
     return left_slice, central_slice, right_slice
 
 
+@profile
 def halo_padding_bwd_primitive(
     grad_output: torch.Tensor,
     mesh: DeviceMesh,
@@ -421,12 +437,14 @@ def halo_padding_bwd_primitive(
     return final_grad_local
 
 
+@profile
 def perform_halo_collective(
     mesh: DeviceMesh,
     mesh_dim: int,
     halo_to_left: torch.Tensor,
     halo_to_right: torch.Tensor,
     method: Literal["p2p", "a2a"] = "a2a",
+    async_op: bool = False,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Performs collective communication to exchange halo regions between ranks.
 
@@ -550,7 +568,14 @@ def perform_halo_collective(
             ).contiguous()
 
         # Perform exchange
-        dist.all_to_all(all_to_all_recv, all_to_all_send, group=local_group)
+        with record_function("all_to_all_queue_and_wait"):
+            request = dist.all_to_all(
+                all_to_all_recv, all_to_all_send, group=local_group, async_op=async_op
+            )
+
+            if async_op:
+                # According to the docs, this will wait until the collectives are enqueued and it's safe to use the recv buffers.
+                request.wait()
 
         # Extract received halos
         halo_from_left = all_to_all_recv[local_rank - 1] if local_rank != 0 else None
@@ -561,6 +586,7 @@ def perform_halo_collective(
     return halo_from_left, halo_from_right
 
 
+@profile
 def apply_halo_tensors(
     mesh: DeviceMesh,
     halo_config: HaloConfig,
@@ -617,6 +643,7 @@ def apply_halo_tensors(
     return torch.cat(padded_output, dim=halo_config.tensor_dim)
 
 
+@profile
 def apply_grad_halo(
     mesh: DeviceMesh,
     halo_config: HaloConfig,
