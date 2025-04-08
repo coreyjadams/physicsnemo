@@ -93,26 +93,26 @@ class BQWarp(nn.Module):
         )
 
         p_grid = torch.reshape(p_grid, (batch_size, nx * ny * nz, 3))
-        p1 = nx * ny * nz
-        p2 = x.shape[1]
+        # p1 = nx * ny * nz
+        # p2 = x.shape[1]
 
         if reverse_mapping:
-            lengths1 = torch.full((batch_size,), p1, dtype=torch.int32)
-            lengths2 = torch.full((batch_size,), p2, dtype=torch.int32)
+            # lengths1 = torch.full((batch_size,), p1, dtype=torch.int32)
+            # lengths2 = torch.full((batch_size,), p2, dtype=torch.int32)
             mapping, num_neighbors, outputs = self.ball_query_layer(
                 p_grid,
                 x,
-                lengths1,
-                lengths2,
+                # lengths1,
+                # lengths2,
             )
         else:
-            lengths1 = torch.full((batch_size,), p2, dtype=torch.int32)
-            lengths2 = torch.full((batch_size,), p1, dtype=torch.int32)
+            # lengths1 = torch.full((batch_size,), p2, dtype=torch.int32)
+            # lengths2 = torch.full((batch_size,), p1, dtype=torch.int32)
             mapping, num_neighbors, outputs = self.ball_query_layer(
                 x,
                 p_grid,
-                lengths1,
-                lengths2,
+                # lengths1,
+                # lengths2,
             )
 
         return mapping, outputs
