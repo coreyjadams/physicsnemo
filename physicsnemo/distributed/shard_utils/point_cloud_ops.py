@@ -21,7 +21,11 @@ import torch.distributed as dist
 import warp as wp
 import wrapt
 
-from physicsnemo.models.layers.ball_query import BallQueryLayer
+from physicsnemo.models.layers.ball_query import (
+    _ball_query_backward_primative_,
+    _ball_query_forward_primative_,
+    ball_query_layer,
+)
 from physicsnemo.utils.version_check import check_module_requirements
 
 check_module_requirements("physicsnemo.distributed.shard_tensor")
@@ -43,7 +47,7 @@ from physicsnemo.distributed.shard_utils.ring import (  # noqa: E402
 
 wp.config.quiet = True
 
-__all__ = ["ball_query_wrapper"]
+__all__ = ["ball_query_layer_wrapper"]
 
 
 def ring_ball_query(
@@ -51,9 +55,7 @@ def ring_ball_query(
     points2: ShardTensor,
     lengths1: Union[torch.Tensor, ShardTensor],
     lengths2: Union[torch.Tensor, ShardTensor],
-    wrapped: Any,
-    *args: Any,
-    **kwargs: Any,
+    bq_kwargs: Any,
 ) -> Tuple[ShardTensor, ShardTensor, ShardTensor]:
     """
     Performs ball query operation on points distributed across ranks in a ring configuration.
@@ -104,9 +106,7 @@ def ring_ball_query(
         mesh,
         ring_config,
         p2_shard_sizes,
-        wrapped,
-        *args,
-        **kwargs,
+        bq_kwargs,
     )
 
     # TODO
@@ -281,9 +281,7 @@ class RingBallQuery(torch.autograd.Function):
         mesh: Any,
         ring_config: RingPassingConfig,
         shard_sizes: list,
-        wrapped: Any,
-        *args: Any,
-        **kwargs: Any,
+        bq_kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for distributed ball query computation.
@@ -313,12 +311,7 @@ class RingBallQuery(torch.autograd.Function):
         current_outputs = None
 
         # For the first iteration, use local tensors
-        current_p1, current_p2, current_l1, current_l2 = (
-            points1,
-            points2,
-            lengths1,
-            lengths2,
-        )
+        current_p1, current_p2 = (points1, points2)
 
         rank = dist.get_rank(group=ctx.mesh.get_group(0))
         world_size = ring_config.mesh_size
@@ -328,15 +321,29 @@ class RingBallQuery(torch.autograd.Function):
         # For uneven point clouds, the global stide is important:
         strides = [s[1] for s in shard_sizes]
 
+        ctx.k = bq_kwargs["k"]
+        ctx.radius = bq_kwargs["radius"]
+        ctx.hash_grid = bq_kwargs["hash_grid"]
+
         for i in range(world_size):
 
             # Calculate which source rank this data is from
             source_rank = (rank - i) % world_size
 
-            local_mapping, local_num_neighbors, local_outputs = wrapped(
-                current_p1, current_p2, current_l1, current_l2, *args, **kwargs
+            # local_mapping, local_num_neighbors, local_outputs = ball_query_layer(
+            #     current_p1, current_p2, current_l1, current_l2, **bq_kwargs
+            # )
+            (
+                local_mapping,
+                local_num_neighbors,
+                local_outputs,
+            ) = _ball_query_forward_primative_(
+                current_p1[0],
+                current_p2[0],
+                ctx.k,
+                ctx.radius,
+                ctx.hash_grid,
             )
-
             # Store the result with its source rank
             rank_results[source_rank] = (
                 local_mapping,
@@ -374,16 +381,21 @@ class RingBallQuery(torch.autograd.Function):
                 )
 
                 stride += strides[r]
+        ctx.save_for_backward(
+            points1, points2, current_mapping, current_num_neighbors, current_outputs
+        )
 
         return current_mapping, current_num_neighbors, current_outputs
 
     @staticmethod
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
-        grad_output: Any,
+        mapping_grad: torch.Tensor,
+        num_neighbors_grad: torch.Tensor,
+        outputs_grad: torch.Tensor,
     ) -> Tuple[None, ...]:
         """
-        Backward pass for distributed ball query computation.
+        Backward pass for distributed ring ball query computation.
 
         Args:
             ctx: Context containing saved variables from forward pass
@@ -392,17 +404,62 @@ class RingBallQuery(torch.autograd.Function):
         Returns:
             Gradients for inputs (currently not implemented)
         """
-        raise NotImplementedError("Backward pass not implemented")
-        return None, None, None, None, None, None, None, None
+        # mesh = ctx.mesh
+        # ring_config = ctx.ring_config
+        # world_size = ring_config.mesh_size
+
+        (
+            points1,
+            points2,
+            current_mapping,
+            current_num_neighbors,
+            current_outputs,
+        ) = ctx.saved_tensors
+        # k = ctx.k
+        # radius = ctx.radius
+        # hash_grid = ctx.hash_grid
+
+        # We need to do a ring again in the backward direction.
+        # The backward pass is computed locally, and then the gradients
+        # and p2 are moved along the ring together.
+        # for i in range(world_size):
+        # Calculate which source rank this data is from
+
+        local_p2_grad = _ball_query_backward_primative_(
+            points1[0],
+            points2[0],
+            current_mapping,
+            current_num_neighbors,
+            current_outputs,
+            mapping_grad,
+            num_neighbors_grad,
+            outputs_grad,
+        )
+        print(f"local_p2_grad: {local_p2_grad}")
+        # print(f"mapping_grad: {mapping_grad}")
+        # print(f"num_neighbors_grad: {num_neighbors_grad}")
+        # print(f"outputs_grad: {outputs_grad}")
+        local_p1_grad = torch.zeros_like(points1)
+
+        return (
+            local_p1_grad,
+            local_p2_grad.unsqueeze(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 @wrapt.patch_function_wrapper(
     "physicsnemo.models.layers.ball_query",
-    "BallQueryLayer.forward",
+    "ball_query_layer",
     enabled=ShardTensor.patches_enabled,
 )
-def ball_query_wrapper(
-    wrapped: Any, instance: BallQueryLayer, args: tuple, kwargs: dict
+def ball_query_layer_wrapper(
+    wrapped: Any, instance: Any, args: tuple, kwargs: dict
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     Tuple[ShardTensor, ShardTensor, ShardTensor],
@@ -439,14 +496,11 @@ def ball_query_wrapper(
         Tuple of (mapping, num_neighbors, outputs) as torch.Tensor or ShardTensor
     """
 
-    # Extract the arguments
-    if len(args) >= 4:
-        points1, points2, lengths1, lengths2 = args[:4]
-    else:
-        points1 = kwargs.get("points1", args[0] if len(args) > 0 else None)
-        points2 = kwargs.get("points2", args[1] if len(args) > 1 else None)
-        lengths1 = kwargs.get("lengths1", args[2] if len(args) > 2 else None)
-        lengths2 = kwargs.get("lengths2", args[3] if len(args) > 3 else None)
+    points1, points2, lengths1, lengths2, bq_kwargs = repackage_ball_query_args(
+        *args, **kwargs
+    )
+
+    print(bq_kwargs)
 
     # If inputs are ShardTensors, handle them appropriately
     if all(isinstance(t, ShardTensor) for t in (points1, points2)):
@@ -454,13 +508,13 @@ def ball_query_wrapper(
         # Make sure all meshes are the same
         if points1._spec.mesh != points2._spec.mesh:
             raise MissingShardPatch(
-                "point_cloud_ops.ball_query_wrapper: All point inputs must be on the same mesh"
+                "point_cloud_ops.ball_query_layer_wrapper: All point inputs must be on the same mesh"
             )
 
         # make sure all meshes are 1D
         if points1._spec.mesh.ndim != 1:
             raise MissingShardPatch(
-                "point_cloud_ops.ball_query_wrapper: All point inputs must be on 1D meshes"
+                "point_cloud_ops.ball_query_layer_wrapper: All point inputs must be on 1D meshes"
             )
 
         # Do we need a ring?
@@ -468,19 +522,21 @@ def ball_query_wrapper(
         if isinstance(points2_placement, Shard):
             # We need a ring
             mapping, num_neighbors, outputs = ring_ball_query(
-                points1, points2, lengths1, lengths2, wrapped
+                points1, points2, lengths1, lengths2, bq_kwargs
             )
         else:
             # No ring is needed
             # Call the original function with local tensors
 
-            mapping, num_neighbors, outputs = wrapped(
-                points1.to_local(),
-                points2.to_local(),
+            local_p1 = points1.to_local()
+            local_p2 = points2.to_local()
+
+            mapping, num_neighbors, outputs = ball_query_layer(
+                local_p1,
+                local_p2,
                 lengths1,
                 lengths2,
-                *args[4:],
-                **kwargs,
+                **bq_kwargs,
             )
 
             mapping = ShardTensor.from_local(
@@ -497,10 +553,64 @@ def ball_query_wrapper(
 
     # If inputs are regular torch tensors, just call the original function
     elif all(isinstance(t, torch.Tensor) for t in (points1, points2)):
-        return wrapped(*args, **kwargs)
+        return ball_query_layer(points1, points2, lengths1, lengths2, **bq_kwargs)
 
     # If inputs are mixed types, raise an error
     else:
         raise UndeterminedShardingError(
             "points1 and points2 must be the same types (torch.Tensor or ShardTensor)"
         )
+
+
+def repackage_ball_query_args(
+    points1: Union[torch.Tensor, ShardTensor],
+    points2: Union[torch.Tensor, ShardTensor],
+    lengths1: Union[torch.Tensor, ShardTensor],
+    lengths2: Union[torch.Tensor, ShardTensor],
+    k: int,
+    radius: float,
+    hash_grid: wp.HashGrid,
+    *args: Any,
+    **kwargs: Any,
+) -> Tuple[
+    Union[torch.Tensor, ShardTensor],
+    Union[torch.Tensor, ShardTensor],
+    Union[torch.Tensor, ShardTensor],
+    Union[torch.Tensor, ShardTensor],
+    dict,
+]:
+    """Repackages ball query arguments into a standard format.
+
+    Takes the arguments that could be passed to a ball query operation
+    and separates them into core tensor inputs (points1, points2, lengths1, lengths2)
+    and configuration parameters packaged as a kwargs dict.
+
+    Args:
+        points1: First set of points
+        points2: Second set of points
+        lengths1: Lengths of each batch in points1
+        lengths2: Lengths of each batch in points2
+        *args: Additional positional args
+        **kwargs: Additional keyword args
+
+    Returns:
+        Tuple containing:
+        - points1 tensor
+        - points2 tensor
+        - lengths1 tensor
+        - lengths2 tensor
+        - Dict of ball query configuration parameters
+    """
+    # Extract any additional parameters that might be in kwargs
+    # or use defaults if not provided
+    return_kwargs = {
+        "k": k,
+        "radius": radius,
+        "hash_grid": hash_grid,
+    }
+
+    # Add any explicitly passed parameters
+    if kwargs:
+        return_kwargs.update(kwargs)
+
+    return points1, points2, lengths1, lengths2, return_kwargs
