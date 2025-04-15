@@ -97,56 +97,6 @@ class BoundingBox(Protocol):
 
 
 @dataclass
-class DoMINOSurfaceData:
-    """Surface data configuration for DoMINO dataset.
-
-    Attributes:
-        variables: Names of surface variables.
-        points_sample: Number of surface points to sample per batch.
-        num_neighbors: Number of surface neighbors to consider for nearest neighbors approach.
-        resample: Whether to resample the surface before kdtree/knn. Not available if caching.
-        resampling_points: Number of points to resample the surface to.
-        sampling_algorithm: Algorithm to use for surface sampling ("area_weighted" or "random").
-        factors: Non-dimensionalization factors for surface variables.
-            If set, and scaling_type is:
-            - min_max_scaling -> rescale surface_fields to the min/max set here
-            - mean_std_scaling -> rescale surface_fields to the mean and std set here.
-        bounding_box_dims: Dimensions of bounding box. Must be an object with min/max
-            attributes that are arraylike.
-    """
-
-    variables: Optional[Sequence] = ("pMean", "wallShearStress")
-    points_sample: int = 1024
-    num_neighbors: int = 11
-    resample: bool = False
-    resampling_points: int = 1_000_000
-    sampling_algorithm: str = Literal["area_weighted", "random"]
-    factors: Optional[Sequence] = None
-    bounding_box_dims: Optional[BoundingBox] = None
-
-
-@dataclass
-class DoMINOVolumeData:
-    """Volume data configuration for DoMINO dataset.
-
-    Attributes:
-        variables: Names of volume variables.
-        points_sample: Number of volume points to sample per batch.
-        factors: Non-dimensionalization factors for volume variables scaling.
-            If set, and scaling_type is:
-            - min_max_scaling -> rescale volume_fields to the min/max set here
-            - mean_std_scaling -> rescale volume_fields to the mean and std set here.
-        bounding_box_dims: Dimensions of bounding box. Must be an object with min/max
-            attributes that are arraylike.
-    """
-
-    variables: Optional[Sequence] = ("UMean", "pMean")
-    points_sample: int = 1024
-    factors: Optional[Sequence] = None
-    bounding_box_dims: Optional[BoundingBox] = None
-
-
-@dataclass
 class DoMINODataConfig:
     """Configuration for DoMINO dataset processing pipeline.
 
