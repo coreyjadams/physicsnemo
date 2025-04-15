@@ -315,6 +315,8 @@ def pad_inp(arr: ArrayType, npoin: int, pad_value: float = 0.0) -> ArrayType:
     return arr_padded
 
 
+# CJA NOTE: the `sample_array` function is the same optimization I put into shuffle_array.
+# Keeping the cupy compatible version (mine)
 @profile
 def shuffle_array(
     arr: ArrayType,
@@ -351,10 +353,14 @@ def create_directory(filepath: str) -> None:
         os.makedirs(filepath)
 
 
-def get_filenames(filepath: str) -> List[str]:
+def get_filenames(filepath: str, exclude_dirs: bool = False) -> List[str]:
     """Function to get filenames from a directory"""
     if os.path.exists(filepath):
-        filenames = os.listdir(filepath)
+        filenames = []
+        for item in os.listdir(filepath):
+            if exclude_dirs and os.path.isdir(os.path.join(filepath, item)):
+                continue
+            filenames.append(item)
         return filenames
     else:
         FileNotFoundError()
@@ -423,11 +429,12 @@ def mean_std_sampling(
     return idx_all
 
 
-def dict_to_device(state_dict, device):
+def dict_to_device(state_dict, device, exclude_keys=["filename"]):
     """Function to load dictionary to device"""
     new_state_dict = {}
     for k, v in state_dict.items():
-        new_state_dict[k] = v.to(device)
+        if k not in exclude_keys:
+            new_state_dict[k] = v.to(device)
     return new_state_dict
 
 
