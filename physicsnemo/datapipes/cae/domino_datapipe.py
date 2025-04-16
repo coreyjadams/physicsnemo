@@ -403,6 +403,12 @@ class DoMINODataPipe(Dataset):
                 if key not in data.keys():
                     data[key] = self.keys_to_read_if_available[key]
 
+            if "filename" in data.keys():
+                data.pop("filename", None)
+
+            if not (isinstance(data["stl_coordinates"], np.ndarray)):
+                data["stl_coordinates"] = np.asarray(data["stl_coordinates"])
+
             # Maybe move to GPU:
             for key in data.keys():
                 data[key] = self.array_provider.asarray(data[key])
@@ -1013,6 +1019,8 @@ class DoMINODataPipe(Dataset):
 def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -> None:
 
     model_type = cfg.model.model_type
+    max_scaling_factor_files = 20
+
     if model_type == "volume" or model_type == "combined":
         vol_save_path = os.path.join(cfg.output, "volume_scaling_factors.npy")
         if not os.path.exists(vol_save_path):
@@ -1103,9 +1111,14 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
                         vol_fields_max = 0.0
                         vol_fields_min = 0.0
 
-                    if j > 20:
+                    if j > max_scaling_factor_files:
                         break
                 vol_scaling_factors = [vol_fields_max, vol_fields_min]
+
+            for i, item in enumerate(vol_scaling_factors):
+                if isinstance(item, cp.ndarray):
+                    vol_scaling_factors[i] = item.get()
+
             np.save(vol_save_path, vol_scaling_factors)
 
     if model_type == "surface" or model_type == "combined":
@@ -1199,10 +1212,15 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
                         surf_fields_max = 0.0
                         surf_fields_min = 0.0
 
-                    if j > 20:
+                    if j > max_scaling_factor_files:
                         break
 
                 surf_scaling_factors = [surf_fields_max, surf_fields_min]
+
+                for i, item in enumerate(surf_scaling_factors):
+                    if isinstance(item, cp.ndarray):
+                        surf_scaling_factors[i] = item.get()
+
             np.save(surf_save_path, surf_scaling_factors)
 
 
