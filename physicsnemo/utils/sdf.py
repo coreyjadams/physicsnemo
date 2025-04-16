@@ -111,7 +111,7 @@ def signed_distance_field(
     Module ...
     array([0.5], dtype=float32)
     """
-
+    wp.config.quiet = True
     wp.init()
 
     # If cupy arrays come in, we have to convert them to numpy arrays:

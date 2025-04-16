@@ -433,9 +433,7 @@ class DoMINODataPipe(Dataset):
 
             def load_one(key):
                 with np.load(filepath) as data:
-                    # This toggles between cupy and numpy depending on the value of self.config.gpu_preprocessing
-                    with self.device_context:
-                        return key, self.array_provider.asarray(data[key])
+                    return key, data[key]
 
             def check_optional_keys():
                 with np.load(filepath) as data:
@@ -454,7 +452,8 @@ class DoMINODataPipe(Dataset):
                 return optional_results
 
             executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=self.max_workers
+                max_workers=1
+                # max_workers=self.max_workers
             )
 
             if return_futures:
@@ -469,6 +468,11 @@ class DoMINODataPipe(Dataset):
             else:
                 # Original behavior - wait for all to complete
                 results = dict(executor.map(load_one, self.keys_to_read))
+
+                # Move the results to the GPU:
+                with self.device_context:
+                    for key in results.keys():
+                        results[key] = self.array_provider.asarray(results[key])
 
                 # Check the optional ones:
                 optional_results = check_optional_keys()
