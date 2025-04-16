@@ -160,6 +160,7 @@ class DoMINODataConfig:
 
     data_path: Path
     phase: Literal["train", "val", "test"]
+    use_pickle_file_loading: bool = True
 
     # Surface-specific variables:
     surface_variables: Optional[Sequence] = ("pMean", "wallShearStress")
@@ -375,8 +376,8 @@ class DoMINODataPipe(Dataset):
         # Always read these keys
         self.keys_to_read = ["stl_coordinates", "stl_centers", "stl_faces", "stl_areas"]
         self.keys_to_read_if_available = {
-            "stream_velocity": 30.00,
-            "air_density": 1.205,
+            "stream_velocity": np.asarray(30.00),
+            "air_density": np.asarray(1.205),
         }
         self.volume_keys = ["volume_mesh_centers", "volume_fields"]
         self.surface_keys = [
@@ -393,44 +394,66 @@ class DoMINODataPipe(Dataset):
 
     @profile
     def threaded_data_read(self, filepath, max_workers=None, return_futures=False):
-        if max_workers is not None:
-            self.max_workers = max_workers
 
-        def load_one(key):
-            with np.load(filepath) as data:
-                # This toggles between cupy and numpy depending on the value of self.config.gpu_preprocessing
-                return key, self.array_provider.asarray(data[key])
-
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
-
-        if return_futures:
-            # Return the futures instead of waiting
-            futures = {key: executor.submit(load_one, key) for key in self.keys_to_read}
-
-            # Also create a future for checking optional keys
-            def check_optional_keys():
-                np_file = np.load(filepath)
-                optional_results = {}
-                for key in self.keys_to_read_if_available:
-                    if key in np_file.keys():
-                        optional_results[key] = np_file[key]
-                return optional_results
-
-            futures["_optional_keys"] = executor.submit(check_optional_keys)
-            return futures, executor
-        else:
-            # Original behavior - wait for all to complete
-            results = dict(executor.map(load_one, self.keys_to_read))
-
-            # Check the optional ones:
-            np_file = np.load(filepath)
+        if self.config.use_pickle_file_loading:
+            with open(filepath, "rb") as f:
+                data = np.load(f, allow_pickle=True).item()
 
             for key in self.keys_to_read_if_available:
-                if key in np_file.keys():
-                    results[key] = np_file[key]
+                if key not in data.keys():
+                    data[key] = self.keys_to_read_if_available[key]
 
-            executor.shutdown()
-            return results
+            # Maybe move to GPU:
+            for key in data.keys():
+                data[key] = self.array_provider.asarray(data[key])
+
+            return data
+        else:
+            if max_workers is not None:
+                self.max_workers = max_workers
+
+            def load_one(key):
+                print(filepath)
+                with np.load(filepath) as data:
+                    # This toggles between cupy and numpy depending on the value of self.config.gpu_preprocessing
+                    return key, self.array_provider.asarray(data[key])
+
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_workers
+            )
+
+            if return_futures:
+                # Return the futures instead of waiting
+                futures = {
+                    key: executor.submit(load_one, key) for key in self.keys_to_read
+                }
+
+                # Also create a future for checking optional keys
+                def check_optional_keys():
+                    np_file = np.load(filepath)
+                    optional_results = {}
+                    for key in self.keys_to_read_if_available:
+                        if key in np_file.keys():
+                            optional_results[key] = np_file[key]
+                        else:
+                            optional_results[key] = self.keys_to_read_if_available[key]
+                    return optional_results
+
+                futures["_optional_keys"] = executor.submit(check_optional_keys)
+                return futures, executor
+            else:
+                # Original behavior - wait for all to complete
+                results = dict(executor.map(load_one, self.keys_to_read))
+
+                # Check the optional ones:
+                np_file = np.load(filepath)
+
+                for key in self.keys_to_read_if_available:
+                    if key in np_file.keys():
+                        results[key] = np_file[key]
+
+                executor.shutdown()
+                return results
 
     def __len__(self):
         return len(self.indices)
