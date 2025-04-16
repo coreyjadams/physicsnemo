@@ -397,9 +397,9 @@ def create_grid(mx: ArrayType, mn: ArrayType, nres: ArrayType) -> ArrayType:
 
     xp = array_type(mx)
 
-    dx = xp.linspace(mn[0], mx[0], nres[0])
-    dy = xp.linspace(mn[1], mx[1], nres[1])
-    dz = xp.linspace(mn[2], mx[2], nres[2])
+    dx = xp.linspace(mn[0], mx[0], nres[0], dtype=mx.dtype)
+    dy = xp.linspace(mn[1], mx[1], nres[1], dtype=mx.dtype)
+    dz = xp.linspace(mn[2], mx[2], nres[2], dtype=mx.dtype)
 
     xv, yv, zv = xp.meshgrid(dx, dy, dz)
     xv = xp.expand_dims(xv, -1)

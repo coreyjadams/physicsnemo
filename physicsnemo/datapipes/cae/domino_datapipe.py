@@ -188,7 +188,7 @@ class DoMINODataConfig:
     compute_scaling_factors: bool = False
     caching: bool = False
     deterministic: bool = False
-    gpu_preprocessing: bool = False
+    gpu_preprocessing: bool = True
     gpu_output: bool = True
 
     def __post_init__(self):
