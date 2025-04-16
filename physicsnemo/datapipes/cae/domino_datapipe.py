@@ -160,7 +160,7 @@ class DoMINODataConfig:
 
     data_path: Path
     phase: Literal["train", "val", "test"]
-    use_pickle_file_loading: bool = True
+    use_pickle_file_loading: bool = False
 
     # Surface-specific variables:
     surface_variables: Optional[Sequence] = ("pMean", "wallShearStress")
@@ -188,7 +188,7 @@ class DoMINODataConfig:
     compute_scaling_factors: bool = False
     caching: bool = False
     deterministic: bool = False
-    gpu_preprocessing: bool = True
+    gpu_preprocessing: bool = False
     gpu_output: bool = True
 
     def __post_init__(self):
@@ -419,7 +419,6 @@ class DoMINODataPipe(Dataset):
                 self.max_workers = max_workers
 
             def load_one(key):
-                print(filepath)
                 with np.load(filepath) as data:
                     # This toggles between cupy and numpy depending on the value of self.config.gpu_preprocessing
                     return key, self.array_provider.asarray(data[key])
@@ -457,6 +456,8 @@ class DoMINODataPipe(Dataset):
                 for key in self.keys_to_read_if_available:
                     if key in np_file.keys():
                         results[key] = np_file[key]
+                    else:
+                        results[key] = self.keys_to_read_if_available[key]
 
                 executor.shutdown()
                 return results
@@ -711,9 +712,7 @@ class DoMINODataPipe(Dataset):
 
             # Have to normalize neighbors after the kNN and sampling
             if self.config.normalize_coordinates:
-                core_dict["surf_grid"] = normalize(
-                    cp.asarray(core_dict["surf_grid"]), s_max, s_min
-                )
+                core_dict["surf_grid"] = normalize(core_dict["surf_grid"], s_max, s_min)
                 surface_coordinates = normalize(surface_coordinates, s_max, s_min)
                 surface_neighbors = normalize(surface_neighbors, s_max, s_min)
 
@@ -724,14 +723,14 @@ class DoMINODataPipe(Dataset):
                         surf_std = self.config.surface_factors[1]
                         # TODO - Are these array calls needed?
                         surface_fields = standardize(
-                            surface_fields, cp.asarray(surf_mean), cp.asarray(surf_std)
+                            surface_fields, xp.asarray(surf_mean), xp.asarray(surf_std)
                         )
                     elif self.config.scaling_type == "min_max_scaling":
                         surf_min = self.config.surface_factors[1]
                         surf_max = self.config.surface_factors[0]
                         # TODO - Are these array calls needed?
                         surface_fields = normalize(
-                            surface_fields, cp.asarray(surf_max), cp.asarray(surf_min)
+                            surface_fields, xp.asarray(surf_max), xp.asarray(surf_min)
                         )
 
         else:
