@@ -30,6 +30,7 @@ import concurrent.futures
 import os
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional, Protocol, Sequence, Union
@@ -44,6 +45,7 @@ from scipy.spatial import KDTree
 from torch import Tensor
 from torch.utils.data import Dataset, default_collate
 
+from physicsnemo.distributed import DistributedManager
 from physicsnemo.utils.domino.utils import (
     ArrayType,
     area_weighted_shuffle_array,
@@ -250,7 +252,6 @@ class DoMINODataPipe(Dataset):
         self,
         input_path,
         model_type: Literal["surface", "volume", "combined"],
-        device: int = 0,
         **data_config_overrides,
         # data_path: Union[str, Path],  # Input data path
         # phase: Literal["train", "val", "test"] = "train",  # Train, test or val
@@ -293,6 +294,15 @@ class DoMINODataPipe(Dataset):
     ):
         # Perform config packaging and validation
         self.config = DoMINODataConfig(data_path=input_path, **data_config_overrides)
+
+        dist = DistributedManager()
+        if self.config.gpu_preprocessing or self.config.gpu_output:
+            # Make sure we move data to the right device:
+            target_device = dist.device.index
+            self.device_context = cp.cuda.Device(target_device)
+            self.device_context.use()
+        else:
+            self.device_context = nullcontext()
 
         if self.config.deterministic:
             np.random.seed(42)
@@ -375,10 +385,12 @@ class DoMINODataPipe(Dataset):
 
         # Always read these keys
         self.keys_to_read = ["stl_coordinates", "stl_centers", "stl_faces", "stl_areas"]
-        self.keys_to_read_if_available = {
-            "stream_velocity": np.asarray(30.00),
-            "air_density": np.asarray(1.205),
-        }
+        with self.device_context:
+            xp = self.array_provider
+            self.keys_to_read_if_available = {
+                "stream_velocity": xp.asarray(30.00),
+                "air_density": xp.asarray(1.205),
+            }
         self.volume_keys = ["volume_mesh_centers", "volume_fields"]
         self.surface_keys = [
             "surface_mesh_centers",
@@ -410,8 +422,9 @@ class DoMINODataPipe(Dataset):
                 data["stl_coordinates"] = np.asarray(data["stl_coordinates"])
 
             # Maybe move to GPU:
-            for key in data.keys():
-                data[key] = self.array_provider.asarray(data[key])
+            with self.device_context:
+                for key in data.keys():
+                    data[key] = self.array_provider.asarray(data[key])
 
             return data
         else:
@@ -421,7 +434,24 @@ class DoMINODataPipe(Dataset):
             def load_one(key):
                 with np.load(filepath) as data:
                     # This toggles between cupy and numpy depending on the value of self.config.gpu_preprocessing
-                    return key, self.array_provider.asarray(data[key])
+                    with self.device_context:
+                        return key, self.array_provider.asarray(data[key])
+
+            def check_optional_keys():
+                with np.load(filepath) as data:
+                    optional_results = {}
+                    for key in self.keys_to_read_if_available:
+                        if key in data.keys():
+                            optional_results[key] = data[key]
+                        else:
+                            optional_results[key] = self.keys_to_read_if_available[key]
+                with self.device_context:
+                    optional_results = {
+                        key: self.array_provider.asarray(value)
+                        for key, value in optional_results.items()
+                    }
+
+                return optional_results
 
             executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.max_workers
@@ -434,16 +464,6 @@ class DoMINODataPipe(Dataset):
                 }
 
                 # Also create a future for checking optional keys
-                def check_optional_keys():
-                    np_file = np.load(filepath)
-                    optional_results = {}
-                    for key in self.keys_to_read_if_available:
-                        if key in np_file.keys():
-                            optional_results[key] = np_file[key]
-                        else:
-                            optional_results[key] = self.keys_to_read_if_available[key]
-                    return optional_results
-
                 futures["_optional_keys"] = executor.submit(check_optional_keys)
                 return futures, executor
             else:
@@ -451,13 +471,8 @@ class DoMINODataPipe(Dataset):
                 results = dict(executor.map(load_one, self.keys_to_read))
 
                 # Check the optional ones:
-                np_file = np.load(filepath)
-
-                for key in self.keys_to_read_if_available:
-                    if key in np_file.keys():
-                        results[key] = np_file[key]
-                    else:
-                        results[key] = self.keys_to_read_if_available[key]
+                optional_results = check_optional_keys()
+                results.update(optional_results)
 
                 executor.shutdown()
                 return results
@@ -493,10 +508,11 @@ class DoMINODataPipe(Dataset):
     def preprocess_combined(self, data_dict):
 
         # Pull these out and force to fp32:
-        STREAM_VELOCITY = data_dict["stream_velocity"].astype(
-            self.array_provider.float32
-        )
-        AIR_DENSITY = data_dict["air_density"].astype(self.array_provider.float32)
+        with self.device_context:
+            STREAM_VELOCITY = data_dict["stream_velocity"].astype(
+                self.array_provider.float32
+            )
+            AIR_DENSITY = data_dict["air_density"].astype(self.array_provider.float32)
 
         # Pull these pieces out of the data_dict for manipulation
         stl_vertices = data_dict["stl_coordinates"]
@@ -508,7 +524,6 @@ class DoMINODataPipe(Dataset):
 
         length_scale = xp.amax(xp.amax(stl_vertices, 0) - xp.amin(stl_vertices, 0))
 
-        # Center of mass calculation
         center_of_mass = calculate_center_of_mass(stl_centers, stl_sizes)
 
         if self.config.bounding_box_dims_surf is None:
