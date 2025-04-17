@@ -26,10 +26,9 @@ pressure, wall-shear-stress for surface variables. The different parameters such
 variable names, domain resolution, sampling size etc. are configurable in config.yaml. 
 """
 
-import concurrent.futures
 import os
 import time
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +39,7 @@ import cupy as cp
 import numpy as np
 import torch
 import torch.cuda.nvtx as nvtx
+import zarr
 from omegaconf import DictConfig
 from scipy.spatial import KDTree
 from torch import Tensor
@@ -375,9 +375,6 @@ class DoMINODataPipe(Dataset):
         else:
             self.knn = KDTree
 
-        # Add dictionary to store preloaded data
-        self.preloaded_data = defaultdict(dict)
-
         # Used if threaded data is enabled:
         self.max_workers = 8
 
@@ -405,108 +402,128 @@ class DoMINODataPipe(Dataset):
             self.keys_to_read.extend(self.surface_keys)
 
     @profile
-    def threaded_data_read(self, filepath, max_workers=None, return_futures=False):
+    def read_data_zarr(self, filepath):
+        @profile
+        def read_chunk_into_array(N, n_threads, i, zarr_array, result_array):
+            chunk_size = N // n_threads
+            start = i * chunk_size
+            end = (i + 1) * chunk_size if i < n_threads - 1 else N
+            result_array[start:end] = zarr_array[start:end]
 
-        if self.config.use_pickle_file_loading:
-            with open(filepath, "rb") as f:
-                data = np.load(f, allow_pickle=True).item()
+        @profile
+        def chunked_read(zarr_group, key, max_threads=16):
+            zarr_array = zarr_group[key]
+            N = zarr_array.shape[0]
 
+            # Pre-allocate the full result array
+            result_shape = zarr_array.shape
+            result_dtype = zarr_array.dtype
+            result = np.empty(result_shape, dtype=result_dtype)
+
+            with ThreadPoolExecutor(max_workers=max_threads) as executor:
+                futures = [
+                    executor.submit(
+                        read_chunk_into_array, N, max_threads, i, zarr_array, result
+                    )
+                    for i in range(max_threads)
+                ]
+
+                # Wait for all threads to complete
+                for future in futures:
+                    future.result()
+
+            return result
+
+        with zarr.open_group(filepath, mode="r") as z:
+
+            data = {}
+            for key in self.keys_to_read:
+                if z[key].shape == ():
+                    data[key] = z[key]
+                elif key in ["volume_fields", "volume_mesh_centers"]:
+                    data[key] = chunked_read(z, key)
+                else:
+                    data[key] = z[key][:]
+                # Convert data to the gpu if needed:
+                with self.device_context:
+                    data[key] = self.array_provider.asarray(data[key])
+
+            # Optional, maybe-present keys
             for key in self.keys_to_read_if_available:
                 if key not in data.keys():
                     data[key] = self.keys_to_read_if_available[key]
 
-            if "filename" in data.keys():
-                data.pop("filename", None)
-
-            if not (isinstance(data["stl_coordinates"], np.ndarray)):
-                data["stl_coordinates"] = np.asarray(data["stl_coordinates"])
-
-            # Maybe move to GPU:
-            with self.device_context:
-                for key in data.keys():
-                    data[key] = self.array_provider.asarray(data[key])
-
-            return data
-        else:
-            if max_workers is not None:
-                self.max_workers = max_workers
-
-            def load_one(key):
-                with np.load(filepath) as data:
-                    return key, data[key]
-
-            def check_optional_keys():
-                with np.load(filepath) as data:
-                    optional_results = {}
-                    for key in self.keys_to_read_if_available:
-                        if key in data.keys():
-                            optional_results[key] = data[key]
-                        else:
-                            optional_results[key] = self.keys_to_read_if_available[key]
-                with self.device_context:
-                    optional_results = {
-                        key: self.array_provider.asarray(value)
-                        for key, value in optional_results.items()
-                    }
-
-                return optional_results
-
-            executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1
-                # max_workers=self.max_workers
-            )
-
-            if return_futures:
-                # Return the futures instead of waiting
-                futures = {
-                    key: executor.submit(load_one, key) for key in self.keys_to_read
-                }
-
-                # Also create a future for checking optional keys
-                futures["_optional_keys"] = executor.submit(check_optional_keys)
-                return futures, executor
-            else:
-                # Original behavior - wait for all to complete
-                results = dict(executor.map(load_one, self.keys_to_read))
-
-                # Move the results to the GPU:
-                with self.device_context:
-                    for key in results.keys():
-                        results[key] = self.array_provider.asarray(results[key])
-
-                # Check the optional ones:
-                optional_results = check_optional_keys()
-                results.update(optional_results)
-
-                executor.shutdown()
-                return results
-
-    def __len__(self):
-        return len(self.indices)
+        return data
 
     @profile
-    def preload_index(self, index, max_workers=None):
-        """
-        Preload volume data for specified indices using ThreadPoolExecutor.
+    def read_data_npy(self, filepath):
+        with open(filepath, "rb") as f:
+            data = np.load(f, allow_pickle=True).item()
 
-        Args:
-            index: Target index to preload.
-            max_workers: Maximum number of worker threads. If None, uses default.
-        """
+        for key in self.keys_to_read_if_available:
+            if key not in data.keys():
+                data[key] = self.keys_to_read_if_available[key]
+
+        if "filename" in data.keys():
+            data.pop("filename", None)
+
+        if not (isinstance(data["stl_coordinates"], np.ndarray)):
+            data["stl_coordinates"] = np.asarray(data["stl_coordinates"])
+
+        # Maybe move to GPU:
+        with self.device_context:
+            for key in data.keys():
+                data[key] = self.array_provider.asarray(data[key])
+
+        return data
+
+    @profile
+    def read_data_npz(
+        self,
+        filepath,
+        max_workers=None,
+    ):
 
         if max_workers is not None:
             self.max_workers = max_workers
 
-        # Get the target file name:
-        actual_index = self.indices[index]
-        filepath = self.data_path / self.filenames[actual_index]
+        def load_one(key):
+            with np.load(filepath) as data:
+                return key, data[key]
 
-        # Load the data with futures
-        self.preloaded_data[index] = self.threaded_data_read(
-            filepath,
-            max_workers=self.max_workers,
-            return_futures=True,  # Return futures instead of waiting
-        )
+        def check_optional_keys():
+            with np.load(filepath) as data:
+                optional_results = {}
+                for key in self.keys_to_read_if_available:
+                    if key in data.keys():
+                        optional_results[key] = data[key]
+                    else:
+                        optional_results[key] = self.keys_to_read_if_available[key]
+            with self.device_context:
+                optional_results = {
+                    key: self.array_provider.asarray(value)
+                    for key, value in optional_results.items()
+                }
+
+            return optional_results
+
+        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        results = dict(executor.map(load_one, self.keys_to_read))
+
+        # Move the results to the GPU:
+        with self.device_context:
+            for key in results.keys():
+                results[key] = self.array_provider.asarray(results[key])
+
+        # Check the optional ones:
+        optional_results = check_optional_keys()
+        results.update(optional_results)
+
+        executor.shutdown()
+        return results
+
+    def __len__(self):
+        return len(self.indices)
 
     @profile
     def preprocess_combined(self, data_dict):
@@ -952,25 +969,6 @@ class DoMINODataPipe(Dataset):
             )
             return_dict.update(surface_dict)
 
-        # if self.config.sampling:
-        #     # nvtx.range_push("Geometry Sampling")
-        #     geometry_points = self.geom_points_sample
-        #     geometry_coordinates_sampled, idx_geometry = shuffle_array(
-        #         stl_centers, geometry_points
-        #     )
-        #     if geometry_coordinates_sampled.shape[0] < geometry_points:
-        #         geometry_coordinates_sampled = pad(
-        #             geometry_coordinates_sampled, geometry_points, pad_value=-100.0
-        #         )
-        #     geom_centers = geometry_coordinates_sampled
-        #     # nvtx.range_pop()
-        # else:
-        #     geom_centers = stl_centers
-
-        # # geom_centers = self.array_provider.float32(geom_centers)
-
-        # return_dict["geometry_coordinates"] = geom_centers
-
         return return_dict
 
     @profile
@@ -982,44 +980,19 @@ class DoMINODataPipe(Dataset):
         index = self.indices[idx]
         cfd_filename = self.filenames[index]
 
-        # Get all of the data with the threaded data read
+        # Get all of the data:
         filepath = self.config.data_path / cfd_filename
 
-        # Check if data was preloaded
-        preloaded = False
-        if index in self.preloaded_data and self.preloaded_data[index]:
-            preloaded = True
-            data_or_futures = self.preloaded_data[index]
-
-            # Check if we have futures
-            if isinstance(data_or_futures, tuple) and len(data_or_futures) == 2:
-                futures, executor = data_or_futures
-
-                # Wait for all futures to complete and gather results
-                data_dict = {}
-                for key, future in futures.items():
-                    if key == "_optional_keys":
-                        # Special handling for optional keys
-                        optional_results = future.result()
-                        data_dict.update(optional_results)
-                    else:
-                        k, v = future.result()
-                        data_dict[k] = v
-
-                # Shutdown the executor
-                executor.shutdown()
-            else:
-                # Already resolved data
-                data_dict = data_or_futures
+        if filepath.suffix == ".zarr":
+            data_dict = self.read_data_zarr(filepath)
+        elif filepath.suffix == ".npz":
+            data_dict = self.read_data_npz(filepath)
+        elif filepath.suffix == ".npy":
+            data_dict = self.read_data_npy(filepath)
         else:
-            # Use return_futures=False for direct loading
-            data_dict = self.threaded_data_read(filepath)
+            raise ValueError(f"Unsupported file extension: {filepath.suffix}")
 
         return_dict = self.preprocess_data(data_dict)
-
-        # Before returning, unload the preloaded data if its present:
-        if preloaded:
-            self.preloaded_data.pop(index)
 
         if self.config.gpu_output:
             # Make sure this is all on the GPU:
@@ -1034,14 +1007,16 @@ class DoMINODataPipe(Dataset):
         return return_dict
 
 
+@profile
 def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -> None:
 
     model_type = cfg.model.model_type
-    max_scaling_factor_files = 20
+    max_scaling_factor_files = 5
 
     if model_type == "volume" or model_type == "combined":
         vol_save_path = os.path.join(cfg.output, "volume_scaling_factors.npy")
         if not os.path.exists(vol_save_path):
+            print("Computing volume scaling factors")
             volume_variable_names = list(cfg.variables.volume.solution.keys())
 
             fm_dict = DoMINODataPipe(
@@ -1067,6 +1042,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
             # Calculate mean
             if cfg.model.normalization == "mean_std_scaling":
                 for j in range(len(fm_dict)):
+                    print("On iteration {j}")
                     d_dict = fm_dict[j]
                     vol_fields = d_dict["volume_fields"]
 
@@ -1081,6 +1057,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
                 vol_fields_mean = vol_fields_sum / len(fm_dict)
 
                 for j in range(len(fm_dict)):
+                    print("On iteration {j} again")
                     d_dict = fm_dict[j]
                     vol_fields = d_dict["volume_fields"]
 
@@ -1102,6 +1079,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
 
             if cfg.model.normalization == "min_max_scaling":
                 for j in range(len(fm_dict)):
+                    print(f"Min max scaling on iteration {j}")
                     d_dict = fm_dict[j]
                     vol_fields = d_dict["volume_fields"]
 
@@ -1143,7 +1121,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
         surf_save_path = os.path.join(cfg.output, "surface_scaling_factors.npy")
 
         if not os.path.exists(surf_save_path):
-
+            print("Computing surface scaling factors")
             volume_variable_names = list(cfg.variables.volume.solution.keys())
             surface_variable_names = list(cfg.variables.surface.solution.keys())
 
@@ -1168,6 +1146,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
             # Calculate mean
             if cfg.model.normalization == "mean_std_scaling":
                 for j in range(len(fm_dict)):
+                    print(f"Mean std scaling on iteration {j}")
                     d_dict = fm_dict[j]
                     surf_fields = d_dict["surface_fields"]
 
@@ -1182,6 +1161,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
                 surf_fields_mean = surf_fields_sum / len(fm_dict)
 
                 for j in range(len(fm_dict)):
+                    print(f"Mean std scaling on iteration {j} again")
                     d_dict = fm_dict[j]
                     surf_fields = d_dict["surface_fields"]
 
@@ -1203,6 +1183,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
 
             if cfg.model.normalization == "min_max_scaling":
                 for j in range(len(fm_dict)):
+                    print(f"Min max scaling on iteration {j}")
                     d_dict = fm_dict[j]
                     surf_fields = d_dict["surface_fields"]
 

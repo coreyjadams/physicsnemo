@@ -358,7 +358,11 @@ def get_filenames(filepath: str, exclude_dirs: bool = False) -> List[str]:
     if os.path.exists(filepath):
         filenames = []
         for item in os.listdir(filepath):
-            if exclude_dirs and os.path.isdir(os.path.join(filepath, item)):
+            item_path = os.path.join(filepath, item)
+            if exclude_dirs and os.path.isdir(item_path):
+                # Include directories ending with .zarr even when exclude_dirs is True
+                if item.endswith(".zarr"):
+                    filenames.append(item)
                 continue
             filenames.append(item)
         return filenames
