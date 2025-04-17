@@ -252,44 +252,6 @@ class DoMINODataPipe(Dataset):
         input_path,
         model_type: Literal["surface", "volume", "combined"],
         **data_config_overrides,
-        # data_path: Union[str, Path],  # Input data path
-        # phase: Literal["train", "val", "test"] = "train",  # Train, test or val
-        # surface_variables: Optional[Sequence] = (
-        #     "pMean",
-        #     "wallShearStress",
-        # ),  # Names of surface variables
-        # volume_variables: Optional[Sequence] = (
-        #     "UMean",
-        #     "pMean",
-        # ),  # Names of volume variables
-        # sampling: bool = False,  # Sampling True or False
-        # device: int = 0,  # GPU device id
-        # grid_resolution: Optional[Sequence] = (
-        #     256,
-        #     96,
-        #     64,
-        # ),  # Resolution of latent grid
-        # normalize_coordinates: bool = False,  # Normalize coordinates?
-        # sample_in_bbox: bool = False,  # Sample points in a specified bounding box
-        # volume_points_sample: int = 1024,  # Number of volume points sampled per batch
-        # surface_points_sample: int = 1024,  # Number of surface points sampled per batch
-        # geom_points_sample: int = 300000,  # Number of STL points sampled per batch
-        # positional_encoding: bool = False,  # Positional encoding, True or False
-        # volume_factors=None,  # Non-dimensionalization factors for volume variables
-        # surface_factors=None,  # Non-dimensionalization factors for surface variables
-        # scaling_type=None,  # Scaling min_max or mean_std
-        # model_type=None,  # Model_type, surface, volume or combined
-        # bounding_box_dims=None,  # Dimensions of bounding box
-        # bounding_box_dims_surf=None,  # Dimensions of bounding box
-        # compute_scaling_factors=False, # Are you computing scaling factors?
-        # num_surface_neighbors=11,  # Surface neighbors to consider
-        # gpu_preprocessing=True,
-        # gpu_output=True,
-        # resample_surfaces=False, # resample surfaces before kdtree
-        # resampling_points=1_000_000, # number of points to resample,
-        # surface_sampling_algorithm="area_weighted", # area_weighted or random
-        # for_caching=False,
-        # deterministic_seed=False,
     ):
         # Perform config packaging and validation
         self.config = DoMINODataConfig(data_path=input_path, **data_config_overrides)
@@ -310,9 +272,6 @@ class DoMINODataPipe(Dataset):
             np.random.seed(seed=int(time.time()))
             cp.random.seed(seed=int(time.time()))
 
-        # self.sampling = sampling
-        # self.grid_resolution = grid_resolution
-        # self.normalize_coordinates = normalize_coordinates
         self.model_type = model_type
 
         self.filenames = get_filenames(self.config.data_path, exclude_dirs=True)
@@ -345,14 +304,6 @@ class DoMINODataPipe(Dataset):
                 "float32"
             ),
         ]
-
-        # Initialize a kNN tool based on the preprocessing device:
-        if self.config.gpu_preprocessing:
-            self.knn = cuml.neighbors.NearestNeighbors(
-                n_neighbors=self.config.num_surface_neighbors, algorithm="rbc"
-            )
-        else:
-            self.knn = KDTree
 
         # Used if threaded data is enabled:
         self.max_workers = 8
@@ -655,11 +606,15 @@ class DoMINODataPipe(Dataset):
 
             # Fit the kNN (or KDTree, if CPU) on ALL points:
             if self.array_provider == cp:
-                self.knn.fit(surface_coordinates)
+                knn = cuml.neighbors.NearestNeighbors(
+                    n_neighbors=self.config.num_surface_neighbors,
+                    algorithm="rbc",
+                )
+                knn.fit(surface_coordinates)
             else:
                 # Under the hood this is instantiating a KDTree.
                 # aka here knn is a type, not a class, technically.
-                interp_func = self.knn(surface_coordinates)
+                interp_func = KDTree(surface_coordinates)
 
             if self.config.sampling:
                 # Perform the down sampling:
@@ -693,7 +648,7 @@ class DoMINODataPipe(Dataset):
 
                 # Now, perform the kNN on the sampled points:
                 if self.array_provider == cp:
-                    ii = self.knn.kneighbors(
+                    ii = knn.kneighbors(
                         surface_coordinates_sampled, return_distance=False
                     )
                 else:
@@ -718,7 +673,7 @@ class DoMINODataPipe(Dataset):
 
             else:
                 # We are *not* sampling, kNN on ALL points:
-                ii = self.knn.kneighbors(surface_coordinates, return_distance=False)
+                ii = knn.kneighbors(surface_coordinates, return_distance=False)
 
                 # Construct the neighbors arrays:
                 surface_neighbors = surface_coordinates[ii][:, 1:]

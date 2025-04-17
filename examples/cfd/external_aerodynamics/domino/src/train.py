@@ -506,11 +506,10 @@ def train_epoch(
     last_loss = 0.0
     loss_interval = 1
 
+    gpu_start_info = nvmlDeviceGetMemoryInfo(gpu_handle)
     for i_batch, sample_batched in enumerate(dataloader):
 
         sampled_batched = dict_to_device(sample_batched, device)
-
-        gpu_start_info = nvmlDeviceGetMemoryInfo(gpu_handle)
 
         with autocast(enabled=True):
             with nvtx.range("Model Forward Pass"):
@@ -619,6 +618,7 @@ def train_epoch(
         logging_string += f"  GPU memory used: {gpu_memory_used} Gb\n"
         logging_string += f"  GPU memory delta: {gpu_memory_delta} Gb\n"
         logger.info(logging_string)
+        gpu_start_info = nvmlDeviceGetMemoryInfo(gpu_handle)
 
         # if prediction_vol is not None and prediction_surf is not None:
         #     logger.info(
