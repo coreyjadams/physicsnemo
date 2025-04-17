@@ -234,11 +234,6 @@ class DoMINODataConfig:
 ##### TODO
 # - put model type in config or leave in __init__
 # - check the bounding box protocol works
-# - keep the target device in the constructor, not the config.
-# - Make sure GPU output always triggers
-# - Make sure un-optimized numpy files can load too
-# - make sure bounding box is set right in the config
-# - Make sure random seeds in utils are set correctly (mostly, not there but here)
 
 
 class DoMINODataPipe(Dataset):
@@ -264,6 +259,8 @@ class DoMINODataPipe(Dataset):
             self.device_context.use()
         else:
             self.device_context = nullcontext()
+
+        self.device = dist.device
 
         if self.config.deterministic:
             np.random.seed(42)
@@ -333,30 +330,32 @@ class DoMINODataPipe(Dataset):
 
     @profile
     def read_data_zarr(self, filepath):
-        @profile
-        def read_chunk_into_array(N, n_threads, i, zarr_array, result_array):
-            chunk_size = N // n_threads
-            start = i * chunk_size
-            end = (i + 1) * chunk_size if i < n_threads - 1 else N
-            result_array[start:end] = zarr_array[start:end]
+        # @profile
+        def read_chunk_into_array(ram_array, fs_zarr_array, slice):
+            ram_array[slice] = fs_zarr_array[slice]
 
         @profile
-        def chunked_read(zarr_group, key, max_threads=16):
+        def chunked_aligned_read(zarr_group, key):
             zarr_array = zarr_group[key]
-            N = zarr_array.shape[0]
+
+            shape = zarr_array.shape
+            chunk_size = zarr_array.chunks[0]
 
             # Pre-allocate the full result array
             result_shape = zarr_array.shape
             result_dtype = zarr_array.dtype
             result = np.empty(result_shape, dtype=result_dtype)
 
-            with ThreadPoolExecutor(max_workers=max_threads) as executor:
-                futures = [
-                    executor.submit(
-                        read_chunk_into_array, N, max_threads, i, zarr_array, result
+            futures = []
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                for start in range(0, shape[0], chunk_size):
+                    end = min(start + chunk_size, shape[0])
+                    read_slice = np.s_[start:end]
+                    futures.append(
+                        executor.submit(
+                            read_chunk_into_array, result, zarr_array, read_slice
+                        )
                     )
-                    for i in range(max_threads)
-                ]
 
                 # Wait for all threads to complete
                 for future in futures:
@@ -371,7 +370,7 @@ class DoMINODataPipe(Dataset):
                 if z[key].shape == ():
                     data[key] = z[key]
                 elif key in ["volume_fields", "volume_mesh_centers"]:
-                    data[key] = chunked_read(z, key)
+                    data[key] = chunked_aligned_read(z, key)
                 else:
                     data[key] = z[key][:]
                 # Convert data to the gpu if needed:
@@ -936,15 +935,26 @@ class DoMINODataPipe(Dataset):
 
         return_dict = self.preprocess_data(data_dict)
 
+        # return only pytorch tensor objects.
+        # If returning on CPU (but processed on GPU), convert below.
+        # This assumes we keep the data on the device it's on.
+        for key, value in return_dict.items():
+            if isinstance(value, np.ndarray):
+                return_dict[key] = torch.from_numpy(value)
+            elif isinstance(value, cp.ndarray):
+                return_dict[key] = torch.utils.dlpack.from_dlpack(value.toDlpack())
+
         if self.config.gpu_output:
-            # Make sure this is all on the GPU:
+            # Make sure this is all on the GPU.
+            # Everything here should be a torch tensor now.
             for key, value in return_dict.items():
-                if isinstance(value, np.ndarray):
-                    return_dict[key] = cp.asarray(value)
+                if isinstance(value, torch.Tensor) and not value.is_cuda:
+                    return_dict[key] = value.pin_memory().to(self.device)
         else:
+            # Make sure everything is on the CPU.
             for key, value in return_dict.items():
-                if isinstance(value, cp.ndarray):
-                    return_dict[key] = value.get()
+                if isinstance(value, torch.Tensor) and value.is_cuda:
+                    return_dict[key] = value.cpu()
 
         return return_dict
 
