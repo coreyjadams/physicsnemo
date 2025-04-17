@@ -948,7 +948,9 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
     max_scaling_factor_files = 5
 
     if model_type == "volume" or model_type == "combined":
-        vol_save_path = os.path.join(cfg.output, "volume_scaling_factors.npy")
+        vol_save_path = os.path.join(
+            cfg.project_dir, "volume_scaling_factors.npy"
+        )
         if not os.path.exists(vol_save_path):
             print("Computing volume scaling factors")
             volume_variable_names = list(cfg.variables.volume.solution.keys())
@@ -1052,7 +1054,9 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
             np.save(vol_save_path, vol_scaling_factors)
 
     if model_type == "surface" or model_type == "combined":
-        surf_save_path = os.path.join(cfg.output, "surface_scaling_factors.npy")
+        surf_save_path = os.path.join(
+            cfg.project_dir, "surface_scaling_factors.npy"
+        )
 
         if not os.path.exists(surf_save_path):
             print("Computing surface scaling factors")

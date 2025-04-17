@@ -594,10 +594,10 @@ def main(cfg: DictConfig) -> None:
         num_surf_vars = None
 
     vol_save_path = os.path.join(
-        "outputs", cfg.project.name, "volume_scaling_factors.npy"
+        cfg.project_dir, "volume_scaling_factors.npy"
     )
     surf_save_path = os.path.join(
-        "outputs", cfg.project.name, "surface_scaling_factors.npy"
+        cfg.project_dir, "surface_scaling_factors.npy"
     )
     if os.path.exists(vol_save_path) and os.path.exists(surf_save_path):
         vol_factors = np.load(vol_save_path)

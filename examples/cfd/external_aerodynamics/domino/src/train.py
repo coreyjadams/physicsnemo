@@ -694,11 +694,14 @@ def main(cfg: DictConfig) -> None:
     surf_save_path = os.path.join(
         "outputs", cfg.project.name, "surface_scaling_factors.npy"
     )
-    if os.path.exists(vol_save_path) and os.path.exists(surf_save_path):
+    if os.path.exists(vol_save_path):
         vol_factors = np.load(vol_save_path)
-        surf_factors = np.load(surf_save_path)
     else:
         vol_factors = None
+
+    if os.path.exists(surf_save_path):
+        surf_factors = np.load(surf_save_path)
+    else:
         surf_factors = None
 
     train_dataset = create_domino_dataset(

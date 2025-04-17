@@ -19,6 +19,7 @@ project: # Project name
   
 exp_tag: 1 # Experiment tag
 # Main output directory.
+project_dir: outputs/${project.name}/
 output: outputs/${project.name}/${exp_tag}
 
 hydra: # Hydra config
