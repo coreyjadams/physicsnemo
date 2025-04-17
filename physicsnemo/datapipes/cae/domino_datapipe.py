@@ -303,7 +303,9 @@ class DoMINODataPipe(Dataset):
         ]
 
         # Used if threaded data is enabled:
-        self.max_workers = 8
+        self.max_workers = 24
+        # Create a single thread pool for the class
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
 
         # Define here the keys to read for each __getitem__ call
 
@@ -328,14 +330,30 @@ class DoMINODataPipe(Dataset):
         if self.model_type == "surface" or self.model_type == "combined":
             self.keys_to_read.extend(self.surface_keys)
 
+    def __del__(self):
+        # Clean up the executor when the instance is being destroyed
+        if hasattr(self, "executor"):
+            self.executor.shutdown()
+
     @profile
     def read_data_zarr(self, filepath):
-        # @profile
+
+        # def create_pinned_streaming_space(shape, dtype):
+        #     # TODO - this function could boost performance a little, but
+        #     # the pinned memory pool seems too small.
+        #     if self.array_provider == cp:
+        #         nbytes = np.prod(shape) * dtype.itemsize
+        #         ptr = cp.cuda.alloc_pinned_memory(nbytes)
+        #         arr = np.frombuffer(ptr, dtype)
+        #         return arr.reshape(shape)
+        #     else:
+        #         return np.empty(shape, dtype=dtype)
+
         def read_chunk_into_array(ram_array, fs_zarr_array, slice):
             ram_array[slice] = fs_zarr_array[slice]
 
         @profile
-        def chunked_aligned_read(zarr_group, key):
+        def chunked_aligned_read(zarr_group, key, futures):
             zarr_array = zarr_group[key]
 
             shape = zarr_array.shape
@@ -344,38 +362,57 @@ class DoMINODataPipe(Dataset):
             # Pre-allocate the full result array
             result_shape = zarr_array.shape
             result_dtype = zarr_array.dtype
+
             result = np.empty(result_shape, dtype=result_dtype)
 
-            futures = []
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                for start in range(0, shape[0], chunk_size):
-                    end = min(start + chunk_size, shape[0])
-                    read_slice = np.s_[start:end]
-                    futures.append(
-                        executor.submit(
-                            read_chunk_into_array, result, zarr_array, read_slice
-                        )
+            for start in range(0, shape[0], chunk_size):
+                end = min(start + chunk_size, shape[0])
+                read_slice = np.s_[start:end]
+                futures.append(
+                    self.executor.submit(
+                        read_chunk_into_array, result, zarr_array, read_slice
                     )
-
-                # Wait for all threads to complete
-                for future in futures:
-                    future.result()
+                )
 
             return result
 
         with zarr.open_group(filepath, mode="r") as z:
 
             data = {}
+            futures = []
+            if "volume_fields" in z.keys():
+                data["volume_fields"] = chunked_aligned_read(
+                    z, "volume_fields", futures
+                )
+            if "volume_mesh_centers" in z.keys():
+                data["volume_mesh_centers"] = chunked_aligned_read(
+                    z, "volume_mesh_centers", futures
+                )
+
             for key in self.keys_to_read:
                 if z[key].shape == ():
                     data[key] = z[key]
                 elif key in ["volume_fields", "volume_mesh_centers"]:
-                    data[key] = chunked_aligned_read(z, key)
+                    continue
                 else:
-                    data[key] = z[key][:]
-                # Convert data to the gpu if needed:
-                with self.device_context:
-                    data[key] = self.array_provider.asarray(data[key])
+                    data[key] = np.empty(z[key].shape, dtype=z[key].dtype)
+                    slice = np.s_[:]
+                    futures.append(
+                        self.executor.submit(
+                            read_chunk_into_array, data[key], z[key], slice
+                        )
+                    )
+
+            # Now wait for all the futures to complete
+            for future in futures:
+                result = future.result()
+                if isinstance(result, tuple) and len(result) == 2:
+                    key, value = result
+                    data[key] = value
+
+            # Move big data to GPU
+            for key in data.keys():
+                data[key] = self.array_provider.asarray(data[key])
 
             # Optional, maybe-present keys
             for key in self.keys_to_read_if_available:
@@ -433,11 +470,10 @@ class DoMINODataPipe(Dataset):
                     key: self.array_provider.asarray(value)
                     for key, value in optional_results.items()
                 }
-
             return optional_results
 
-        executor = ThreadPoolExecutor(max_workers=self.max_workers)
-        results = dict(executor.map(load_one, self.keys_to_read))
+        # Use the class-level executor instead of creating a new one
+        results = dict(self.executor.map(load_one, self.keys_to_read))
 
         # Move the results to the GPU:
         with self.device_context:
@@ -448,7 +484,6 @@ class DoMINODataPipe(Dataset):
         optional_results = check_optional_keys()
         results.update(optional_results)
 
-        executor.shutdown()
         return results
 
     def __len__(self):
