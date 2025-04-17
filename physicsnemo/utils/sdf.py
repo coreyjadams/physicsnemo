@@ -23,6 +23,8 @@ import numpy as np
 import warp as wp
 from numpy.typing import NDArray
 
+wp.config.quiet = True
+
 
 @wp.kernel
 def _bvh_query_distance(
@@ -111,7 +113,6 @@ def signed_distance_field(
     Module ...
     array([0.5], dtype=float32)
     """
-    wp.config.quiet = True
     wp.init()
 
     # If cupy arrays come in, we have to convert them to numpy arrays:

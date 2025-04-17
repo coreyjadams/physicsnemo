@@ -162,7 +162,6 @@ class DoMINODataConfig:
 
     data_path: Path
     phase: Literal["train", "val", "test"]
-    use_pickle_file_loading: bool = False
 
     # Surface-specific variables:
     surface_variables: Optional[Sequence] = ("pMean", "wallShearStress")
@@ -324,26 +323,6 @@ class DoMINODataPipe(Dataset):
         # Why shuffle the indices here if only using random access below?
 
         np.random.shuffle(self.indices)
-        # self.surface_variables = surface_variables
-        # self.volume_variables = volume_variables
-        # self.volume_points = volume_points_sample
-        # self.surface_points = surface_points_sample
-        # self.geom_points_sample = geom_points_sample
-        # self.sample_in_bbox = sample_in_bbox
-        # self.device = device
-        # self.positional_encoding = positional_encoding
-        # self.volume_factors = volume_factors
-        # self.surface_factors = surface_factors
-        # self.scaling_type = scaling_type
-        # self.compute_scaling_factors = compute_scaling_factors
-        # self.num_surface_neighbors = num_surface_neighbors
-        # self.gpu_preprocessing = gpu_preprocessing
-        # self.gpu_output = gpu_output
-
-        # self.resample_surfaces = resample_surfaces
-        # self.resampling_points = resampling_points
-        # self.surface_sampling_algorithm = surface_sampling_algorithm
-        # self.deterministic_seed = deterministic_seed
 
         # Determine the array provider based on what device
         # will do preprocessing:

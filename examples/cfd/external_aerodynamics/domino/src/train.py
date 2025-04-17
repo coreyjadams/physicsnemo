@@ -49,6 +49,7 @@ import torch.cuda.nvtx as nvtx
 
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.utils import load_checkpoint, save_checkpoint
+from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
 
 from physicsnemo.datapipes.cae.domino_datapipe import (
     compute_scaling_factors,
@@ -57,6 +58,19 @@ from physicsnemo.datapipes.cae.domino_datapipe import (
 )
 from physicsnemo.models.domino.model import DoMINO
 from physicsnemo.utils.domino.utils import *
+
+# This is included for GPU memory tracking:
+from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
+import time
+
+# Initialize NVML
+nvmlInit()
+
+
+from physicsnemo.utils.profiling import profile, Profiler
+
+Profiler().enable("line_profiler")
+Profiler().initialize()
 
 
 def relative_loss_fn(output, target, padded_value=-10):
@@ -469,12 +483,15 @@ def validation_step(
     return avg_vloss
 
 
+@profile
 def train_epoch(
     dataloader,
     model,
     optimizer,
     scaler,
     tb_writer,
+    logger,
+    gpu_handle,
     epoch_index,
     device,
     integral_scaling_factor,
@@ -483,6 +500,8 @@ def train_epoch(
     surf_loss_scaling=None,
 ):
 
+    dist = DistributedManager()
+
     running_loss = 0.0
     last_loss = 0.0
     loss_interval = 1
@@ -490,6 +509,8 @@ def train_epoch(
     for i_batch, sample_batched in enumerate(dataloader):
 
         sampled_batched = dict_to_device(sample_batched, device)
+
+        gpu_start_info = nvmlDeviceGetMemoryInfo(gpu_handle)
 
         with autocast(enabled=True):
             with nvtx.range("Model Forward Pass"):
@@ -584,41 +605,63 @@ def train_epoch(
         # Gather data and report
         running_loss += loss.item()
 
-        if prediction_vol is not None and prediction_surf is not None:
-            print(
-                f"Device {device}, batch processed: {i_batch + 1}, loss volume: {loss_norm_vol:.5f} \
-            , loss surface: {loss_norm_surf:.5f}, loss integral: {loss_integral:.5f}, loss surface area: {loss_norm_surf_area:.5f}"
-            )
-        elif prediction_vol is not None:
-            print(
-                f"Device {device}, batch processed: {i_batch + 1}, loss volume: {loss_norm_vol:.5f}"
-            )
-        elif prediction_surf is not None:
-            print(
-                f"Device {device}, batch processed: {i_batch + 1} \
-            , loss surface: {loss_norm_surf:.5f}, loss integral: {loss_integral:.5f}, loss surface area: {loss_norm_surf_area:.5f}"
-            )
+        gpu_end_info = nvmlDeviceGetMemoryInfo(gpu_handle)
+        gpu_memory_used = gpu_end_info.used / (1024**3)
+        gpu_memory_delta = (gpu_end_info.used - gpu_start_info.used) / (1024**3)
+
+        logging_string = f"Device {device}, batch processed: {i_batch + 1}\n"
+        if prediction_vol is not None:
+            logging_string += f"  loss volume: {loss_norm_vol:.5f}\n"
+        if prediction_surf is not None:
+            logging_string += f"  loss surface: {loss_norm_surf:.5f}\n"
+            logging_string += f"  loss integral: {loss_integral:.5f}\n"
+            logging_string += f"  loss surface area: {loss_norm_surf_area:.5f}\n"
+        logging_string += f"  GPU memory used: {gpu_memory_used} Gb\n"
+        logging_string += f"  GPU memory delta: {gpu_memory_delta} Gb\n"
+        logger.info(logging_string)
+
+        # if prediction_vol is not None and prediction_surf is not None:
+        #     logger.info(
+        #         f"Device {device}, batch processed: {i_batch + 1}, loss volume: {loss_norm_vol:.5f} \
+        #     , loss surface: {loss_norm_surf:.5f}, loss integral: {loss_integral:.5f}, loss surface area: {loss_norm_surf_area:.5f}"
+        #     )
+        # elif prediction_vol is not None:
+        #     logger.info(
+        #         f"Device {device}, batch processed: {i_batch + 1}, loss volume: {loss_norm_vol:.5f}"
+        #     )
+        # elif prediction_surf is not None:
+        #     logger.info(
+        #         f"Device {device}, batch processed: {i_batch + 1} \
+        #     , loss surface: {loss_norm_surf:.5f}, loss integral: {loss_integral:.5f}, loss surface area: {loss_norm_surf_area:.5f}"
+        #     )
 
     last_loss = running_loss / (i_batch + 1)  # loss per batch
-    print(f" Device {device},  batch: {i_batch + 1}, loss norm: {loss:.5f}")
-    tb_x = epoch_index * len(dataloader) + i_batch + 1
-    tb_writer.add_scalar("Loss/train", last_loss, tb_x)
+    if dist.rank == 0:
+        logger.info(f" Device {device},  batch: {i_batch + 1}, loss norm: {loss:.5f}")
+        tb_x = epoch_index * len(dataloader) + i_batch + 1
+        tb_writer.add_scalar("Loss/train", last_loss, tb_x)
 
     return last_loss
 
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
-    compute_scaling_factors(
-        cfg, cfg.data_processor.output_dir, use_cache=cfg.data_processor.use_cache
-    )
-    model_type = cfg.model.model_type
 
     # initialize distributed manager
     DistributedManager.initialize()
     dist = DistributedManager()
 
-    print(f"Config summary:\n{OmegaConf.to_yaml(cfg, sort_keys=True)}")
+    gpu_handle = nvmlDeviceGetHandleByIndex(dist.device.index)
+
+    compute_scaling_factors(
+        cfg, cfg.data_processor.output_dir, use_cache=cfg.data_processor.use_cache
+    )
+    model_type = cfg.model.model_type
+
+    logger = PythonLogger("Train")
+    logger = RankZeroLoggingWrapper(logger, dist)
+
+    logger.info(f"Config summary:\n{OmegaConf.to_yaml(cfg, sort_keys=True)}")
 
     num_vol_vars = 0
     volume_variable_names = []
@@ -711,7 +754,7 @@ def main(cfg: DictConfig) -> None:
     model = torch.compile(model, disable=True)  # TODO make this configurable
 
     # Print model summary (structure and parmeter count).
-    print(f"Model summary:\n{torchinfo.summary(model, verbose=0, depth=2)}\n")
+    logger.info(f"Model summary:\n{torchinfo.summary(model, verbose=0, depth=2)}\n")
 
     if dist.world_size > 1:
         model = DistributedDataParallel(
@@ -775,7 +818,7 @@ def main(cfg: DictConfig) -> None:
 
     for epoch in range(init_epoch, cfg.train.epochs):
         start_time = time.perf_counter()
-        print(f"Device {dist.device}, epoch {epoch_number}:")
+        logger.info(f"Device {dist.device}, epoch {epoch_number}:")
 
         train_sampler.set_epoch(epoch)
         val_sampler.set_epoch(epoch)
@@ -795,6 +838,8 @@ def main(cfg: DictConfig) -> None:
             optimizer=optimizer,
             scaler=scaler,
             tb_writer=writer,
+            logger=logger,
+            gpu_handle=gpu_handle,
             epoch_index=epoch,
             device=dist.device,
             integral_scaling_factor=initial_integral_factor,
@@ -803,32 +848,29 @@ def main(cfg: DictConfig) -> None:
             surf_loss_scaling=surface_scaling_loss,
         )
         epoch_end_time = time.perf_counter()
-        print(
+        logger.info(
             f"Device {dist.device}, Epoch {epoch_number} took {epoch_end_time - epoch_start_time} seconds"
         )
         epoch_end_time = time.perf_counter()
-        print(
-            f"Device {dist.device}, Epoch {epoch_number} took {epoch_end_time - epoch_start_time} seconds"
-        )
 
-        model.eval()
-        avg_vloss = validation_step(
-            dataloader=val_dataloader,
-            model=model,
-            device=dist.device,
-            use_sdf_basis=cfg.model.use_sdf_in_basis_func,
-            use_surface_normals=cfg.model.use_surface_normals,
-            integral_scaling_factor=initial_integral_factor,
-            loss_fn_type=cfg.model.loss_function,
-            vol_loss_scaling=cfg.model.vol_loss_scaling,
-            surf_loss_scaling=surface_scaling_loss,
-        )
+        # model.eval()
+        # avg_vloss = validation_step(
+        #     dataloader=val_dataloader,
+        #     model=model,
+        #     device=dist.device,
+        #     use_sdf_basis=cfg.model.use_sdf_in_basis_func,
+        #     use_surface_normals=cfg.model.use_surface_normals,
+        #     integral_scaling_factor=initial_integral_factor,
+        #     loss_fn_type=cfg.model.loss_function,
+        #     vol_loss_scaling=cfg.model.vol_loss_scaling,
+        #     surf_loss_scaling=surface_scaling_loss,
+        # )
 
         scheduler.step()
-        print(
+        logger.info(
             f"Device {dist.device} "
             f"LOSS train {avg_loss:.5f} "
-            f"valid {avg_vloss:.5f} "
+            # f"valid {avg_vloss:.5f} "
             f"Current lr {scheduler.get_last_lr()[0]}"
             f"Integral factor {initial_integral_factor}"
         )
@@ -836,7 +878,10 @@ def main(cfg: DictConfig) -> None:
         if dist.rank == 0:
             writer.add_scalars(
                 "Training vs. Validation Loss",
-                {"Training": avg_loss, "Validation": avg_vloss},
+                {
+                    "Training": avg_loss,
+                    # "Validation": avg_vloss
+                },
                 epoch_number,
             )
             writer.flush()
@@ -845,22 +890,23 @@ def main(cfg: DictConfig) -> None:
         if dist.world_size > 1:
             torch.distributed.barrier()
 
-        if avg_vloss < best_vloss:  # This only considers GPU: 0, is that okay?
-            best_vloss = avg_vloss
-            # if dist.rank == 0:
-            save_checkpoint(
-                to_absolute_path(best_model_path),
-                models=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                epoch=str(
-                    best_vloss.item()
-                ),  # hacky way of using epoch to store metadata
+        # if avg_vloss < best_vloss:  # This only considers GPU: 0, is that okay?
+        #     best_vloss = avg_vloss
+        #     # if dist.rank == 0:
+        #     save_checkpoint(
+        #         to_absolute_path(best_model_path),
+        #         models=model,
+        #         optimizer=optimizer,
+        #         scheduler=scheduler,
+        #         scaler=scaler,
+        #         epoch=str(
+        #             best_vloss.item()
+        #         ),  # hacky way of using epoch to store metadata
+        #     )
+        if dist.rank == 0:
+            print(
+                f"Device { dist.device}, Best val loss {best_vloss}, Time taken {time.perf_counter() - start_time}"
             )
-        print(
-            f"Device { dist.device}, Best val loss {best_vloss}, Time taken {time.perf_counter() - start_time}"
-        )
 
         if dist.rank == 0 and (epoch + 1) % cfg.train.checkpoint_interval == 0.0:
             save_checkpoint(
