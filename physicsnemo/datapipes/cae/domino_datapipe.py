@@ -907,9 +907,17 @@ class DoMINODataPipe(Dataset):
 
     @profile
     def __getitem__(self, idx):
+        """
+        Function for fetching and processing a single file's data.
+
+        Domino, in general, expects one example per file and the files
+        are relatively large due to the mesh size.
+        """
 
         if self.config.deterministic:
-            self.array_provider.seed(idx)
+            self.array_provider.random.seed(idx)
+            # But also always set numpy:
+            np.random.seed(idx)
 
         index = self.indices[idx]
         cfd_filename = self.filenames[index]
@@ -948,9 +956,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
     max_scaling_factor_files = 5
 
     if model_type == "volume" or model_type == "combined":
-        vol_save_path = os.path.join(
-            cfg.project_dir, "volume_scaling_factors.npy"
-        )
+        vol_save_path = os.path.join(cfg.project_dir, "volume_scaling_factors.npy")
         if not os.path.exists(vol_save_path):
             print("Computing volume scaling factors")
             volume_variable_names = list(cfg.variables.volume.solution.keys())
@@ -1054,9 +1060,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
             np.save(vol_save_path, vol_scaling_factors)
 
     if model_type == "surface" or model_type == "combined":
-        surf_save_path = os.path.join(
-            cfg.project_dir, "surface_scaling_factors.npy"
-        )
+        surf_save_path = os.path.join(cfg.project_dir, "surface_scaling_factors.npy")
 
         if not os.path.exists(surf_save_path):
             print("Computing surface scaling factors")
