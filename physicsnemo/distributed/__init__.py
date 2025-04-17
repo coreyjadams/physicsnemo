@@ -15,10 +15,10 @@
 # limitations under the License.
 
 
-
 # There is a minimum version of pytorch required for shard tensor.
 # 2.6.0+ works
 # 2.5.X and lower does not work
+
 from physicsnemo.utils.version_check import check_module_requirements
 
 from .autograd import all_gather_v, gather_v, indexed_all_to_all_v, scatter_v
@@ -35,7 +35,6 @@ from .utils import (
     reduce_loss,
     unmark_module_as_shared,
 )
-
 
 try:
     check_module_requirements("physicsnemo.distributed.shard_tensor")

@@ -224,8 +224,6 @@ class BallQuery(torch.autograd.Function):
         ctx,
         points1,
         points2,
-        lengths1,
-        lengths2,
         k,
         radius,
         hash_grid,
@@ -278,16 +276,14 @@ class BallQuery(torch.autograd.Function):
             None,
             None,
             None,
-            None,
-            None,
         )
 
 
-def ball_query_layer(points1, points2, lengths1, lengths2, k, radius, hash_grid):
+def ball_query_layer(points1, points2, k, radius, hash_grid):
     """
     Wrapper for BallQuery.apply to support a functional interface.
     """
-    return BallQuery.apply(points1, points2, lengths1, lengths2, k, radius, hash_grid)
+    return BallQuery.apply(points1, points2, k, radius, hash_grid)
 
 
 class BallQueryLayer(torch.nn.Module):
@@ -307,12 +303,10 @@ class BallQueryLayer(torch.nn.Module):
         self.radius = radius
         self.hash_grid = wp.HashGrid(grid_size, grid_size, grid_size)
 
-    def forward(self, points1, points2, lengths1, lengths2):
-        return ball_query_layer(
+    def forward(self, points1, points2):
+        return BallQuery.apply(
             points1,
             points2,
-            lengths1,
-            lengths2,
             self.k,
             self.radius,
             self.hash_grid,
@@ -336,8 +330,6 @@ if __name__ == "__main__":
     points1 = torch.rand(n, p1, d, device="cuda", requires_grad=True)
 
     points2 = torch.rand(n, p2, d, device="cuda", requires_grad=True)
-    lengths1 = torch.full((n,), p1, dtype=torch.int32).cuda()
-    lengths2 = torch.full((n,), p2, dtype=torch.int32).cuda()
     k = 256  # maximum number of neighbors
     radius = 0.1
 
@@ -349,8 +341,6 @@ if __name__ == "__main__":
         mapping, num_neighbors, outputs = layer(
             points1,
             points2,
-            lengths1,
-            lengths2,
         )
 
     for i in range(20):
@@ -358,14 +348,10 @@ if __name__ == "__main__":
         p2 += 100
         points1 = torch.rand(n, p1, d, device="cuda", requires_grad=False)
         points2 = torch.rand(n, p2, d, device="cuda", requires_grad=False)
-        lengths1 = torch.full((n,), p1, dtype=torch.int32).cuda()
-        lengths2 = torch.full((n,), p2, dtype=torch.int32).cuda()
 
         mapping, num_neighbors, outputs = layer(
             points1,
             points2,
-            lengths1,
-            lengths2,
         )
 
     # Perform matrix multiplication as comparison for timing
@@ -383,7 +369,8 @@ if __name__ == "__main__":
     # Test optimization
     for i in range(100):
         optimizer.zero_grad()
-        mapping, num_neighbors, outputs = layer(points1, points2, lengths1, lengths2)
+        # mapping, num_neighbors, outputs = layer(points1, points2, lengths1, lengths2)
+        mapping, num_neighbors, outputs = layer(points1, points2)
 
         loss = (points1.unsqueeze(2) - outputs).pow(2).sum()
         loss.backward()
