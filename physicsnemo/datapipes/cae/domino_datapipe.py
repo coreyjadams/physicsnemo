@@ -171,13 +171,13 @@ class DoMINODataConfig:
     resampling_points: int = 1_000_000
     surface_sampling_algorithm: str = Literal["area_weighted", "random"]
     surface_factors: Optional[Sequence] = None
-    bounding_box_dims_surf: Optional[BoundingBox] = None
+    bounding_box_dims_surf: Optional[Union[BoundingBox, Sequence]] = None
 
     # Volume specific variables:
     volume_variables: Optional[Sequence] = ("UMean", "pMean")
     volume_points_sample: int = 1024
     volume_factors: Optional[Sequence] = None
-    bounding_box_dims: Optional[BoundingBox] = None
+    bounding_box_dims: Optional[Union[BoundingBox, Sequence]] = None
 
     grid_resolution: Union[Sequence, ArrayType] = (256, 96, 64)
     normalize_coordinates: bool = False
@@ -234,11 +234,6 @@ class DoMINODataConfig:
 ##### TODO
 # - put model type in config or leave in __init__
 # - check the bounding box protocol works
-# - keep the target device in the constructor, not the config.
-# - Make sure GPU output always triggers
-# - Make sure un-optimized numpy files can load too
-# - make sure bounding box is set right in the config
-# - Make sure random seeds in utils are set correctly (mostly, not there but here)
 
 
 class DoMINODataPipe(Dataset):
@@ -265,6 +260,8 @@ class DoMINODataPipe(Dataset):
         else:
             self.device_context = nullcontext()
 
+        self.device = dist.device
+
         if self.config.deterministic:
             np.random.seed(42)
             cp.random.seed(42)
@@ -288,25 +285,33 @@ class DoMINODataPipe(Dataset):
         self.array_provider = cp if self.config.gpu_preprocessing else np
         # Update the arrays for bounding boxes:
 
-        self.config.bounding_box_dims = [
-            self.array_provider.asarray(self.config.bounding_box_dims.max).astype(
-                "float32"
-            ),
-            self.array_provider.asarray(self.config.bounding_box_dims.min).astype(
-                "float32"
-            ),
-        ]
-        self.config.bounding_box_dims_surf = [
-            self.array_provider.asarray(self.config.bounding_box_dims_surf.max).astype(
-                "float32"
-            ),
-            self.array_provider.asarray(self.config.bounding_box_dims_surf.min).astype(
-                "float32"
-            ),
-        ]
+        if hasattr(self.config.bounding_box_dims, "max") and hasattr(
+            self.config.bounding_box_dims, "min"
+        ):
+            self.config.bounding_box_dims = [
+                self.array_provider.asarray(self.config.bounding_box_dims.max).astype(
+                    "float32"
+                ),
+                self.array_provider.asarray(self.config.bounding_box_dims.min).astype(
+                    "float32"
+                ),
+            ]
+        if hasattr(self.config.bounding_box_dims_surf, "max") and hasattr(
+            self.config.bounding_box_dims_surf, "min"
+        ):
+            self.config.bounding_box_dims_surf = [
+                self.array_provider.asarray(
+                    self.config.bounding_box_dims_surf.max
+                ).astype("float32"),
+                self.array_provider.asarray(
+                    self.config.bounding_box_dims_surf.min
+                ).astype("float32"),
+            ]
 
         # Used if threaded data is enabled:
-        self.max_workers = 8
+        self.max_workers = 24
+        # Create a single thread pool for the class
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
 
         # Define here the keys to read for each __getitem__ call
 
@@ -331,52 +336,89 @@ class DoMINODataPipe(Dataset):
         if self.model_type == "surface" or self.model_type == "combined":
             self.keys_to_read.extend(self.surface_keys)
 
+    def __del__(self):
+        # Clean up the executor when the instance is being destroyed
+        if hasattr(self, "executor"):
+            self.executor.shutdown()
+
     @profile
     def read_data_zarr(self, filepath):
-        @profile
-        def read_chunk_into_array(N, n_threads, i, zarr_array, result_array):
-            chunk_size = N // n_threads
-            start = i * chunk_size
-            end = (i + 1) * chunk_size if i < n_threads - 1 else N
-            result_array[start:end] = zarr_array[start:end]
+
+        # def create_pinned_streaming_space(shape, dtype):
+        #     # TODO - this function could boost performance a little, but
+        #     # the pinned memory pool seems too small.
+        #     if self.array_provider == cp:
+        #         nbytes = np.prod(shape) * dtype.itemsize
+        #         ptr = cp.cuda.alloc_pinned_memory(nbytes)
+        #         arr = np.frombuffer(ptr, dtype)
+        #         return arr.reshape(shape)
+        #     else:
+        #         return np.empty(shape, dtype=dtype)
+
+        def read_chunk_into_array(ram_array, fs_zarr_array, slice):
+            ram_array[slice] = fs_zarr_array[slice]
 
         @profile
-        def chunked_read(zarr_group, key, max_threads=16):
+        def chunked_aligned_read(zarr_group, key, futures):
             zarr_array = zarr_group[key]
-            N = zarr_array.shape[0]
+
+            shape = zarr_array.shape
+            chunk_size = zarr_array.chunks[0]
 
             # Pre-allocate the full result array
             result_shape = zarr_array.shape
             result_dtype = zarr_array.dtype
+
             result = np.empty(result_shape, dtype=result_dtype)
 
-            with ThreadPoolExecutor(max_workers=max_threads) as executor:
-                futures = [
-                    executor.submit(
-                        read_chunk_into_array, N, max_threads, i, zarr_array, result
+            for start in range(0, shape[0], chunk_size):
+                end = min(start + chunk_size, shape[0])
+                read_slice = np.s_[start:end]
+                futures.append(
+                    self.executor.submit(
+                        read_chunk_into_array, result, zarr_array, read_slice
                     )
-                    for i in range(max_threads)
-                ]
-
-                # Wait for all threads to complete
-                for future in futures:
-                    future.result()
+                )
 
             return result
 
         with zarr.open_group(filepath, mode="r") as z:
 
             data = {}
+            futures = []
+            if "volume_fields" in z.keys():
+                data["volume_fields"] = chunked_aligned_read(
+                    z, "volume_fields", futures
+                )
+            if "volume_mesh_centers" in z.keys():
+                data["volume_mesh_centers"] = chunked_aligned_read(
+                    z, "volume_mesh_centers", futures
+                )
+
             for key in self.keys_to_read:
                 if z[key].shape == ():
                     data[key] = z[key]
                 elif key in ["volume_fields", "volume_mesh_centers"]:
-                    data[key] = chunked_read(z, key)
+                    continue
                 else:
-                    data[key] = z[key][:]
-                # Convert data to the gpu if needed:
-                with self.device_context:
-                    data[key] = self.array_provider.asarray(data[key])
+                    data[key] = np.empty(z[key].shape, dtype=z[key].dtype)
+                    slice = np.s_[:]
+                    futures.append(
+                        self.executor.submit(
+                            read_chunk_into_array, data[key], z[key], slice
+                        )
+                    )
+
+            # Now wait for all the futures to complete
+            for future in futures:
+                result = future.result()
+                if isinstance(result, tuple) and len(result) == 2:
+                    key, value = result
+                    data[key] = value
+
+            # Move big data to GPU
+            for key in data.keys():
+                data[key] = self.array_provider.asarray(data[key])
 
             # Optional, maybe-present keys
             for key in self.keys_to_read_if_available:
@@ -434,11 +476,10 @@ class DoMINODataPipe(Dataset):
                     key: self.array_provider.asarray(value)
                     for key, value in optional_results.items()
                 }
-
             return optional_results
 
-        executor = ThreadPoolExecutor(max_workers=self.max_workers)
-        results = dict(executor.map(load_one, self.keys_to_read))
+        # Use the class-level executor instead of creating a new one
+        results = dict(self.executor.map(load_one, self.keys_to_read))
 
         # Move the results to the GPU:
         with self.device_context:
@@ -449,7 +490,6 @@ class DoMINODataPipe(Dataset):
         optional_results = check_optional_keys()
         results.update(optional_results)
 
-        executor.shutdown()
         return results
 
     def __len__(self):
@@ -907,9 +947,17 @@ class DoMINODataPipe(Dataset):
 
     @profile
     def __getitem__(self, idx):
+        """
+        Function for fetching and processing a single file's data.
+
+        Domino, in general, expects one example per file and the files
+        are relatively large due to the mesh size.
+        """
 
         if self.config.deterministic:
-            self.array_provider.seed(idx)
+            self.array_provider.random.seed(idx)
+            # But also always set numpy:
+            np.random.seed(idx)
 
         index = self.indices[idx]
         cfd_filename = self.filenames[index]
@@ -928,15 +976,26 @@ class DoMINODataPipe(Dataset):
 
         return_dict = self.preprocess_data(data_dict)
 
+        # return only pytorch tensor objects.
+        # If returning on CPU (but processed on GPU), convert below.
+        # This assumes we keep the data on the device it's on.
+        for key, value in return_dict.items():
+            if isinstance(value, np.ndarray):
+                return_dict[key] = torch.from_numpy(value)
+            elif isinstance(value, cp.ndarray):
+                return_dict[key] = torch.utils.dlpack.from_dlpack(value.toDlpack())
+
         if self.config.gpu_output:
-            # Make sure this is all on the GPU:
+            # Make sure this is all on the GPU.
+            # Everything here should be a torch tensor now.
             for key, value in return_dict.items():
-                if isinstance(value, np.ndarray):
-                    return_dict[key] = cp.asarray(value)
+                if isinstance(value, torch.Tensor) and not value.is_cuda:
+                    return_dict[key] = value.pin_memory().to(self.device)
         else:
+            # Make sure everything is on the CPU.
             for key, value in return_dict.items():
-                if isinstance(value, cp.ndarray):
-                    return_dict[key] = value.get()
+                if isinstance(value, torch.Tensor) and value.is_cuda:
+                    return_dict[key] = value.cpu()
 
         return return_dict
 
@@ -948,9 +1007,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
     max_scaling_factor_files = 5
 
     if model_type == "volume" or model_type == "combined":
-        vol_save_path = os.path.join(
-            cfg.project_dir, "volume_scaling_factors.npy"
-        )
+        vol_save_path = os.path.join(cfg.project_dir, "volume_scaling_factors.npy")
         if not os.path.exists(vol_save_path):
             print("Computing volume scaling factors")
             volume_variable_names = list(cfg.variables.volume.solution.keys())
@@ -1054,9 +1111,7 @@ def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -
             np.save(vol_save_path, vol_scaling_factors)
 
     if model_type == "surface" or model_type == "combined":
-        surf_save_path = os.path.join(
-            cfg.project_dir, "surface_scaling_factors.npy"
-        )
+        surf_save_path = os.path.join(cfg.project_dir, "surface_scaling_factors.npy")
 
         if not os.path.exists(surf_save_path):
             print("Computing surface scaling factors")

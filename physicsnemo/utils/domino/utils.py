@@ -19,7 +19,6 @@ Important utilities for data processing and training, testing DoMINO.
 """
 
 import os
-import time
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -321,20 +320,9 @@ def pad_inp(arr: ArrayType, npoin: int, pad_value: float = 0.0) -> ArrayType:
 def shuffle_array(
     arr: ArrayType,
     npoin: int,
-    seed: int = None,
 ) -> Tuple[ArrayType, ArrayType]:
     """Function for shuffling arrays"""
-
     xp = array_type(arr)
-
-    if seed is None:
-        seed = int(time.time())
-
-    xp.random.seed(seed=seed)
-    # idx = xp.arange(arr.shape[0])
-    # xp.random.shuffle(idx)
-    # idx = idx[:npoin]
-
     idx = xp.random.choice(arr.shape[0], size=npoin, replace=False)
     return arr[idx], idx
 
@@ -443,7 +431,7 @@ def dict_to_device(state_dict, device, exclude_keys=["filename"]):
 
 
 def area_weighted_shuffle_array(
-    arr: ArrayType, npoin: int, area: ArrayType, seed: int = None
+    arr: ArrayType, npoin: int, area: ArrayType
 ) -> Tuple[ArrayType, ArrayType]:
     """Function for area weighted shuffling"""
     xp = array_type(arr)
@@ -452,11 +440,6 @@ def area_weighted_shuffle_array(
     total_area = xp.sum(area**factor)
     probs = area**factor / total_area
 
-    if seed is None:
-        seed = int(time.time())
-
-    # Seeding on NUMPY
-    np.random.seed(seed=seed)
     idx = xp.arange(arr.shape[0])
 
     # This is too memory intensive to run on the GPU.
