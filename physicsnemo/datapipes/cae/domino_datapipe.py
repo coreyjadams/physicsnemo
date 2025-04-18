@@ -171,13 +171,13 @@ class DoMINODataConfig:
     resampling_points: int = 1_000_000
     surface_sampling_algorithm: str = Literal["area_weighted", "random"]
     surface_factors: Optional[Sequence] = None
-    bounding_box_dims_surf: Optional[BoundingBox] = None
+    bounding_box_dims_surf: Optional[Union[BoundingBox, Sequence]] = None
 
     # Volume specific variables:
     volume_variables: Optional[Sequence] = ("UMean", "pMean")
     volume_points_sample: int = 1024
     volume_factors: Optional[Sequence] = None
-    bounding_box_dims: Optional[BoundingBox] = None
+    bounding_box_dims: Optional[Union[BoundingBox, Sequence]] = None
 
     grid_resolution: Union[Sequence, ArrayType] = (256, 96, 64)
     normalize_coordinates: bool = False
@@ -285,22 +285,28 @@ class DoMINODataPipe(Dataset):
         self.array_provider = cp if self.config.gpu_preprocessing else np
         # Update the arrays for bounding boxes:
 
-        self.config.bounding_box_dims = [
-            self.array_provider.asarray(self.config.bounding_box_dims.max).astype(
-                "float32"
-            ),
-            self.array_provider.asarray(self.config.bounding_box_dims.min).astype(
-                "float32"
-            ),
-        ]
-        self.config.bounding_box_dims_surf = [
-            self.array_provider.asarray(self.config.bounding_box_dims_surf.max).astype(
-                "float32"
-            ),
-            self.array_provider.asarray(self.config.bounding_box_dims_surf.min).astype(
-                "float32"
-            ),
-        ]
+        if hasattr(self.config.bounding_box_dims, "max") and hasattr(
+            self.config.bounding_box_dims, "min"
+        ):
+            self.config.bounding_box_dims = [
+                self.array_provider.asarray(self.config.bounding_box_dims.max).astype(
+                    "float32"
+                ),
+                self.array_provider.asarray(self.config.bounding_box_dims.min).astype(
+                    "float32"
+                ),
+            ]
+        if hasattr(self.config.bounding_box_dims_surf, "max") and hasattr(
+            self.config.bounding_box_dims_surf, "min"
+        ):
+            self.config.bounding_box_dims_surf = [
+                self.array_provider.asarray(
+                    self.config.bounding_box_dims_surf.max
+                ).astype("float32"),
+                self.array_provider.asarray(
+                    self.config.bounding_box_dims_surf.min
+                ).astype("float32"),
+            ]
 
         # Used if threaded data is enabled:
         self.max_workers = 24
