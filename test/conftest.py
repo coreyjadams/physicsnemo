@@ -17,9 +17,12 @@ import os
 import pathlib
 from collections import defaultdict
 
+from collections import defaultdict
+
 import pytest
 
 NFS_DATA_PATH = "/data/nfs/modulus-data"
+
 
 # Total time per file
 file_timings = defaultdict(float)

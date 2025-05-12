@@ -147,6 +147,7 @@ def main(cfg: DictConfig):
                 sampler_args=dict(cfg.sampler.args),
             )
 
+
             state_pred[0, :] += edm_corrected_outputs[0].float()
             state_pred_edm = state_pred.clone()
 
