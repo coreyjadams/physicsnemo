@@ -56,12 +56,7 @@ def create_basic_dataset(data_dir, model_type, **kwargs):
 
     assert model_type in ["volume", "surface", "combined"]
 
-    if model_type == "volume":
-        input_path = data_dir / "volume/"
-    elif model_type == "surface":
-        input_path = data_dir / "surface/"
-    elif model_type == "combined":
-        input_path = data_dir / "combined/"
+    input_path = data_dir / model_type
 
     bounding_box = ConcreteBoundingBox(min=[-3.5, -2.25, -0.32], max=[8.5, 2.25, 3.00])
     bounding_box_surface = ConcreteBoundingBox(
@@ -146,10 +141,6 @@ def test_domino_datapipe_core(
     data_dir, gpu_preprocessing, gpu_output, model_type, pytestconfig
 ):
     """Core test for basic functionality with different device and model configurations."""
-    # if gpu_preprocessing and model_type in ["surface", "combined"]:
-    #     pytest.xfail(
-    #         "Known cuda/cuml issue with GPU preprocessing for surface data (cuml nearest neighbors)"
-    #     )
 
     dataset = create_basic_dataset(
         data_dir, model_type, gpu_preprocessing=gpu_preprocessing, gpu_output=gpu_output
@@ -184,10 +175,10 @@ def test_domino_datapipe_coordinate_normalization(
     if normalize_coordinates:
         assert all(torch.min(v_coords, dim=0).values >= -2.0) and all(
             torch.max(v_coords, dim=0).values <= 2.0
-        ), "Normalized coordinates should be in [-1,1]"
+        ), "Normalized coordinates should be in [-2,2]"
         assert all(torch.min(s_coords, dim=0).values >= -2.0) and all(
             torch.max(s_coords, dim=0).values <= 2.0
-        ), "Normalized coordinates should be in [-1,1]"
+        ), "Normalized coordinates should be in [-2,2]"
 
 
 @import_or_fail(["warp", "cupy", "cuml"])
@@ -232,7 +223,6 @@ def test_domino_datapipe_sampling(data_dir, model_type, sampling, pytestconfig):
             "surface_neighbors_normals",
             "surface_neighbors_areas",
         ]:
-            print(f"key: {key} has shape: {sample[key].shape}")
             if sampling:
                 assert sample[key].shape[0] == sample_points
                 assert sample[key].shape[1] == dataset.config.num_surface_neighbors - 1
@@ -254,9 +244,6 @@ def test_domino_datapipe_bbox_sampling(
 
     sample = dataset[0]
     validate_sample_structure(sample, model_type, gpu_output=True)
-
-    # if sample_in_bbox:
-    #     for key in ["volume_mesh_centers", "volume_fields", "surface_mesh_centers", "surface_fields"]:
 
     v_coords = sample["volume_mesh_centers"]
     s_coords = sample["surface_mesh_centers"]
@@ -373,7 +360,7 @@ def test_cached_domino_dataset(data_dir, tmp_path, pytestconfig):
     )
 
     assert len(dataset) > 0
-    print(f"dataset length: {len(dataset)}")
+
     sample = dataset[0]
 
     # Check that sampling worked
