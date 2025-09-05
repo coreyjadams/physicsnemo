@@ -522,8 +522,6 @@ class DoMINODataPipe(Dataset):
         if mesh_indices_flattened.dtype != xp.int32:
             mesh_indices_flattened = mesh_indices_flattened.astype(xp.int32)
 
-        length_scale = xp.amax(xp.amax(stl_vertices, 0) - xp.amin(stl_vertices, 0))
-
         center_of_mass = calculate_center_of_mass(stl_centers, stl_sizes)
 
         if self.config.bounding_box_dims_surf is None:
@@ -570,7 +568,6 @@ class DoMINODataPipe(Dataset):
         surf_grid_max_min = xp.stack([s_min, s_max])
 
         return_dict = {
-            "length_scale": xp.array(length_scale, dtype=xp.float32),
             "surf_grid": surf_grid,
             "sdf_surf_grid": sdf_surf_grid,
             "surface_min_max": surf_grid_max_min,
