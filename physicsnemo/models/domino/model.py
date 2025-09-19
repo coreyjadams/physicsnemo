@@ -22,7 +22,6 @@ the config.yaml file)
 """
 
 import math
-from collections import defaultdict
 from typing import Callable, Literal, Sequence
 
 import torch
@@ -40,6 +39,7 @@ from .encodings import (
     fourier_encode_vectorized,
 )
 from .mlps import AggregationModel
+from .solutions import SolutionCalculatorSurface, SolutionCalculatorVolume
 
 
 def get_activation(activation: Literal["relu", "gelu"]) -> Callable:
@@ -757,18 +757,6 @@ class DoMINO(nn.Module):
         else:
             self.num_volume_neighbors = 50
 
-        if hasattr(model_parameters, "return_volume_neighbors"):
-            self.return_volume_neighbors = model_parameters.return_volume_neighbors
-            if (
-                self.return_volume_neighbors
-                and self.solution_calculation_mode == "one-loop"
-            ):
-                print(
-                    "'one-loop' solution_calculation mode not supported when return_volume_neighbors is set to true"
-                )
-                print("Overwriting the solution_calculation mode to 'two-loop'")
-                self.solution_calculation_mode = "two-loop"
-
         if self.use_surface_normals:
             if not self.use_surface_area:
                 input_features_surface = input_features + 3
@@ -940,6 +928,20 @@ class DoMINO(nn.Module):
                     )
                 )
 
+            self.solution_calculator_surf = SolutionCalculatorSurface(
+                num_variables=self.num_variables_surf,
+                num_sample_points=self.num_sample_points_surface,
+                use_surface_normals=self.use_surface_normals,
+                use_surface_area=self.use_surface_area,
+                noise_intensity=50,
+                encode_parameters=self.encode_parameters,
+                parameter_model=self.parameter_model
+                if self.encode_parameters
+                else None,
+                aggregation_model=self.agg_model_surf,
+                nn_basis=self.nn_basis_surf,
+            )
+
         if self.output_features_vol is not None:
             # Volume
             base_layer_geo_vol = 0
@@ -961,451 +963,23 @@ class DoMINO(nn.Module):
                         ),
                     )
                 )
-
-    def calculate_solution_with_neighbors(
-        self,
-        surface_mesh_centers,
-        encoding_g,
-        encoding_node,
-        surface_mesh_neighbors,
-        surface_normals,
-        surface_neighbors_normals,
-        surface_areas,
-        surface_neighbors_areas,
-        global_params_values,
-        global_params_reference,
-        num_sample_points=7,
-    ):
-        """Function to approximate solution given the neighborhood information"""
-        num_variables = self.num_variables_surf
-        nn_basis = self.nn_basis_surf
-        agg_model = self.agg_model_surf
-
-        if self.encode_parameters:
-            processed_parameters = []
-            for k in range(global_params_values.shape[1]):
-                param = torch.unsqueeze(global_params_values[:, k, :], 1)
-                ref = torch.unsqueeze(global_params_reference[:, k, :], 1)
-                param = param.expand(
-                    param.shape[0],
-                    surface_mesh_centers.shape[1],
-                    param.shape[2],
-                )
-                param = param / ref
-                processed_parameters.append(param)
-            processed_parameters = torch.cat(processed_parameters, axis=-1)
-            param_encoding = self.parameter_model(processed_parameters)
-
-        if self.use_surface_normals:
-            if not self.use_surface_area:
-                surface_mesh_centers = torch.cat(
-                    (surface_mesh_centers, surface_normals),
-                    dim=-1,
-                )
-                if num_sample_points > 1:
-                    surface_mesh_neighbors = torch.cat(
-                        (
-                            surface_mesh_neighbors,
-                            surface_neighbors_normals,
-                        ),
-                        dim=-1,
-                    )
-
+            if hasattr(model_parameters, "return_volume_neighbors"):
+                return_volume_neighbors = model_parameters.return_volume_neighbors
             else:
-                surface_mesh_centers = torch.cat(
-                    (
-                        surface_mesh_centers,
-                        surface_normals,
-                        torch.log(surface_areas) / 10,
-                    ),
-                    dim=-1,
-                )
-                if num_sample_points > 1:
-                    surface_mesh_neighbors = torch.cat(
-                        (
-                            surface_mesh_neighbors,
-                            surface_neighbors_normals,
-                            torch.log(surface_neighbors_areas) / 10,
-                        ),
-                        dim=-1,
-                    )
+                return_volume_neighbors = False
 
-        if self.solution_calculation_mode == "one-loop":
-            encoding_list = [
-                encoding_node.unsqueeze(2).expand(-1, -1, num_sample_points, -1),
-                encoding_g.unsqueeze(2).expand(-1, -1, num_sample_points, -1),
-            ]
-
-            for f in range(num_variables):
-                one_loop_centers_expanded = surface_mesh_centers.unsqueeze(2)
-
-                one_loop_noise = one_loop_centers_expanded - (
-                    surface_mesh_neighbors + 1e-6
-                )
-                one_loop_noise = torch.norm(one_loop_noise, dim=-1, keepdim=True)
-
-                # Doing it this way prevents the intermediate one_loop_basis_f from being stored in memory for the rest of the function.
-                agg_output = agg_model[f](
-                    torch.cat(
-                        (
-                            nn_basis[f](
-                                torch.cat(
-                                    (
-                                        one_loop_centers_expanded,
-                                        surface_mesh_neighbors + 1e-6,
-                                    ),
-                                    dim=2,
-                                )
-                            ),
-                            *encoding_list,
-                        ),
-                        dim=-1,
-                    )
-                )
-
-                one_loop_output_center, one_loop_output_neighbor = torch.split(
-                    agg_output, [1, num_sample_points - 1], dim=2
-                )
-                one_loop_output_neighbor = one_loop_output_neighbor * (
-                    1.0 / one_loop_noise
-                )
-
-                one_loop_output_center = one_loop_output_center.squeeze(2)
-                one_loop_output_neighbor = one_loop_output_neighbor.sum(2)
-                one_loop_dist_sum = torch.sum(1.0 / one_loop_noise, dim=2)
-
-                # Stop here
-                if num_sample_points > 1:
-                    one_loop_output_res = (
-                        0.5 * one_loop_output_center
-                        + 0.5 * one_loop_output_neighbor / one_loop_dist_sum
-                    )
-                else:
-                    one_loop_output_res = one_loop_output_center
-                if f == 0:
-                    one_loop_output_all = one_loop_output_res
-                else:
-                    one_loop_output_all = torch.cat(
-                        (one_loop_output_all, one_loop_output_res), dim=-1
-                    )
-
-            return one_loop_output_all
-
-        if self.solution_calculation_mode == "two-loop":
-            for f in range(num_variables):
-                for p in range(num_sample_points):
-                    if p == 0:
-                        volume_m_c = surface_mesh_centers
-                    else:
-                        volume_m_c = surface_mesh_neighbors[:, :, p - 1] + 1e-6
-                        noise = surface_mesh_centers - volume_m_c
-                        dist = torch.norm(noise, dim=-1, keepdim=True)
-
-                    basis_f = nn_basis[f](volume_m_c)
-                    output = torch.cat((basis_f, encoding_node, encoding_g), dim=-1)
-                    if self.encode_parameters:
-                        output = torch.cat((output, param_encoding), dim=-1)
-                    if p == 0:
-                        output_center = agg_model[f](output)
-                    else:
-                        if p == 1:
-                            output_neighbor = agg_model[f](output) * (1.0 / dist)
-                            dist_sum = 1.0 / dist
-                        else:
-                            output_neighbor += agg_model[f](output) * (1.0 / dist)
-                            dist_sum += 1.0 / dist
-                if num_sample_points > 1:
-                    output_res = 0.5 * output_center + 0.5 * output_neighbor / dist_sum
-                else:
-                    output_res = output_center
-                if f == 0:
-                    output_all = output_res
-                else:
-                    output_all = torch.cat((output_all, output_res), dim=-1)
-
-            return output_all
-
-    def sample_sphere(self, center, r, num_points):
-        """Uniformly sample points in a 3D sphere around the center.
-
-        This method generates random points within a sphere of radius r centered
-        at each point in the input tensor. The sampling is uniform in volume,
-        meaning points are more likely to be sampled in the outer regions of the sphere.
-
-        Args:
-            center: Tensor of shape (batch_size, num_points, 3) containing center coordinates
-            r: Radius of the sphere for sampling
-            num_points: Number of points to sample per center
-
-        Returns:
-            Tensor of shape (batch_size, num_points, num_samples, 3) containing
-            the sampled points around each center
-        """
-        # Adjust the center points to the final shape:
-        unsqueezed_center = center.unsqueeze(2).expand(-1, -1, num_points, -1)
-
-        # Generate directions like the centers:
-        directions = torch.randn_like(unsqueezed_center)
-        directions = directions / torch.norm(directions, dim=-1, keepdim=True)
-
-        # Generate radii like the centers:
-        radii = r * torch.pow(torch.rand_like(unsqueezed_center), 1 / 3)
-
-        output = unsqueezed_center + directions * radii
-        return output
-
-    def sample_sphere_shell(self, center, r_inner, r_outer, num_points):
-        """Uniformly sample points in a 3D spherical shell around a center.
-
-        This method generates random points within a spherical shell (annulus)
-        between inner radius r_inner and outer radius r_outer centered at each
-        point in the input tensor. The sampling is uniform in volume within the shell.
-
-        Args:
-            center: Tensor of shape (batch_size, num_points, 3) containing center coordinates
-            r_inner: Inner radius of the spherical shell
-            r_outer: Outer radius of the spherical shell
-            num_points: Number of points to sample per center
-
-        Returns:
-            Tensor of shape (batch_size, num_points, num_samples, 3) containing
-            the sampled points within the spherical shell around each center
-        """
-
-        unsqueezed_center = center.unsqueeze(2).expand(-1, -1, num_points, -1)
-
-        # Generate directions like the centers:
-        directions = torch.randn_like(unsqueezed_center)
-        directions = directions / torch.norm(directions, dim=-1, keepdim=True)
-
-        radii = (
-            torch.rand_like(unsqueezed_center) * (r_outer**3 - r_inner**3) + r_inner**3
-        )
-        radii = torch.pow(radii, 1 / 3)
-
-        output = unsqueezed_center + directions * radii
-
-        return output
-
-    def calculate_solution(
-        self,
-        volume_mesh_centers,
-        encoding_g,
-        encoding_node,
-        global_params_values,
-        global_params_reference,
-        eval_mode,
-        num_sample_points=20,
-        noise_intensity=50,
-        return_volume_neighbors=False,
-    ):
-        """Function to approximate solution sampling the neighborhood information"""
-        if eval_mode == "volume":
-            num_variables = self.num_variables_vol
-            nn_basis = self.nn_basis_vol
-            agg_model = self.agg_model_vol
-        elif eval_mode == "surface":
-            num_variables = self.num_variables_surf
-            nn_basis = self.nn_basis_surf
-            agg_model = self.agg_model_surf
-
-        if self.encode_parameters:
-            processed_parameters = []
-            for k in range(global_params_values.shape[1]):
-                param = torch.unsqueeze(global_params_values[:, k, :], 1)
-                ref = torch.unsqueeze(global_params_reference[:, k, :], 1)
-                param = param.expand(
-                    param.shape[0],
-                    volume_mesh_centers.shape[1],
-                    param.shape[2],
-                )
-                param = param / ref
-                processed_parameters.append(param)
-            processed_parameters = torch.cat(processed_parameters, axis=-1)
-            param_encoding = self.parameter_model(processed_parameters)
-
-        if self.solution_calculation_mode == "one-loop":
-            # Stretch these out to num_sample_points
-            one_loop_encoding_node = encoding_node.unsqueeze(0).expand(
-                num_sample_points, -1, -1, -1
+            self.solution_calculator_vol = SolutionCalculatorVolume(
+                num_variables=self.num_variables_vol,
+                num_sample_points=self.num_sample_points_volume,
+                noise_intensity=50,
+                return_volume_neighbors=return_volume_neighbors,
+                encode_parameters=self.encode_parameters,
+                parameter_model=self.parameter_model
+                if self.encode_parameters
+                else None,
+                aggregation_model=self.agg_model_vol,
+                nn_basis=self.nn_basis_vol,
             )
-            one_loop_encoding_g = encoding_g.unsqueeze(0).expand(
-                num_sample_points, -1, -1, -1
-            )
-
-            if self.encode_parameters:
-                one_loop_other_terms = (
-                    one_loop_encoding_node,
-                    one_loop_encoding_g,
-                    param_encoding,
-                )
-            else:
-                one_loop_other_terms = (one_loop_encoding_node, one_loop_encoding_g)
-
-            for f in range(num_variables):
-                one_loop_volume_mesh_centers_expanded = volume_mesh_centers.unsqueeze(
-                    0
-                ).expand(num_sample_points, -1, -1, -1)
-                # Bulk_random_noise has shape (num_sample_points, batch_size, num_points, 3)
-                one_loop_bulk_random_noise = torch.rand_like(
-                    one_loop_volume_mesh_centers_expanded
-                )
-
-                one_loop_bulk_random_noise = 2 * (one_loop_bulk_random_noise - 0.5)
-                one_loop_bulk_random_noise = (
-                    one_loop_bulk_random_noise / noise_intensity
-                )
-                one_loop_bulk_dist = torch.norm(
-                    one_loop_bulk_random_noise, dim=-1, keepdim=True
-                )
-
-                _, one_loop_bulk_dist = torch.split(
-                    one_loop_bulk_dist, [1, num_sample_points - 1], dim=0
-                )
-
-                # Set the first sample point to 0.0:
-                one_loop_bulk_random_noise[0] = torch.zeros_like(
-                    one_loop_bulk_random_noise[0]
-                )
-
-                # Add the noise to the expanded volume_mesh_centers:
-                one_loop_volume_m_c = volume_mesh_centers + one_loop_bulk_random_noise
-                # If this looks overly complicated - it is.
-                # But, this makes sure that the memory used to store the output of both nn_basis[f]
-                # as well as the output of torch.cat can be deallocated immediately.
-                # Apply the aggregation model and distance scaling:
-                one_loop_output = agg_model[f](
-                    torch.cat(
-                        (nn_basis[f](one_loop_volume_m_c), *one_loop_other_terms),
-                        dim=-1,
-                    )
-                )
-
-                # select off the first, unperturbed term:
-                one_loop_output_center, one_loop_output_neighbor = torch.split(
-                    one_loop_output, [1, num_sample_points - 1], dim=0
-                )
-
-                # Scale the neighbor terms by the distance:
-                one_loop_output_neighbor = one_loop_output_neighbor / one_loop_bulk_dist
-
-                one_loop_dist_sum = torch.sum(1.0 / one_loop_bulk_dist, dim=0)
-
-                # Adjust shapes:
-                one_loop_output_center = one_loop_output_center.squeeze(1)
-                one_loop_output_neighbor = one_loop_output_neighbor.sum(0)
-
-                # Compare:
-                if num_sample_points > 1:
-                    one_loop_output_res = (
-                        0.5 * one_loop_output_center
-                        + 0.5 * one_loop_output_neighbor / one_loop_dist_sum
-                    )
-                else:
-                    one_loop_output_res = one_loop_output_center
-                if f == 0:
-                    one_loop_output_all = one_loop_output_res
-                else:
-                    one_loop_output_all = torch.cat(
-                        (one_loop_output_all, one_loop_output_res), dim=-1
-                    )
-
-            return one_loop_output_all
-
-        if self.solution_calculation_mode == "two-loop":
-            volume_m_c_perturbed = [volume_mesh_centers.unsqueeze(2)]
-
-            if return_volume_neighbors:
-                num_hop1 = num_sample_points
-                num_hop2 = (
-                    num_sample_points // 2 if num_sample_points != 1 else 1
-                )  # This is per 1 hop node
-                neighbors = defaultdict(list)
-
-                volume_m_c_hop1 = self.sample_sphere(
-                    volume_mesh_centers, 1 / noise_intensity, num_hop1
-                )
-                # 1 hop neighbors
-                for i in range(num_hop1):
-                    idx = len(volume_m_c_perturbed)
-                    volume_m_c_perturbed.append(volume_m_c_hop1[:, :, i : i + 1, :])
-                    neighbors[0].append(idx)
-
-                # 2 hop neighbors
-                for i in range(num_hop1):
-                    parent_idx = (
-                        i + 1
-                    )  # Skipping the first point, which is the original
-                    parent_point = volume_m_c_perturbed[parent_idx]
-
-                    children = self.sample_sphere_shell(
-                        parent_point.squeeze(2),
-                        1 / noise_intensity,
-                        2 / noise_intensity,
-                        num_hop2,
-                    )
-
-                    for c in range(num_hop2):
-                        idx = len(volume_m_c_perturbed)
-                        volume_m_c_perturbed.append(children[:, :, c : c + 1, :])
-                        neighbors[parent_idx].append(idx)
-
-                volume_m_c_perturbed = torch.cat(volume_m_c_perturbed, dim=2)
-                neighbors = dict(neighbors)
-                field_neighbors = {i: [] for i in range(num_variables)}
-            else:
-                volume_m_c_sample = self.sample_sphere(
-                    volume_mesh_centers, 1 / noise_intensity, num_sample_points
-                )
-                for i in range(num_sample_points):
-                    volume_m_c_perturbed.append(volume_m_c_sample[:, :, i : i + 1, :])
-
-                volume_m_c_perturbed = torch.cat(volume_m_c_perturbed, dim=2)
-
-            for f in range(num_variables):
-                for p in range(volume_m_c_perturbed.shape[2]):
-                    volume_m_c = volume_m_c_perturbed[:, :, p, :]
-                    if p != 0:
-                        dist = torch.norm(
-                            volume_m_c - volume_mesh_centers, dim=-1, keepdim=True
-                        )
-                    basis_f = nn_basis[f](volume_m_c)
-                    output = torch.cat((basis_f, encoding_node, encoding_g), dim=-1)
-                    if self.encode_parameters:
-                        output = torch.cat((output, param_encoding), dim=-1)
-                    if p == 0:
-                        output_center = agg_model[f](output)
-                    else:
-                        if p == 1:
-                            output_neighbor = agg_model[f](output) * (1.0 / dist)
-                            dist_sum = 1.0 / dist
-                        else:
-                            output_neighbor += agg_model[f](output) * (1.0 / dist)
-                            dist_sum += 1.0 / dist
-                    if return_volume_neighbors:
-                        field_neighbors[f].append(agg_model[f](output))
-
-                if return_volume_neighbors:
-                    field_neighbors[f] = torch.stack(field_neighbors[f], dim=2)
-
-                if num_sample_points > 1:
-                    output_res = (
-                        0.5 * output_center + 0.5 * output_neighbor / dist_sum
-                    )  # This only applies to the main point, and not the preturbed points
-                else:
-                    output_res = output_center
-                if f == 0:
-                    output_all = output_res
-                else:
-                    output_all = torch.cat((output_all, output_res), axis=-1)
-
-            if return_volume_neighbors:
-                field_neighbors = torch.cat(
-                    [field_neighbors[i] for i in range(num_variables)], dim=3
-                )
-                return output_all, volume_m_c_perturbed, field_neighbors, neighbors
-            else:
-                return output_all
 
     @profile
     def forward(self, data_dict, return_volume_neighbors=False):
@@ -1417,9 +991,6 @@ class DoMINO(nn.Module):
         # Bounding box grid
         s_grid = data_dict["surf_grid"]
         sdf_surf_grid = data_dict["sdf_surf_grid"]
-        # Scaling factors
-        surf_max = data_dict["surface_min_max"][:, 1]
-        surf_min = data_dict["surface_min_max"][:, 0]
 
         # Parameters
         global_params_values = data_dict["global_params_values"]
@@ -1431,11 +1002,16 @@ class DoMINO(nn.Module):
             p_grid = data_dict["grid"]
             sdf_grid = data_dict["sdf_grid"]
             # Scaling factors
-            vol_max = data_dict["volume_min_max"][:, 1]
-            vol_min = data_dict["volume_min_max"][:, 0]
+            if "volume_min_max" in data_dict.keys():
+                vol_max = data_dict["volume_min_max"][:, 1]
+                vol_min = data_dict["volume_min_max"][:, 0]
 
-            # Normalize based on computational domain
-            geo_centers_vol = 2.0 * (geo_centers - vol_min) / (vol_max - vol_min) - 1
+                # Normalize based on computational domain
+                geo_centers_vol = (
+                    2.0 * (geo_centers - vol_min) / (vol_max - vol_min) - 1
+                )
+            else:
+                geo_centers_vol = geo_centers
 
             encoding_g_vol = self.geo_rep_volume(geo_centers_vol, p_grid, sdf_grid)
 
@@ -1457,9 +1033,16 @@ class DoMINO(nn.Module):
 
         if self.output_features_surf is not None:
             # Represent geometry on bounding box
-            geo_centers_surf = (
-                2.0 * (geo_centers - surf_min) / (surf_max - surf_min) - 1
-            )
+            # Scaling factors
+            if "surface_min_max" in data_dict.keys():
+                surf_max = data_dict["surface_min_max"][:, 1]
+                surf_min = data_dict["surface_min_max"][:, 0]
+                geo_centers_surf = (
+                    2.0 * (geo_centers - surf_min) / (surf_max - surf_min) - 1
+                )
+            else:
+                geo_centers_surf = geo_centers
+
             encoding_g_surf = self.geo_rep_surface(
                 geo_centers_surf, s_grid, sdf_surf_grid
             )
@@ -1491,15 +1074,12 @@ class DoMINO(nn.Module):
             )
 
             # Approximate solution on volume node
-            output_vol = self.calculate_solution(
+            output_vol = self.solution_calculator_vol(
                 volume_mesh_centers,
                 encoding_g_vol,
                 encoding_node_vol,
                 global_params_values,
                 global_params_reference,
-                eval_mode="volume",
-                num_sample_points=self.num_sample_points_volume,
-                return_volume_neighbors=return_volume_neighbors,
             )
 
         else:
@@ -1523,7 +1103,7 @@ class DoMINO(nn.Module):
             )
 
             # Approximate solution on surface cell center
-            output_surf = self.calculate_solution_with_neighbors(
+            output_surf = self.solution_calculator_surf(
                 surface_mesh_centers,
                 encoding_g_surf,
                 encoding_node_surf,
@@ -1534,7 +1114,6 @@ class DoMINO(nn.Module):
                 surface_neighbors_areas,
                 global_params_values,
                 global_params_reference,
-                num_sample_points=self.num_sample_points_surface,
             )
         else:
             output_surf = None
