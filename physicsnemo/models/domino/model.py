@@ -36,9 +36,10 @@ from physicsnemo.utils.profiling import profile
 from .ball_query import BQWarp
 from .encodings import (
     EncodingMLP,
+    MultiGeometryEncoding,
     fourier_encode_vectorized,
 )
-from .mlps import AggregationModel, LocalPointConv
+from .mlps import AggregationModel
 
 
 def get_activation(activation: Literal["relu", "gelu"]) -> Callable:
@@ -881,79 +882,26 @@ class DoMINO(nn.Module):
                 base_layer=model_parameters.position_encoder.base_neurons,
                 activation=get_activation(model_parameters.position_encoder.activation),
             )
-        # BQ for surface
-        self.surface_neighbors_in_radius = (
-            model_parameters.geometry_local.surface_neighbors_in_radius
+
+        # Create a set of local geometry encodings for the surface data:
+        self.surface_local_geo_encodings = MultiGeometryEncoding(
+            radii=model_parameters.geometry_local.surface_radii,
+            neighbors_in_radius=model_parameters.geometry_local.surface_neighbors_in_radius,
+            geo_encoding_type=self.geo_encoding_type,
+            base_layer=512,
+            activation=get_activation(model_parameters.local_point_conv.activation),
+            grid_resolution=self.grid_resolution,
         )
-        self.surface_radius = model_parameters.geometry_local.surface_radii
-        self.surface_bq_warp = nn.ModuleList()
-        self.surface_local_point_conv = nn.ModuleList()
 
-        for ct in range(len(self.surface_radius)):
-            if self.geo_encoding_type == "both":
-                total_neighbors_in_radius = self.surface_neighbors_in_radius[ct] * (
-                    len(model_parameters.geometry_rep.geo_conv.surface_radii) + 1
-                )
-            elif self.geo_encoding_type == "stl":
-                total_neighbors_in_radius = self.surface_neighbors_in_radius[ct] * (
-                    len(model_parameters.geometry_rep.geo_conv.surface_radii)
-                )
-            elif self.geo_encoding_type == "sdf":
-                total_neighbors_in_radius = self.surface_neighbors_in_radius[ct]
-
-            self.surface_bq_warp.append(
-                BQWarp(
-                    radius=self.surface_radius[ct],
-                    neighbors_in_radius=self.surface_neighbors_in_radius[ct],
-                )
-            )
-            self.surface_local_point_conv.append(
-                LocalPointConv(
-                    input_features=total_neighbors_in_radius,
-                    base_layer=512,
-                    output_features=self.surface_neighbors_in_radius[ct],
-                    activation=get_activation(
-                        model_parameters.local_point_conv.activation
-                    ),
-                )
-            )
-
-        # BQ for volume
-        self.volume_neighbors_in_radius = (
-            model_parameters.geometry_local.volume_neighbors_in_radius
+        # Create a set of local geometry encodings for the surface data:
+        self.volume_local_geo_encodings = MultiGeometryEncoding(
+            radii=model_parameters.geometry_local.volume_radii,
+            neighbors_in_radius=model_parameters.geometry_local.volume_neighbors_in_radius,
+            geo_encoding_type=self.geo_encoding_type,
+            base_layer=512,
+            activation=get_activation(model_parameters.local_point_conv.activation),
+            grid_resolution=self.grid_resolution,
         )
-        self.volume_radius = model_parameters.geometry_local.volume_radii
-        self.volume_bq_warp = nn.ModuleList()
-        self.volume_local_point_conv = nn.ModuleList()
-
-        for ct in range(len(self.volume_radius)):
-            if self.geo_encoding_type == "both":
-                total_neighbors_in_radius = self.volume_neighbors_in_radius[ct] * (
-                    len(model_parameters.geometry_rep.geo_conv.volume_radii) + 1
-                )
-            elif self.geo_encoding_type == "stl":
-                total_neighbors_in_radius = self.volume_neighbors_in_radius[ct] * (
-                    len(model_parameters.geometry_rep.geo_conv.volume_radii)
-                )
-            elif self.geo_encoding_type == "sdf":
-                total_neighbors_in_radius = self.volume_neighbors_in_radius[ct]
-
-            self.volume_bq_warp.append(
-                BQWarp(
-                    radius=self.volume_radius[ct],
-                    neighbors_in_radius=self.volume_neighbors_in_radius[ct],
-                )
-            )
-            self.volume_local_point_conv.append(
-                LocalPointConv(
-                    input_features=total_neighbors_in_radius,
-                    base_layer=512,
-                    output_features=self.volume_neighbors_in_radius[ct],
-                    activation=get_activation(
-                        model_parameters.local_point_conv.activation
-                    ),
-                )
-            )
 
         # Transmitting surface to volume
         self.surf_to_vol_conv1 = nn.Conv3d(
@@ -973,7 +921,7 @@ class DoMINO(nn.Module):
         if self.output_features_surf is not None:
             # Surface
             base_layer_geo_surf = 0
-            for j in self.surface_neighbors_in_radius:
+            for j in model_parameters.geometry_local.surface_neighbors_in_radius:
                 base_layer_geo_surf += j
 
             self.agg_model_surf = nn.ModuleList()
@@ -995,7 +943,7 @@ class DoMINO(nn.Module):
         if self.output_features_vol is not None:
             # Volume
             base_layer_geo_vol = 0
-            for j in self.volume_neighbors_in_radius:
+            for j in model_parameters.geometry_local.volume_neighbors_in_radius:
                 base_layer_geo_vol += j
 
             self.agg_model_vol = nn.ModuleList()
@@ -1013,83 +961,6 @@ class DoMINO(nn.Module):
                         ),
                     )
                 )
-
-    def position_encoder(
-        self,
-        encoding_node: torch.Tensor,
-        eval_mode: Literal["surface", "volume"] = "volume",
-    ) -> torch.Tensor:
-        """
-        Compute positional encoding for input points.
-
-        Args:
-            encoding_node: Tensor containing node position information
-            eval_mode: Mode of evaluation, either "volume" or "surface"
-
-        Returns:
-            Tensor containing positional encoding features
-        """
-        if eval_mode == "volume":
-            x = self.fc_p_vol(encoding_node)
-        elif eval_mode == "surface":
-            x = self.fc_p_surf(encoding_node)
-        else:
-            raise ValueError(
-                f"`eval_mode` must be 'surface' or 'volume', got {eval_mode=}"
-            )
-        return x
-
-    def geo_encoding_local(
-        self, encoding_g, volume_mesh_centers, p_grid, mode="volume"
-    ):
-        """Function to calculate local geometry encoding from global encoding"""
-
-        if mode == "volume":
-            radius = self.volume_radius
-            bq_warp = self.volume_bq_warp
-            point_conv = self.volume_local_point_conv
-        elif mode == "surface":
-            radius = self.surface_radius
-            bq_warp = self.surface_bq_warp
-            point_conv = self.surface_local_point_conv
-
-        batch_size = volume_mesh_centers.shape[0]
-        nx, ny, nz = (
-            self.grid_resolution[0],
-            self.grid_resolution[1],
-            self.grid_resolution[2],
-        )
-
-        encoding_outer = []
-        for p in range(len(radius)):
-            p_grid = torch.reshape(p_grid, (batch_size, nx * ny * nz, 3))
-            mapping, outputs = bq_warp[p](
-                volume_mesh_centers, p_grid, reverse_mapping=False
-            )
-            mapping = mapping.type(torch.int64)
-            mask = mapping != 0
-
-            encoding_g_inner = []
-            for j in range(encoding_g.shape[1]):
-                geo_encoding = rearrange(
-                    encoding_g[:, j], "b nx ny nz -> b 1 (nx ny nz)"
-                )
-
-                geo_encoding_sampled = torch.index_select(
-                    geo_encoding, 2, mapping.flatten()
-                )
-                geo_encoding_sampled = torch.reshape(geo_encoding_sampled, mask.shape)
-                geo_encoding_sampled = geo_encoding_sampled * mask
-
-                encoding_g_inner.append(geo_encoding_sampled)
-            encoding_g_inner = torch.cat(encoding_g_inner, dim=2)
-            encoding_g_inner = point_conv[p](encoding_g_inner)
-
-            encoding_outer.append(encoding_g_inner)
-
-        encoding_g = torch.cat(encoding_outer, dim=-1)
-
-        return encoding_g
 
     def calculate_solution_with_neighbors(
         self,
@@ -1300,11 +1171,6 @@ class DoMINO(nn.Module):
             Tensor of shape (batch_size, num_points, num_samples, 3) containing
             the sampled points within the spherical shell around each center
         """
-        # directions = torch.randn(
-        #     size=(center.shape[0], center.shape[1], num_points, center.shape[2]),
-        #     device=center.device,
-        # )
-        # directions = directions / torch.norm(directions, dim=-1, keepdim=True)
 
         unsqueezed_center = center.unsqueeze(2).expand(-1, -1, num_points, -1)
 
@@ -1587,9 +1453,7 @@ class DoMINO(nn.Module):
                 encoding_node_vol = pos_volume_center_of_mass
 
             # Calculate positional encoding on volume nodes
-            encoding_node_vol = self.position_encoder(
-                encoding_node_vol, eval_mode="volume"
-            )
+            encoding_node_vol = self.fc_p_vol(encoding_node_vol)
 
         if self.output_features_surf is not None:
             # Represent geometry on bounding box
@@ -1605,9 +1469,7 @@ class DoMINO(nn.Module):
             encoding_node_surf = pos_surface_center_of_mass
 
             # Calculate positional encoding on surface centers
-            encoding_node_surf = self.position_encoder(
-                encoding_node_surf, eval_mode="surface"
-            )
+            encoding_node_surf = self.fc_p_surf(encoding_node_surf)
 
         if (
             self.output_features_surf is not None
@@ -1622,8 +1484,10 @@ class DoMINO(nn.Module):
             # Calculate local geometry encoding for volume
             # Sampled points on volume
             volume_mesh_centers = data_dict["volume_mesh_centers"]
-            encoding_g_vol = self.geo_encoding_local(
-                0.5 * encoding_g_vol, volume_mesh_centers, p_grid, mode="volume"
+            encoding_g_vol = self.volume_local_geo_encodings(
+                0.5 * encoding_g_vol,
+                volume_mesh_centers,
+                p_grid,
             )
 
             # Approximate solution on volume node
@@ -1654,8 +1518,8 @@ class DoMINO(nn.Module):
             surface_areas = torch.unsqueeze(surface_areas, -1)
             surface_neighbors_areas = torch.unsqueeze(surface_neighbors_areas, -1)
             # Calculate local geometry encoding for surface
-            encoding_g_surf = self.geo_encoding_local(
-                0.5 * encoding_g_surf, surface_mesh_centers, s_grid, mode="surface"
+            encoding_g_surf = self.surface_local_geo_encodings(
+                0.5 * encoding_g_surf, surface_mesh_centers, s_grid
             )
 
             # Approximate solution on surface cell center
