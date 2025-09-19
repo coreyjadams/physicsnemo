@@ -31,8 +31,14 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from physicsnemo.models.unet import UNet
-from physicsnemo.utils.neighbors import radius_search
 from physicsnemo.utils.profiling import profile
+
+from .ball_query import BQWarp
+from .encodings import (
+    EncodingMLP,
+    fourier_encode_vectorized,
+)
+from .mlps import AggregationModel, LocalPointConv
 
 
 def get_activation(activation: Literal["relu", "gelu"]) -> Callable:
@@ -40,46 +46,11 @@ def get_activation(activation: Literal["relu", "gelu"]) -> Callable:
     Return a PyTorch activation function corresponding to the given name.
     """
     if activation == "relu":
-        return F.relu
+        return nn.ReLU()
     elif activation == "gelu":
-        return F.gelu
+        return nn.GELU()
     else:
         raise ValueError(f"Activation function {activation} not found")
-
-
-def fourier_encode(coords, num_freqs):
-    """Function to caluculate fourier features"""
-    # Create a range of frequencies
-    freqs = torch.exp(torch.linspace(0, math.pi, num_freqs, device=coords.device))
-    # Generate sine and cosine features
-    features = [torch.sin(coords * f) for f in freqs] + [
-        torch.cos(coords * f) for f in freqs
-    ]
-    ret = torch.cat(features, dim=-1)
-    return ret
-
-
-def fourier_encode_vectorized(coords, freqs):
-    """Vectorized Fourier feature encoding"""
-    D = coords.shape[-1]
-    F = freqs.shape[0]
-
-    freqs = freqs[None, None, :, None]  # reshape to [*, F, 1] for broadcasting
-
-    coords = coords.unsqueeze(-2)  # [*, 1, D]
-    scaled = (coords * freqs).reshape(*coords.shape[:-2], D * F)  # [*, D, F]
-    features = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=-1)  # [*, D, 2F]
-
-    return features.reshape(*coords.shape[:-2], D * 2 * F)  # [*, D * 2F]
-
-
-def calculate_pos_encoding(nx, d=8):
-    """Function to caluculate positional encoding"""
-    vec = []
-    for k in range(int(d / 2)):
-        vec.append(torch.sin(nx / 10000 ** (2 * (k) / d)))
-        vec.append(torch.cos(nx / 10000 ** (2 * (k) / d)))
-    return vec
 
 
 def scale_sdf(sdf: torch.Tensor) -> torch.Tensor:
@@ -97,90 +68,6 @@ def scale_sdf(sdf: torch.Tensor) -> torch.Tensor:
         Tensor with scaled SDF values in range [-1, 1]
     """
     return sdf / (0.4 + torch.abs(sdf))
-
-
-class BQWarp(nn.Module):
-    """
-    Warp-based ball-query layer for finding neighboring points within a specified radius.
-
-    This layer uses an accelerated ball query implementation to efficiently find points
-    within a specified radius of query points.
-    """
-
-    def __init__(
-        self,
-        grid_resolution=None,
-        radius: float = 0.25,
-        neighbors_in_radius: int = 10,
-    ):
-        """
-        Initialize the BQWarp layer.
-
-        Args:
-            grid_resolution: Resolution of the grid in each dimension [nx, ny, nz]
-            radius: Radius for ball query operation
-            neighbors_in_radius: Maximum number of neighbors to return within radius
-        """
-        super().__init__()
-        if grid_resolution is None:
-            grid_resolution = [256, 96, 64]
-
-        self.radius = radius
-        self.neighbors_in_radius = neighbors_in_radius
-        self.grid_resolution = grid_resolution
-
-    def forward(
-        self, x: torch.Tensor, p_grid: torch.Tensor, reverse_mapping: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Performs ball query operation to find neighboring points and their features.
-
-        This method uses the Warp-accelerated ball query implementation to find points
-        within a specified radius. It can operate in two modes:
-        - Forward mapping: Find points from x that are near p_grid points (reverse_mapping=False)
-        - Reverse mapping: Find points from p_grid that are near x points (reverse_mapping=True)
-
-        Args:
-            x: Tensor of shape (batch_size, num_points, 3+features) containing point coordinates
-               and their features
-            p_grid: Tensor of shape (batch_size, grid_x, grid_y, grid_z, 3) containing grid point
-                   coordinates
-            reverse_mapping: Boolean flag to control the direction of the mapping:
-                            - True: Find p_grid points near x points
-                            - False: Find x points near p_grid points
-
-        Returns:
-            tuple containing:
-                - mapping: Tensor containing indices of neighboring points
-                - outputs: Tensor containing coordinates of the neighboring points
-        """
-        batch_size = x.shape[0]
-        nx, ny, nz = self.grid_resolution
-
-        p_grid = torch.reshape(p_grid, (batch_size, nx * ny * nz, 3))
-
-        if reverse_mapping:
-            mapping, outputs = radius_search(
-                x[0],
-                p_grid[0],
-                self.radius,
-                self.neighbors_in_radius,
-                return_points=True,
-            )
-            mapping = mapping.unsqueeze(0)
-            outputs = outputs.unsqueeze(0)
-        else:
-            mapping, outputs = radius_search(
-                p_grid[0],
-                x[0],
-                self.radius,
-                self.neighbors_in_radius,
-                return_points=True,
-            )
-            mapping = mapping.unsqueeze(0)
-            outputs = outputs.unsqueeze(0)
-
-        return mapping, outputs
 
 
 class GeoConvOut(nn.Module):
@@ -419,7 +306,6 @@ class GeometryRep(nn.Module):
         for j in range(len(radii)):
             self.bq_warp.append(
                 BQWarp(
-                    grid_resolution=model_parameters.interp_res,
                     radius=radii[j],
                     neighbors_in_radius=neighbors_in_radius[j],
                 )
@@ -630,247 +516,6 @@ class GeometryRep(nn.Module):
             encoding_g = self.combined_unet(encoding_g)
 
         return encoding_g
-
-
-class NNBasisFunctions(nn.Module):
-    """Basis function layer for point clouds"""
-
-    def __init__(self, input_features: int, model_parameters=None):
-        super(NNBasisFunctions, self).__init__()
-        base_layer = model_parameters.base_layer
-        self.fourier_features = model_parameters.fourier_features
-        self.num_modes = model_parameters.num_modes
-
-        if self.fourier_features:
-            input_features_calculated = (
-                input_features + input_features * self.num_modes * 2
-            )
-        else:
-            input_features_calculated = input_features
-
-        self.fc1 = nn.Linear(input_features_calculated, base_layer)
-        self.fc2 = nn.Linear(base_layer, int(base_layer))
-        self.fc3 = nn.Linear(int(base_layer), int(base_layer))
-
-        self.activation = get_activation(model_parameters.activation)
-
-        if self.fourier_features:
-            self.register_buffer(
-                "freqs", torch.exp(torch.linspace(0, math.pi, self.num_modes))
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Transform point features into a basis function representation.
-
-        Args:
-            x: Input tensor containing point features
-
-        Returns:
-            Tensor containing basis function coefficients
-        """
-        if self.fourier_features:
-            facets = torch.cat((x, fourier_encode_vectorized(x, self.freqs)), dim=-1)
-        else:
-            facets = x
-        facets = self.activation(self.fc1(facets))
-        facets = self.activation(self.fc2(facets))
-        facets = self.fc3(facets)
-
-        return facets
-
-
-class ParameterModel(nn.Module):
-    """
-    Neural network module to encode simulation parameters.
-
-    This module encodes physical global parameters into a learned
-    latent representation that can be incorporated into the
-    model'sprediction process.
-    """
-
-    def __init__(self, input_features: int, model_parameters=None):
-        """
-        Initialize the parameter encoding network.
-
-        Args:
-            input_features: Number of input parameters to encode
-            model_parameters: Configuration parameters for the model
-        """
-        super(ParameterModel, self).__init__()
-        self.fourier_features = model_parameters.fourier_features
-        self.num_modes = model_parameters.num_modes
-
-        if self.fourier_features:
-            input_features_calculated = (
-                input_features + input_features * self.num_modes * 2
-            )
-            self.register_buffer(
-                "freqs", torch.exp(torch.linspace(0, math.pi, self.num_modes))
-            )
-        else:
-            input_features_calculated = input_features
-
-        base_layer = model_parameters.base_layer
-        self.fc1 = nn.Linear(input_features_calculated, base_layer)
-        self.fc2 = nn.Linear(base_layer, int(base_layer))
-        self.fc3 = nn.Linear(int(base_layer), int(base_layer))
-
-        self.activation = get_activation(model_parameters.activation)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Encode physical parameters into a latent representation.
-
-        Args:
-            x: Input tensor containing physical parameters (e.g., inlet velocity, air density)
-
-        Returns:
-            Tensor containing encoded parameter representation
-        """
-        if self.fourier_features:
-            params = torch.cat((x, fourier_encode_vectorized(x, self.freqs)), dim=-1)
-        else:
-            params = x
-        params = self.activation(self.fc1(params))
-        params = self.activation(self.fc2(params))
-        params = self.fc3(params)
-
-        return params
-
-
-class AggregationModel(nn.Module):
-    """
-    Neural network module to aggregate local geometry encoding with basis functions.
-
-    This module combines basis function representations with geometry encodings
-    to predict the final output quantities. It serves as the final prediction layer
-    that integrates all available information sources.
-    """
-
-    def __init__(
-        self,
-        input_features: int,
-        output_features: int,
-        model_parameters=None,
-        new_change: bool = True,
-    ):
-        """
-        Initialize the aggregation model.
-
-        Args:
-            input_features: Number of input feature dimensions
-            output_features: Number of output feature dimensions
-            model_parameters: Configuration parameters for the model
-            new_change: Flag to enable newer implementation (default: True)
-        """
-        super(AggregationModel, self).__init__()
-        self.input_features = input_features
-        self.output_features = output_features
-        self.new_change = new_change
-        base_layer = model_parameters.base_layer
-        self.fc1 = nn.Linear(self.input_features, base_layer)
-        self.fc2 = nn.Linear(base_layer, int(base_layer))
-        self.fc3 = nn.Linear(int(base_layer), int(base_layer))
-        self.fc4 = nn.Linear(int(base_layer), int(base_layer))
-        self.fc5 = nn.Linear(int(base_layer), self.output_features)
-
-        self.activation = get_activation(model_parameters.activation)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Process the combined input features to predict output quantities.
-
-        This method applies a series of fully connected layers to the input,
-        which typically contains a combination of basis functions, geometry
-        encodings, and potentially parameter encodings.
-
-        Args:
-            x: Input tensor containing combined features
-
-        Returns:
-            Tensor containing predicted output quantities
-        """
-        out = self.activation(self.fc1(x))
-        out = self.activation(self.fc2(out))
-        out = self.activation(self.fc3(out))
-        out = self.activation(self.fc4(out))
-
-        out = self.fc5(out)
-
-        return out
-
-
-class LocalPointConv(nn.Module):
-    """Layer for local geometry point kernel"""
-
-    def __init__(
-        self,
-        input_features,
-        base_layer,
-        output_features,
-        model_parameters=None,
-    ):
-        super(LocalPointConv, self).__init__()
-        self.input_features = input_features
-        self.output_features = output_features
-        self.fc1 = nn.Linear(self.input_features, base_layer)
-        self.fc2 = nn.Linear(base_layer, self.output_features)
-        self.activation = get_activation(model_parameters.activation)
-
-    def forward(self, x):
-        out = self.activation(self.fc1(x))
-        out = self.fc2(out)
-
-        return out
-
-
-class PositionEncoder(nn.Module):
-    """Positional encoding of point clouds"""
-
-    def __init__(self, input_features: int, model_parameters=None):
-        super().__init__()
-        base_layer = model_parameters.base_neurons
-        self.fourier_features = model_parameters.fourier_features
-        self.num_modes = model_parameters.num_modes
-
-        if self.fourier_features:
-            input_features_calculated = (
-                input_features + input_features * self.num_modes * 2
-            )
-        else:
-            input_features_calculated = input_features
-
-        self.fc1 = nn.Linear(input_features_calculated, base_layer)
-        self.fc2 = nn.Linear(base_layer, int(base_layer))
-        self.fc3 = nn.Linear(int(base_layer), int(base_layer))
-
-        self.activation = get_activation(model_parameters.activation)
-
-        if self.fourier_features:
-            self.register_buffer(
-                "freqs", torch.exp(torch.linspace(0, math.pi, self.num_modes))
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Transform point features into a basis function representation.
-
-        Args:
-            x: Input tensor containing point features
-
-        Returns:
-            Tensor containing position encoder
-        """
-        if self.fourier_features:
-            facets = torch.cat((x, fourier_encode_vectorized(x, self.freqs)), axis=-1)
-        else:
-            facets = x
-        facets = self.activation(self.fc1(facets))
-        facets = self.activation(self.fc2(facets))
-        facets = self.fc3(facets)
-
-        return facets
 
 
 # @dataclass
@@ -1134,9 +779,12 @@ class DoMINO(nn.Module):
         if self.encode_parameters:
             # Defining the parameter model
             base_layer_p = model_parameters.parameter_model.base_layer
-            self.parameter_model = ParameterModel(
+            self.parameter_model = EncodingMLP(
                 input_features=self.global_features,
-                model_parameters=model_parameters.parameter_model,
+                fourier_features=model_parameters.parameter_model.fourier_features,
+                num_modes=model_parameters.parameter_model.num_modes,
+                base_layer=model_parameters.parameter_model.base_layer,
+                activation=get_activation(model_parameters.parameter_model.activation),
             )
         else:
             base_layer_p = 0
@@ -1172,9 +820,15 @@ class DoMINO(nn.Module):
                 self.num_variables_surf
             ):  # Have the same basis function for each variable
                 self.nn_basis_surf.append(
-                    NNBasisFunctions(
+                    EncodingMLP(
                         input_features=input_features_surface,
-                        model_parameters=model_parameters.nn_basis_functions,
+                        base_layer=model_parameters.nn_basis_functions.base_layer,
+                        fourier_features=model_parameters.nn_basis_functions.fourier_features,
+                        num_modes=model_parameters.nn_basis_functions.num_modes,
+                        activation=get_activation(
+                            model_parameters.nn_basis_functions.activation
+                        ),
+                        # model_parameters=model_parameters.nn_basis_functions,
                     )
                 )
 
@@ -1184,9 +838,15 @@ class DoMINO(nn.Module):
                 self.num_variables_vol
             ):  # Have the same basis function for each variable
                 self.nn_basis_vol.append(
-                    NNBasisFunctions(
+                    EncodingMLP(
                         input_features=input_features,
-                        model_parameters=model_parameters.nn_basis_functions,
+                        base_layer=model_parameters.nn_basis_functions.base_layer,
+                        fourier_features=model_parameters.nn_basis_functions.fourier_features,
+                        num_modes=model_parameters.nn_basis_functions.num_modes,
+                        activation=get_activation(
+                            model_parameters.nn_basis_functions.activation
+                        ),
+                        # model_parameters=model_parameters.nn_basis_functions,
                     )
                 )
 
@@ -1200,8 +860,12 @@ class DoMINO(nn.Module):
             else:
                 inp_pos_vol = 7 if model_parameters.use_sdf_in_basis_func else 3
 
-            self.fc_p_vol = PositionEncoder(
-                inp_pos_vol, model_parameters.position_encoder
+            self.fc_p_vol = EncodingMLP(
+                input_features=inp_pos_vol,
+                fourier_features=model_parameters.position_encoder.fourier_features,
+                num_modes=model_parameters.position_encoder.num_modes,
+                base_layer=model_parameters.position_encoder.base_neurons,
+                activation=get_activation(model_parameters.position_encoder.activation),
             )
 
         if self.output_features_surf is not None:
@@ -1210,10 +874,13 @@ class DoMINO(nn.Module):
             else:
                 inp_pos_surf = 3
 
-            self.fc_p_surf = PositionEncoder(
-                inp_pos_surf, model_parameters.position_encoder
+            self.fc_p_surf = EncodingMLP(
+                input_features=inp_pos_surf,
+                fourier_features=model_parameters.position_encoder.fourier_features,
+                num_modes=model_parameters.position_encoder.num_modes,
+                base_layer=model_parameters.position_encoder.base_neurons,
+                activation=get_activation(model_parameters.position_encoder.activation),
             )
-
         # BQ for surface
         self.surface_neighbors_in_radius = (
             model_parameters.geometry_local.surface_neighbors_in_radius
@@ -1236,7 +903,6 @@ class DoMINO(nn.Module):
 
             self.surface_bq_warp.append(
                 BQWarp(
-                    grid_resolution=model_parameters.interp_res,
                     radius=self.surface_radius[ct],
                     neighbors_in_radius=self.surface_neighbors_in_radius[ct],
                 )
@@ -1246,7 +912,9 @@ class DoMINO(nn.Module):
                     input_features=total_neighbors_in_radius,
                     base_layer=512,
                     output_features=self.surface_neighbors_in_radius[ct],
-                    model_parameters=model_parameters.local_point_conv,
+                    activation=get_activation(
+                        model_parameters.local_point_conv.activation
+                    ),
                 )
             )
 
@@ -1272,7 +940,6 @@ class DoMINO(nn.Module):
 
             self.volume_bq_warp.append(
                 BQWarp(
-                    grid_resolution=model_parameters.interp_res,
                     radius=self.volume_radius[ct],
                     neighbors_in_radius=self.volume_neighbors_in_radius[ct],
                 )
@@ -1282,7 +949,9 @@ class DoMINO(nn.Module):
                     input_features=total_neighbors_in_radius,
                     base_layer=512,
                     output_features=self.volume_neighbors_in_radius[ct],
-                    model_parameters=model_parameters.local_point_conv,
+                    activation=get_activation(
+                        model_parameters.local_point_conv.activation
+                    ),
                 )
             )
 
@@ -1316,7 +985,10 @@ class DoMINO(nn.Module):
                         + base_layer_geo_surf
                         + base_layer_p,
                         output_features=1,
-                        model_parameters=model_parameters.aggregation_model,
+                        base_layer=model_parameters.aggregation_model.base_layer,
+                        activation=get_activation(
+                            model_parameters.aggregation_model.activation
+                        ),
                     )
                 )
 
@@ -1335,7 +1007,10 @@ class DoMINO(nn.Module):
                         + base_layer_geo_vol
                         + base_layer_p,
                         output_features=1,
-                        model_parameters=model_parameters.aggregation_model,
+                        base_layer=model_parameters.aggregation_model.base_layer,
+                        activation=get_activation(
+                            model_parameters.aggregation_model.activation
+                        ),
                     )
                 )
 
