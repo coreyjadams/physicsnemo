@@ -26,7 +26,7 @@ from .utils import validate_output_shape_and_values
 @pytest.mark.parametrize("act", ["relu", "gelu"])
 def test_geo_conv_out(device, act):
     """Test GeoConvOut layer"""
-    from physicsnemo.models.domino.model import GeoConvOut
+    from physicsnemo.models.domino.geometry_rep import GeoConvOut
 
     torch.manual_seed(0)
 
@@ -59,7 +59,7 @@ def test_geo_conv_out(device, act):
 @pytest.mark.parametrize("act", ["relu", "gelu"])
 def test_geo_processor(device, act):
     """Test GeoProcessor CNN"""
-    from physicsnemo.models.domino.model import GeoProcessor
+    from physicsnemo.models.domino.geometry_rep import GeoProcessor
 
     torch.manual_seed(0)
 
@@ -87,7 +87,7 @@ def test_geometry_rep(
     device, geometry_encoding_type, processor_type, base_model_params
 ):
     """Test GeometryRep module with different configurations"""
-    from physicsnemo.models.domino.model import GeometryRep
+    from physicsnemo.models.domino.geometry_rep import GeometryRep
 
     torch.manual_seed(0)
 
