@@ -88,7 +88,7 @@ class EncodingMLP(nn.Module):
         if self.fourier_features:
             input_features_calculated = input_features + input_features * num_modes * 2
             self.register_buffer(
-                "freqs", torch.exp(torch.linspace(0, math.pi, self.num_modes))
+                "freqs", torch.exp(torch.linspace(0, math.pi, num_modes))
             )
         else:
             input_features_calculated = input_features
@@ -160,6 +160,7 @@ class LocalGeometryEncoding(nn.Module):
         mapping, outputs = self.bq_warp(
             volume_mesh_centers, p_grid, reverse_mapping=False
         )
+
         mapping = mapping.type(torch.int64)
         mask = mapping != 0
 

@@ -122,7 +122,7 @@ class SolutionCalculatorVolume(nn.Module):
                     "Parameter model is required when encode_parameters is True"
                 )
 
-    def encode_parameters(
+    def apply_parameter_encoding(
         self,
         mesh_centers: torch.Tensor,
         global_params_values: torch.Tensor,
@@ -156,7 +156,7 @@ class SolutionCalculatorVolume(nn.Module):
         Forward pass of the SolutionCalculator module.
         """
         if self.encode_parameters:
-            param_encoding = self.encode_parameters(
+            param_encoding = self.apply_parameter_encoding(
                 volume_mesh_centers, global_params_values, global_params_reference
             )
 
@@ -291,7 +291,7 @@ class SolutionCalculatorSurface(nn.Module):
                     "Parameter model is required when encode_parameters is True"
                 )
 
-    def encode_parameters(
+    def apply_parameter_encoding(
         self,
         mesh_centers: torch.Tensor,
         global_params_values: torch.Tensor,
@@ -329,43 +329,29 @@ class SolutionCalculatorSurface(nn.Module):
         """Function to approximate solution given the neighborhood information"""
 
         if self.encode_parameters:
-            param_encoding = self.encode_parameters(
+            param_encoding = self.apply_parameter_encoding(
                 surface_mesh_centers, global_params_values, global_params_reference
             )
 
-        if self.use_surface_normals:
-            if not self.use_surface_area:
-                surface_mesh_centers = torch.cat(
-                    (surface_mesh_centers, surface_normals),
-                    dim=-1,
-                )
-                if self.num_sample_points > 1:
-                    surface_mesh_neighbors = torch.cat(
-                        (
-                            surface_mesh_neighbors,
-                            surface_neighbors_normals,
-                        ),
-                        dim=-1,
-                    )
+        centers_inputs = [
+            surface_mesh_centers,
+        ]
+        neighbors_inputs = [
+            surface_mesh_neighbors,
+        ]
 
-            else:
-                surface_mesh_centers = torch.cat(
-                    (
-                        surface_mesh_centers,
-                        surface_normals,
-                        torch.log(surface_areas) / 10,
-                    ),
-                    dim=-1,
-                )
-                if self.num_sample_points > 1:
-                    surface_mesh_neighbors = torch.cat(
-                        (
-                            surface_mesh_neighbors,
-                            surface_neighbors_normals,
-                            torch.log(surface_neighbors_areas) / 10,
-                        ),
-                        dim=-1,
-                    )
+        if self.use_surface_normals:
+            centers_inputs.append(surface_normals)
+            if self.num_sample_points > 1:
+                neighbors_inputs.append(surface_neighbors_normals)
+
+        if self.use_surface_area:
+            centers_inputs.append(torch.log(surface_areas) / 10)
+            if self.num_sample_points > 1:
+                neighbors_inputs.append(torch.log(surface_neighbors_areas) / 10)
+
+        surface_mesh_centers = torch.cat(centers_inputs, dim=-1)
+        surface_mesh_neighbors = torch.cat(neighbors_inputs, dim=-1)
 
         for f in range(self.num_variables):
             for p in range(self.num_sample_points):

@@ -127,7 +127,7 @@ class GeoConvOut(nn.Module):
 
         Args:
             x: Input tensor containing coordinates of the neighboring points
-               (batch_size, nx*ny*nz, 3, n_points)
+               (batch_size, nx*ny*nz, n_points, 3)
             grid: Input tensor represented as a grid of shape
                 (batch_size, nx, ny, nz, 3)
 
