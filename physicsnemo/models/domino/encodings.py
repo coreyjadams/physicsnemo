@@ -138,7 +138,6 @@ class LocalGeometryEncoding(nn.Module):
             radius=radius,
             neighbors_in_radius=neighbors_in_radius,
         )
-
         self.local_point_conv = LocalPointConv(
             input_features=total_neighbors_in_radius,
             base_layer=base_layer,
@@ -201,6 +200,7 @@ class MultiGeometryEncoding(nn.Module):
         radii: list[float],
         neighbors_in_radius: list[int],
         geo_encoding_type: str,
+        n_upstream_radii: int,
         base_layer: int,
         activation: nn.Module,
         grid_resolution: tuple[int, int, int],
@@ -213,7 +213,7 @@ class MultiGeometryEncoding(nn.Module):
                     radius=r,
                     neighbors_in_radius=n,
                     total_neighbors_in_radius=self.calculate_total_neighbors_in_radius(
-                        geo_encoding_type, n, radii
+                        geo_encoding_type, n, n_upstream_radii
                     ),
                     base_layer=base_layer,
                     activation=activation,
@@ -224,12 +224,12 @@ class MultiGeometryEncoding(nn.Module):
         )
 
     def calculate_total_neighbors_in_radius(
-        self, geo_encoding_type: str, neighbors_in_radius: int, radii: list[float]
+        self, geo_encoding_type: str, neighbors_in_radius: int, n_upstream_radii: int
     ) -> list[int]:
         if geo_encoding_type == "both":
-            total_neighbors_in_radius = neighbors_in_radius * (len(radii) + 1)
+            total_neighbors_in_radius = neighbors_in_radius * (n_upstream_radii + 1)
         elif geo_encoding_type == "stl":
-            total_neighbors_in_radius = neighbors_in_radius * (len(radii))
+            total_neighbors_in_radius = neighbors_in_radius * (n_upstream_radii)
         elif geo_encoding_type == "sdf":
             total_neighbors_in_radius = neighbors_in_radius
 
