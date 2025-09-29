@@ -359,10 +359,7 @@ class DoMINO(nn.Module):
         self.activation = get_activation(model_parameters.activation)
         self.use_sdf_in_basis_func = model_parameters.use_sdf_in_basis_func
         if self.output_features_vol is not None:
-            if model_parameters.positional_encoding:
-                inp_pos_vol = 25 if model_parameters.use_sdf_in_basis_func else 12
-            else:
-                inp_pos_vol = 7 if model_parameters.use_sdf_in_basis_func else 3
+            inp_pos_vol = 7 if model_parameters.use_sdf_in_basis_func else 3
 
             self.fc_p_vol = EncodingMLP(
                 input_features=inp_pos_vol,
@@ -373,10 +370,7 @@ class DoMINO(nn.Module):
             )
 
         if self.output_features_surf is not None:
-            if model_parameters.positional_encoding:
-                inp_pos_surf = 12
-            else:
-                inp_pos_surf = 3
+            inp_pos_surf = 3
 
             self.fc_p_surf = EncodingMLP(
                 input_features=inp_pos_surf,
