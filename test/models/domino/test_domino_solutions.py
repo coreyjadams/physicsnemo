@@ -29,10 +29,9 @@ def test_solution_calculator_volume(
     device, num_variables, num_sample_points, encode_parameters
 ):
     """Test SolutionCalculatorVolume with various configurations"""
-    from physicsnemo.models.domino.encodings import EncodingMLP
     from physicsnemo.models.domino.mlps import AggregationModel
-    from physicsnemo.models.domino.model import get_activation
     from physicsnemo.models.domino.solutions import SolutionCalculatorVolume
+    from physicsnemo.models.layers import FourierMLP, get_activation
 
     torch.manual_seed(0)
 
@@ -40,7 +39,7 @@ def test_solution_calculator_volume(
 
     # Create parameter model if needed
     parameter_model = (
-        EncodingMLP(
+        FourierMLP(
             input_features=2,
             base_layer=32,
             fourier_features=True,
@@ -67,7 +66,7 @@ def test_solution_calculator_volume(
     # Create basis functions
     nn_basis = nn.ModuleList(
         [
-            EncodingMLP(
+            FourierMLP(
                 input_features=3,
                 base_layer=32,
                 fourier_features=False,
@@ -115,10 +114,9 @@ def test_solution_calculator_surface(
     device, num_variables, use_surface_normals, use_surface_area
 ):
     """Test SolutionCalculatorSurface with various configurations"""
-    from physicsnemo.models.domino.encodings import EncodingMLP
     from physicsnemo.models.domino.mlps import AggregationModel
-    from physicsnemo.models.domino.model import get_activation
     from physicsnemo.models.domino.solutions import SolutionCalculatorSurface
+    from physicsnemo.models.layers import FourierMLP, get_activation
 
     torch.manual_seed(0)
 
@@ -130,8 +128,6 @@ def test_solution_calculator_surface(
         input_features += 3
     if use_surface_area:
         input_features += 1
-
-    print(f"Input features: {input_features}")
 
     # Create aggregation models
     aggregation_model = nn.ModuleList(
@@ -149,7 +145,7 @@ def test_solution_calculator_surface(
     # Create basis functions
     nn_basis = nn.ModuleList(
         [
-            EncodingMLP(
+            FourierMLP(
                 input_features=input_features,
                 base_layer=32,
                 fourier_features=False,
@@ -163,7 +159,6 @@ def test_solution_calculator_surface(
     model = SolutionCalculatorSurface(
         num_variables=num_variables,
         num_sample_points=3,
-        noise_intensity=50.0,
         encode_parameters=False,
         use_surface_normals=use_surface_normals,
         use_surface_area=use_surface_area,

@@ -25,19 +25,18 @@ from .utils import validate_output_shape_and_values
 @pytest.mark.parametrize("device", ["cuda:0"])
 @pytest.mark.parametrize("fourier_features", [True, False])
 @pytest.mark.parametrize("num_modes", [3, 5, 10])
-def test_encoding_mlp(device, fourier_features, num_modes):
-    """Test EncodingMLP with various configurations"""
-    from physicsnemo.models.domino.encodings import EncodingMLP
-    from physicsnemo.models.domino.model import get_activation
+def test_fourier_mlp(device, fourier_features, num_modes):
+    """Test FourierMLP with various configurations"""
+    from physicsnemo.models.layers import FourierMLP
 
     torch.manual_seed(0)
 
-    model = EncodingMLP(
+    model = FourierMLP(
         input_features=3,
         base_layer=64,
         fourier_features=fourier_features,
         num_modes=num_modes,
-        activation=get_activation("relu"),
+        activation="relu",
     ).to(device)
 
     x = torch.randn(2, 100, 3).to(device)
@@ -49,14 +48,14 @@ def test_encoding_mlp(device, fourier_features, num_modes):
 @pytest.mark.parametrize("device", ["cuda:0"])
 def test_fourier_encode_vectorized(device):
     """Test fourier encoding function"""
-    from physicsnemo.models.domino.encodings import fourier_encode_vectorized
+    from physicsnemo.models.layers import fourier_encode
 
     torch.manual_seed(0)
 
     coords = torch.randn(4, 20, 3).to(device)
     freqs = torch.exp(torch.linspace(0, math.pi, 5)).to(device)
 
-    output = fourier_encode_vectorized(coords, freqs)
+    output = fourier_encode(coords, freqs)
 
     # Output should be [batch, points, D * 2 * F] = [4, 20, 3 * 2 * 5] = [4, 20, 30]
     validate_output_shape_and_values(output, (4, 20, 30))
@@ -118,6 +117,7 @@ def test_multi_geometry_encoding(device, geo_encoding_type):
         neighbors_in_radius=neighbors_in_radius,
         geo_encoding_type=geo_encoding_type,
         base_layer=64,
+        n_upstream_radii=2,
         activation=get_activation("relu"),
         grid_resolution=GRID_RESOLUTION,
     ).to(device)
@@ -133,13 +133,7 @@ def test_multi_geometry_encoding(device, geo_encoding_type):
     volume_mesh_centers = torch.randn(BATCH_SIZE, N_MESH_POINTS, 3).to(device)
     p_grid = torch.randn(BATCH_SIZE, *GRID_RESOLUTION, 3).to(device)
 
-    print(f"encoding_g.shape: {encoding_g.shape}")
-    print(f"volume_mesh_centers.shape: {volume_mesh_centers.shape}")
-    print(f"p_grid.shape: {p_grid.shape}")
-
     output = model(encoding_g, volume_mesh_centers, p_grid)
-
-    print(f"output.shape: {output.shape}")
 
     expected_output_dim = sum(neighbors_in_radius)
 

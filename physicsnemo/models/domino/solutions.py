@@ -27,6 +27,27 @@ import torch
 import torch.nn as nn
 
 
+def apply_parameter_encoding(
+    mesh_centers: torch.Tensor,
+    global_params_values: torch.Tensor,
+    global_params_reference: torch.Tensor,
+) -> torch.Tensor:
+    processed_parameters = []
+    for k in range(global_params_values.shape[1]):
+        param = torch.unsqueeze(global_params_values[:, k, :], 1)
+        ref = torch.unsqueeze(global_params_reference[:, k, :], 1)
+        param = param.expand(
+            param.shape[0],
+            mesh_centers.shape[1],
+            param.shape[2],
+        )
+        param = param / ref
+        processed_parameters.append(param)
+    processed_parameters = torch.cat(processed_parameters, axis=-1)
+
+    return processed_parameters
+
+
 def sample_sphere(center, r, num_points):
     """Uniformly sample points in a 3D sphere around the center.
 
@@ -122,28 +143,6 @@ class SolutionCalculatorVolume(nn.Module):
                     "Parameter model is required when encode_parameters is True"
                 )
 
-    def apply_parameter_encoding(
-        self,
-        mesh_centers: torch.Tensor,
-        global_params_values: torch.Tensor,
-        global_params_reference: torch.Tensor,
-    ) -> torch.Tensor:
-        processed_parameters = []
-        for k in range(global_params_values.shape[1]):
-            param = torch.unsqueeze(global_params_values[:, k, :], 1)
-            ref = torch.unsqueeze(global_params_reference[:, k, :], 1)
-            param = param.expand(
-                param.shape[0],
-                mesh_centers.shape[1],
-                param.shape[2],
-            )
-            param = param / ref
-            processed_parameters.append(param)
-        processed_parameters = torch.cat(processed_parameters, axis=-1)
-        param_encoding = self.parameter_model(processed_parameters)
-
-        return param_encoding
-
     def forward(
         self,
         volume_mesh_centers: torch.Tensor,
@@ -156,9 +155,10 @@ class SolutionCalculatorVolume(nn.Module):
         Forward pass of the SolutionCalculator module.
         """
         if self.encode_parameters:
-            param_encoding = self.apply_parameter_encoding(
+            param_encoding = apply_parameter_encoding(
                 volume_mesh_centers, global_params_values, global_params_reference
             )
+            param_encoding = self.parameter_model(param_encoding)
 
         volume_m_c_perturbed = [volume_mesh_centers.unsqueeze(2)]
 
@@ -266,7 +266,6 @@ class SolutionCalculatorSurface(nn.Module):
         self,
         num_variables: int,
         num_sample_points: int,
-        noise_intensity: float,
         encode_parameters: bool,
         use_surface_normals: bool,
         use_surface_area: bool,
@@ -277,7 +276,6 @@ class SolutionCalculatorSurface(nn.Module):
         super().__init__()
         self.num_variables = num_variables
         self.num_sample_points = num_sample_points
-        self.noise_intensity = noise_intensity
         self.encode_parameters = encode_parameters
         self.use_surface_normals = use_surface_normals
         self.use_surface_area = use_surface_area
@@ -290,28 +288,6 @@ class SolutionCalculatorSurface(nn.Module):
                 raise ValueError(
                     "Parameter model is required when encode_parameters is True"
                 )
-
-    def apply_parameter_encoding(
-        self,
-        mesh_centers: torch.Tensor,
-        global_params_values: torch.Tensor,
-        global_params_reference: torch.Tensor,
-    ) -> torch.Tensor:
-        processed_parameters = []
-        for k in range(global_params_values.shape[1]):
-            param = torch.unsqueeze(global_params_values[:, k, :], 1)
-            ref = torch.unsqueeze(global_params_reference[:, k, :], 1)
-            param = param.expand(
-                param.shape[0],
-                mesh_centers.shape[1],
-                param.shape[2],
-            )
-            param = param / ref
-            processed_parameters.append(param)
-        processed_parameters = torch.cat(processed_parameters, axis=-1)
-        param_encoding = self.parameter_model(processed_parameters)
-
-        return param_encoding
 
     def forward(
         self,
@@ -329,9 +305,10 @@ class SolutionCalculatorSurface(nn.Module):
         """Function to approximate solution given the neighborhood information"""
 
         if self.encode_parameters:
-            param_encoding = self.apply_parameter_encoding(
+            param_encoding = apply_parameter_encoding(
                 surface_mesh_centers, global_params_values, global_params_reference
             )
+            param_encoding = self.parameter_model(param_encoding)
 
         centers_inputs = [
             surface_mesh_centers,

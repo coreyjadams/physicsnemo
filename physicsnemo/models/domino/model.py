@@ -24,13 +24,13 @@ the config.yaml file)
 import torch
 import torch.nn as nn
 
+from physicsnemo.models.layers import FourierMLP, get_activation
 from physicsnemo.models.unet import UNet
 
 from .encodings import (
-    EncodingMLP,
     MultiGeometryEncoding,
 )
-from .geometry_rep import GeometryRep, get_activation
+from .geometry_rep import GeometryRep
 from .mlps import AggregationModel
 from .solutions import SolutionCalculatorSurface, SolutionCalculatorVolume
 
@@ -283,7 +283,7 @@ class DoMINO(nn.Module):
         if self.encode_parameters:
             # Defining the parameter model
             base_layer_p = model_parameters.parameter_model.base_layer
-            self.parameter_model = EncodingMLP(
+            self.parameter_model = FourierMLP(
                 input_features=self.global_features,
                 fourier_features=model_parameters.parameter_model.fourier_features,
                 num_modes=model_parameters.parameter_model.num_modes,
@@ -324,7 +324,7 @@ class DoMINO(nn.Module):
                 self.num_variables_surf
             ):  # Have the same basis function for each variable
                 self.nn_basis_surf.append(
-                    EncodingMLP(
+                    FourierMLP(
                         input_features=input_features_surface,
                         base_layer=model_parameters.nn_basis_functions.base_layer,
                         fourier_features=model_parameters.nn_basis_functions.fourier_features,
@@ -342,7 +342,7 @@ class DoMINO(nn.Module):
                 self.num_variables_vol
             ):  # Have the same basis function for each variable
                 self.nn_basis_vol.append(
-                    EncodingMLP(
+                    FourierMLP(
                         input_features=input_features,
                         base_layer=model_parameters.nn_basis_functions.base_layer,
                         fourier_features=model_parameters.nn_basis_functions.fourier_features,
@@ -364,7 +364,7 @@ class DoMINO(nn.Module):
             else:
                 inp_pos_vol = 7 if model_parameters.use_sdf_in_basis_func else 3
 
-            self.fc_p_vol = EncodingMLP(
+            self.fc_p_vol = FourierMLP(
                 input_features=inp_pos_vol,
                 fourier_features=model_parameters.position_encoder.fourier_features,
                 num_modes=model_parameters.position_encoder.num_modes,
@@ -378,7 +378,7 @@ class DoMINO(nn.Module):
             else:
                 inp_pos_surf = 3
 
-            self.fc_p_surf = EncodingMLP(
+            self.fc_p_surf = FourierMLP(
                 input_features=inp_pos_surf,
                 fourier_features=model_parameters.position_encoder.fourier_features,
                 num_modes=model_parameters.position_encoder.num_modes,
@@ -450,7 +450,6 @@ class DoMINO(nn.Module):
                 num_sample_points=self.num_sample_points_surface,
                 use_surface_normals=self.use_surface_normals,
                 use_surface_area=self.use_surface_area,
-                noise_intensity=50,
                 encode_parameters=self.encode_parameters,
                 parameter_model=self.parameter_model
                 if self.encode_parameters
@@ -498,7 +497,7 @@ class DoMINO(nn.Module):
                 nn_basis=self.nn_basis_vol,
             )
 
-    def forward(self, data_dict, return_volume_neighbors=False):
+    def forward(self, data_dict):
         # Loading STL inputs, bounding box grids, precomputed SDF and scaling factors
 
         # STL nodes

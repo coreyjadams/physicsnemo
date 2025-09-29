@@ -15,29 +15,17 @@
 # limitations under the License.
 
 import math
-from typing import Callable, Literal, Sequence
+from typing import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from physicsnemo.models.layers import BQWarp, Mlp, fourier_encode, get_activation
 from physicsnemo.models.unet import UNet
 
-from .ball_query import BQWarp
-from .encodings import fourier_encode_vectorized
-
-
-def get_activation(activation: Literal["relu", "gelu"]) -> Callable:
-    """
-    Return a PyTorch activation function corresponding to the given name.
-    """
-    if activation == "relu":
-        return nn.ReLU()
-    elif activation == "gelu":
-        return nn.GELU()
-    else:
-        raise ValueError(f"Activation function {activation} not found")
+# from .encodings import fourier_encode
 
 
 def scale_sdf(sdf: torch.Tensor) -> torch.Tensor:
@@ -88,9 +76,17 @@ class GeoConvOut(nn.Module):
         else:
             input_features_calculated = input_features
 
-        self.fc1 = nn.Linear(input_features_calculated, base_neurons)
-        self.fc2 = nn.Linear(base_neurons, base_neurons // 2)
-        self.fc3 = nn.Linear(base_neurons // 2, model_parameters.base_neurons_in)
+        self.mlp = Mlp(
+            in_features=input_features_calculated,
+            hidden_features=[base_neurons, base_neurons // 2],
+            out_features=model_parameters.base_neurons_in,
+            act_layer=get_activation(model_parameters.activation),
+            drop=0.0,
+        )
+
+        # self.fc1 = nn.Linear(input_features_calculated, base_neurons)
+        # self.fc2 = nn.Linear(base_neurons, base_neurons // 2)
+        # self.fc3 = nn.Linear(base_neurons // 2, model_parameters.base_neurons_in)
 
         self.grid_resolution = grid_resolution
 
@@ -135,12 +131,13 @@ class GeoConvOut(nn.Module):
         # x = torch.sum(x, 2)
         mask = abs(x - 0) > 1e-6
         if self.fourier_features:
-            facets = torch.cat((x, fourier_encode_vectorized(x, self.freqs)), axis=-1)
+            facets = torch.cat((x, fourier_encode(x, self.freqs)), axis=-1)
         else:
             facets = x
-        x = self.activation(self.fc1(facets))
-        x = self.activation(self.fc2(x))
-        x = F.tanh(self.fc3(x))
+        # x = self.activation(self.fc1(facets))
+        # x = self.activation(self.fc2(x))
+        # x = F.tanh(self.fc3(x))
+        x = F.tanh(self.mlp(facets))
 
         mask = mask[:, :, :, 0:1].expand(
             mask.shape[0], mask.shape[1], mask.shape[2], x.shape[-1]
@@ -272,6 +269,8 @@ class GeometryRep(nn.Module):
         neighbors_in_radius,
         hops=1,
         model_parameters=None,
+        # activation_conv: nn.Module,
+        # activation_processor: nn.Module,
     ):
         """
         Initialize the GeometryRep module.

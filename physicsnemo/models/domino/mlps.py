@@ -15,60 +15,17 @@
 # limitations under the License.
 
 """
-This code contains the DoMINO model architecture.
-The DoMINO class contains an architecture to model both surface and
-volume quantities together as well as separately (controlled using
-the config.yaml file)
+This file contains specific MLPs for the DoMINO model.
+
+The main feature here is we've locked in the number of layers.
 """
 
-import torch
 import torch.nn as nn
 
-
-class MLP(nn.Module):
-    """
-    FlexibleMulti-layer perceptron (MLP) module.
-
-    This is reused in various domino layers to simplify and unify
-    the MLP implementations.
-    """
-
-    def __init__(
-        self,
-        input_features: int,
-        output_features: int,
-        base_layer: int,
-        activation: nn.Module,
-        n_layers: int,
-    ):
-        super(MLP, self).__init__()
-        self.input_features = input_features
-
-        modules = []
-
-        if n_layers == 1:
-            # Single layer: input_features -> output_features
-            modules.append(nn.Linear(input_features, output_features))
-        else:
-            # First layer: input_features -> base_layer
-            modules.append(nn.Linear(input_features, base_layer))
-            modules.append(activation)
-
-            # Hidden layers: base_layer -> base_layer
-            for _ in range(n_layers - 2):
-                modules.append(nn.Linear(base_layer, base_layer))
-                modules.append(activation)
-
-            # Final layer: base_layer -> output_features (no activation)
-            modules.append(nn.Linear(base_layer, output_features))
-
-        self.mlp_modules = torch.nn.Sequential(*modules)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp_modules(x)
+from physicsnemo.models.layers import Mlp
 
 
-class AggregationModel(MLP):
+class AggregationModel(Mlp):
     """
     Neural network module to aggregate local geometry encoding with basis functions.
 
@@ -76,6 +33,8 @@ class AggregationModel(MLP):
     to predict the final output quantities. It serves as the final prediction layer
     that integrates all available information sources.
 
+    It is implemented as a straightforward MLP with 5 total layers.
+
     """
 
     def __init__(
@@ -85,17 +44,22 @@ class AggregationModel(MLP):
         base_layer: int,
         activation: nn.Module,
     ):
+        hidden_features = [base_layer, base_layer, base_layer, base_layer]
+
         super().__init__(
-            input_features=input_features,
-            output_features=output_features,
-            base_layer=base_layer,
-            activation=activation,
-            n_layers=5,
+            in_features=input_features,
+            hidden_features=hidden_features,
+            out_features=output_features,
+            act_layer=activation,
+            drop=0.0,
         )
 
 
-class LocalPointConv(MLP):
-    """Layer for local geometry point kernel"""
+class LocalPointConv(Mlp):
+    """Layer for local geometry point kernel
+
+    This is a straight forward MLP, with exactly two layers.
+    """
 
     def __init__(
         self,
@@ -105,9 +69,9 @@ class LocalPointConv(MLP):
         activation: nn.Module,
     ):
         super().__init__(
-            input_features=input_features,
-            base_layer=base_layer,
-            output_features=output_features,
-            activation=activation,
-            n_layers=2,
+            in_features=input_features,
+            hidden_features=base_layer,
+            out_features=output_features,
+            act_layer=activation,
+            drop=0.0,
         )

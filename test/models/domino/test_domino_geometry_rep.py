@@ -24,7 +24,8 @@ from .utils import validate_output_shape_and_values
 
 @pytest.mark.parametrize("device", ["cuda:0"])
 @pytest.mark.parametrize("act", ["relu", "gelu"])
-def test_geo_conv_out(device, act):
+@pytest.mark.parametrize("fourier_features", [True, False])
+def test_geo_conv_out(device, act, fourier_features):
     """Test GeoConvOut layer"""
     from physicsnemo.models.domino.geometry_rep import GeoConvOut
 
@@ -39,6 +40,8 @@ def test_geo_conv_out(device, act):
         activation: str = act
 
     params = TestParams()
+    params.fourier_features = fourier_features
+
     grid_resolution = [32, 32, 32]
 
     layer = GeoConvOut(
