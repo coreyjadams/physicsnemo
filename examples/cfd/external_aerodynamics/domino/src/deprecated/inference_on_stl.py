@@ -372,8 +372,18 @@ class inferenceDataPipe:
         surf_sdf_grid = torch.reshape(surf_sdf_grid, (nx, ny, nz))
 
         if self.normalize_coordinates:
-            sdf_grid = 2.0 * (sdf_grid - torch.amax(grid)) / (torch.amax(grid) - torch.amin(grid)) - 1.0
-            surf_sdf_grid = 2.0 * (surf_sdf_grid - torch.amax(s_grid)) / (torch.amax(s_grid) - torch.amin(s_grid)) - 1.0
+            sdf_grid = (
+                2.0
+                * (sdf_grid - torch.amax(grid))
+                / (torch.amax(grid) - torch.amin(grid))
+                - 1.0
+            )
+            surf_sdf_grid = (
+                2.0
+                * (surf_sdf_grid - torch.amax(s_grid))
+                / (torch.amax(s_grid) - torch.amin(s_grid))
+                - 1.0
+            )
             grid = 2.0 * (grid - c_min) / (c_max - c_min) - 1.0
             s_grid = 2.0 * (s_grid - surf_min) / (surf_max - surf_min) - 1.0
 
@@ -645,8 +655,15 @@ class inferenceDataPipe:
         sdf_nodes = torch.unsqueeze(sdf_nodes, -1)
 
         if self.normalize_coordinates:
-            volume_coordinates = 2.0 * (volume_coordinates - c_min) / (c_max - c_min) - 1.0
-            sdf_nodes = 2.0 * (sdf_nodes - torch.amax(c_max)) / (torch.amax(c_max) - torch.amin(c_min)) - 1.0
+            volume_coordinates = (
+                2.0 * (volume_coordinates - c_min) / (c_max - c_min) - 1.0
+            )
+            sdf_nodes = (
+                2.0
+                * (sdf_nodes - torch.amax(c_max))
+                / (torch.amax(c_max) - torch.amin(c_min))
+                - 1.0
+            )
             sdf_node_closest_point = (
                 2.0 * (sdf_node_closest_point - c_min) / (c_max - c_min) - 1.0
             )
