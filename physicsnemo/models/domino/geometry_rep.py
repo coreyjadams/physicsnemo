@@ -53,6 +53,7 @@ class GeoConvOut(nn.Module):
     def __init__(
         self,
         input_features: int,
+        neighbors_in_radius: int,
         model_parameters,
         grid_resolution=None,
     ):
@@ -61,6 +62,7 @@ class GeoConvOut(nn.Module):
 
         Args:
             input_features: Number of input feature dimensions
+            neighbors_in_radius: Number of neighbors in radius
             model_parameters: Configuration parameters for the model
             grid_resolution: Resolution of the output grid [nx, ny, nz]
         """
@@ -72,9 +74,9 @@ class GeoConvOut(nn.Module):
         self.num_modes = model_parameters.num_modes
 
         if self.fourier_features:
-            input_features_calculated = input_features * (1 + 2 * self.num_modes)
+            input_features_calculated = input_features * (1 + 2 * self.num_modes) * neighbors_in_radius
         else:
-            input_features_calculated = input_features
+            input_features_calculated = input_features * neighbors_in_radius
 
         self.mlp = Mlp(
             in_features=input_features_calculated,
@@ -91,6 +93,8 @@ class GeoConvOut(nn.Module):
         self.grid_resolution = grid_resolution
 
         self.activation = get_activation(model_parameters.activation)
+
+        self.neighbors_in_radius = neighbors_in_radius
 
         if self.fourier_features:
             self.register_buffer(
@@ -123,13 +127,8 @@ class GeoConvOut(nn.Module):
             self.grid_resolution[2],
         )
         grid = grid.reshape(1, nx * ny * nz, 3, 1)
-        x_transposed = torch.transpose(x, 2, 3)
-        dist_weights = 1.0 / (1e-6 + (x_transposed - grid) ** 2.0)
-        dist_weights = torch.transpose(dist_weights, 2, 3)
 
-        # x = torch.sum(x * dist_weights, 2) / torch.sum(dist_weights, 2)
-        # x = torch.sum(x, 2)
-        mask = abs(x - 0) > 1e-6
+        x = rearrange(x, "b x y z -> b x (y z)", x=nx*ny*nz, y=self.neighbors_in_radius, z=3)
         if self.fourier_features:
             facets = torch.cat((x, fourier_encode(x, self.freqs)), axis=-1)
         else:
@@ -139,12 +138,8 @@ class GeoConvOut(nn.Module):
         # x = F.tanh(self.fc3(x))
         x = F.tanh(self.mlp(facets))
 
-        mask = mask[:, :, :, 0:1].expand(
-            mask.shape[0], mask.shape[1], mask.shape[2], x.shape[-1]
-        )
-
-        x = torch.sum(x * mask, 2)
         x = rearrange(x, "b (x y z) c -> b c x y z", x=nx, y=ny, z=nz)
+
         return x
 
 
@@ -336,11 +331,6 @@ class GeometryRep(nn.Module):
                             output_filters=geometry_rep.geo_conv.base_neurons_out,
                             model_parameters=geometry_rep.geo_processor,
                         ),
-                        GeoProcessor(
-                            input_filters=geometry_rep.geo_conv.base_neurons_in,
-                            output_filters=geometry_rep.geo_conv.base_neurons_out,
-                            model_parameters=geometry_rep.geo_processor,
-                        ),
                     )
                 )
             else:
@@ -348,10 +338,11 @@ class GeometryRep(nn.Module):
 
         self.geo_conv_out = nn.ModuleList()
         self.geo_processor_out = nn.ModuleList()
-        for _ in range(len(radii)):
+        for u in range(len(radii)):
             self.geo_conv_out.append(
                 GeoConvOut(
                     input_features=input_features,
+                    neighbors_in_radius=neighbors_in_radius[u],
                     model_parameters=geometry_rep.geo_conv,
                     grid_resolution=model_parameters.interp_res,
                 )
@@ -402,15 +393,11 @@ class GeometryRep(nn.Module):
                     output_filters=geometry_rep.geo_conv.base_neurons_out,
                     model_parameters=geometry_rep.geo_processor,
                 ),
-                GeoProcessor(
-                    input_filters=geometry_rep.geo_conv.base_neurons_out,
-                    output_filters=geometry_rep.geo_conv.base_neurons_out,
-                    model_parameters=geometry_rep.geo_processor,
-                ),
             )
         else:
             raise ValueError("Invalid prompt. Specify unet or conv ...")
         self.radii = radii
+        self.neighbors_in_radius = neighbors_in_radius
         self.hops = hops
 
         self.geo_processor_sdf_out = nn.Conv3d(
