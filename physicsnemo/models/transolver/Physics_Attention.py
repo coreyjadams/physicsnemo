@@ -38,6 +38,30 @@ import transformer_engine.pytorch as te  # noqa: F401
 from einops import rearrange
 
 
+def gumbel_softmax(logits: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
+    """
+    Implementation of Gumblel Softmax from transolver++.
+
+    Original code: https://github.com/thuml/Transolver_plus/blob/main/models/Transolver_plus.py#L69
+
+    Args:
+        logits (torch.Tensor): The logits to apply Gumblel Softmax to.
+        tau (float): The temperature parameter for the Gumblel Softmax.
+
+    Returns:
+        torch.Tensor: The Gumblel Softmax of the logits.
+    """
+    u = torch.rand_like(logits)
+    gumbel_noise = -torch.log(-torch.log(u + 1e-8) + 1e-8)
+
+    y = logits + gumbel_noise
+    y = y / tau
+
+    y = torch.nn.functional.softmax(y, dim=-1)
+
+    return y
+
+
 class PhysicsAttentionBase(nn.Module, ABC):
     """
     Base class for all physics attention modules.
@@ -55,18 +79,36 @@ class PhysicsAttentionBase(nn.Module, ABC):
 
     """
 
-    def __init__(self, dim, heads, dim_head, dropout, slice_num, use_te):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        dim_head: int,
+        dropout: float,
+        slice_num: int,
+        use_te: bool,
+        plus: bool,
+    ):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
         self.heads = heads
-
+        self.plus = plus
         self.scale = dim_head**-0.5
+        self.use_te = use_te
 
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
-        self.use_te = use_te
+
+        if plus:
+            linear_layer = te.Linear if self.use_te else nn.Linear
+            self.proj_temperature = torch.nn.Sequential(
+                linear_layer(self.dim_head, slice_num),
+                nn.GELU(),
+                linear_layer(slice_num, 1),
+                nn.GELU(),
+            )
 
         if self.use_te:
             self.in_project_slice = te.Linear(dim_head, slice_num)
@@ -131,12 +173,22 @@ class PhysicsAttentionBase(nn.Module, ABC):
 
         # Project the latent space vectors on to the weight computation space,
         # and compute a temperature adjusted softmax.
-        clamped_temp = torch.clamp(self.temperature, min=0.5, max=5).to(
-            slice_projections.dtype
-        )
-        slice_weights = nn.functional.softmax(
-            slice_projections / clamped_temp, dim=-1
-        )  # [Batch, N_heads, N_tokens, Slice_num]
+
+        if self.plus:
+            clamped_temp = torch.clamp(self.temperature, min=0.01).to(
+                slice_projections.dtype
+            )
+            slice_weights = gumbel_softmax(
+                slice_projections, clamped_temp
+            )  # [Batch, N_heads, N_tokens, Slice_num]
+
+        else:
+            clamped_temp = torch.clamp(self.temperature, min=0.5, max=5).to(
+                slice_projections.dtype
+            )
+            slice_weights = nn.functional.softmax(
+                slice_projections / clamped_temp, dim=-1
+            )  # [Batch, N_heads, N_tokens, Slice_num]
 
         # Cast to the computation type (since the parameter is probably fp32)
         slice_weights = slice_weights.to(slice_projections.dtype)
@@ -221,7 +273,13 @@ class PhysicsAttentionBase(nn.Module, ABC):
         """
 
         # Project the inputs onto learned spaces:
-        x_mid, fx_mid = self.project_input_onto_slices(x)
+        if self.plus:
+            x_mid = self.project_input_onto_slices(x)
+            # In transolver ++, fx_mid is gone.
+            # x_mid is used to compute the projections instead:
+            fx_mid = x_mid
+        else:
+            x_mid, fx_mid = self.project_input_onto_slices(x)
 
         # Perform the linear projection of learned latent space onto slices:
         slice_projections = self.in_project_slice(x_mid)
@@ -257,29 +315,46 @@ class PhysicsAttentionIrregularMesh(PhysicsAttentionBase):
     """
 
     def __init__(
-        self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64, use_te=True
+        self,
+        dim,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        slice_num: int = 64,
+        use_te: bool = True,
+        plus: bool = False,
     ):
-        super().__init__(dim, heads, dim_head, dropout, slice_num, use_te)
+        super().__init__(dim, heads, dim_head, dropout, slice_num, use_te, plus)
         inner_dim = dim_head * heads
         if use_te:
             self.in_project_x = te.Linear(dim, inner_dim)
-            self.in_project_fx = te.Linear(dim, inner_dim)
+            if not plus:
+                self.in_project_fx = te.Linear(dim, inner_dim)
         else:
             self.in_project_x = nn.Linear(dim, inner_dim)
-            self.in_project_fx = nn.Linear(dim, inner_dim)
+            if not plus:
+                self.in_project_fx = nn.Linear(dim, inner_dim)
 
-    def project_input_onto_slices(self, x) -> tuple[torch.Tensor, torch.Tensor]:
+    def project_input_onto_slices(
+        self, x
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Project the input onto the slice space.
         """
-        fx_mid = rearrange(
-            self.in_project_fx(x), "B N (h d) -> B h N d", h=self.heads, d=self.dim_head
-        )
         x_mid = rearrange(
             self.in_project_x(x), "B N (h d) -> B h N d", h=self.heads, d=self.dim_head
         )
+        if self.plus:
+            return x_mid
+        else:
+            fx_mid = rearrange(
+                self.in_project_fx(x),
+                "B N (h d) -> B h N d",
+                h=self.heads,
+                d=self.dim_head,
+            )
 
-        return x_mid, fx_mid
+            return x_mid, fx_mid
 
 
 class PhysicsAttentionStructuredMesh2D(PhysicsAttentionBase):
@@ -289,14 +364,15 @@ class PhysicsAttentionStructuredMesh2D(PhysicsAttentionBase):
 
     def __init__(
         self,
-        dim,
-        spatial_shape,
-        heads=8,
+        dim: int,
+        spatial_shape: tuple[int, int],
+        heads: int = 8,
         dim_head=64,
-        dropout=0.0,
-        slice_num=64,
-        kernel=3,
-        use_te=True,
+        dropout: float = 0.0,
+        slice_num: int = 64,
+        kernel: int = 3,
+        use_te: bool = True,
+        plus: bool = False,
     ):  # kernel=3):
         super().__init__(dim, heads, dim_head, dropout, slice_num, use_te)
 
@@ -307,30 +383,35 @@ class PhysicsAttentionStructuredMesh2D(PhysicsAttentionBase):
         self.in_project_x = nn.Conv2d(dim, inner_dim, kernel, 1, kernel // 2)
         self.in_project_fx = nn.Conv2d(dim, inner_dim, kernel, 1, kernel // 2)
 
-    def project_input_onto_slices(self, x) -> tuple[torch.Tensor, torch.Tensor]:
+    def project_input_onto_slices(
+        self, x
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Rearrange the input tokens back to an image shape:
         x = rearrange(x, "b (h w) c -> b c h w", h=self.H, w=self.W)
-
         # Apply the projections, here they are convolutions in 2D:
-        input_projected_fx = self.in_project_fx(x)
-        input_projected_x = self.in_project_x(x)
 
-        # Next, re-reshape the projections into token-like shapes:
-        input_projected_fx = rearrange(
-            input_projected_fx,
-            "b (n_heads head_dim) h w -> b n_heads (h w) head_dim",
-            head_dim=self.dim_head,
-            n_heads=self.heads,
-        )
+        input_projected_x = self.in_project_x(x)
         input_projected_x = rearrange(
             input_projected_x,
             "b (n_heads head_dim) h w -> b n_heads (h w) head_dim",
             head_dim=self.dim_head,
             n_heads=self.heads,
         )
+        if self.plus:
+            return input_projected_x
+        else:
+            input_projected_fx = self.in_project_fx(x)
 
-        # Return the projections:
-        return input_projected_x, input_projected_fx
+            # Next, re-reshape the projections into token-like shapes:
+            input_projected_fx = rearrange(
+                input_projected_fx,
+                "b (n_heads head_dim) h w -> b n_heads (h w) head_dim",
+                head_dim=self.dim_head,
+                n_heads=self.heads,
+            )
+
+            # Return the projections:
+            return input_projected_x, input_projected_fx
 
 
 class PhysicsAttentionStructuredMesh3D(PhysicsAttentionBase):
@@ -340,14 +421,15 @@ class PhysicsAttentionStructuredMesh3D(PhysicsAttentionBase):
 
     def __init__(
         self,
-        dim,
-        spatial_shape,
-        heads=8,
-        dim_head=64,
-        dropout=0.0,
-        slice_num=32,
-        kernel=3,
-        use_te=True,
+        dim: int,
+        spatial_shape: tuple[int, int, int],
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        slice_num: int = 32,
+        kernel: int = 3,
+        use_te: int = True,
+        plus: bool = False,
     ):
         super().__init__(dim, heads, dim_head, dropout, slice_num, use_te)
 
@@ -359,7 +441,9 @@ class PhysicsAttentionStructuredMesh3D(PhysicsAttentionBase):
         self.in_project_x = nn.Conv3d(dim, inner_dim, kernel, 1, kernel // 2)
         self.in_project_fx = nn.Conv3d(dim, inner_dim, kernel, 1, kernel // 2)
 
-    def project_input_onto_slices(self, x) -> tuple[torch.Tensor, torch.Tensor]:
+    def project_input_onto_slices(
+        self, x
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Project the input onto the slice space.
         """
@@ -367,21 +451,24 @@ class PhysicsAttentionStructuredMesh3D(PhysicsAttentionBase):
         x = rearrange(x, "b (h w) c -> b c h w", h=self.H, w=self.W)
 
         # Apply the projections, here they are convolutions:
-        input_projected_fx = self.in_project_fx(x)
         input_projected_x = self.in_project_x(x)
 
         # Next, re-reshape the projections into token-like shapes:
-        input_projected_fx = rearrange(
-            input_projected_fx,
-            "b (n_heads head_dim) h w -> b n_heads (h w) head_dim",
-            head_dim=self.dim_head,
-            n_heads=self.heads,
-        )
+
         input_projected_x = rearrange(
             input_projected_x,
             "b (n_heads head_dim) h w -> b n_heads (h w) head_dim",
             head_dim=self.dim_head,
             n_heads=self.heads,
         )
-
-        return input_projected_x, input_projected_fx
+        if self.plus:
+            return input_projected_x
+        else:
+            input_projected_fx = self.in_project_fx(x)
+            input_projected_fx = rearrange(
+                input_projected_fx,
+                "b (n_heads head_dim) h w -> b n_heads (h w) head_dim",
+                head_dim=self.dim_head,
+                n_heads=self.heads,
+            )
+            return input_projected_x, input_projected_fx
