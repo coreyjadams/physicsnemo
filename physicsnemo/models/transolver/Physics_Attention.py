@@ -175,7 +175,8 @@ class PhysicsAttentionBase(nn.Module, ABC):
         # and compute a temperature adjusted softmax.
 
         if self.plus:
-            clamped_temp = torch.clamp(self.temperature, min=0.01).to(
+            temperature = self.temperature + self.proj_temperature(fx)
+            clamped_temp = torch.clamp(temperature, min=0.01).to(
                 slice_projections.dtype
             )
             slice_weights = gumbel_softmax(
@@ -381,7 +382,8 @@ class PhysicsAttentionStructuredMesh2D(PhysicsAttentionBase):
         self.W = spatial_shape[1]
 
         self.in_project_x = nn.Conv2d(dim, inner_dim, kernel, 1, kernel // 2)
-        self.in_project_fx = nn.Conv2d(dim, inner_dim, kernel, 1, kernel // 2)
+        if not plus:
+            self.in_project_fx = nn.Conv2d(dim, inner_dim, kernel, 1, kernel // 2)
 
     def project_input_onto_slices(
         self, x
@@ -439,7 +441,8 @@ class PhysicsAttentionStructuredMesh3D(PhysicsAttentionBase):
         self.D = spatial_shape[2]
 
         self.in_project_x = nn.Conv3d(dim, inner_dim, kernel, 1, kernel // 2)
-        self.in_project_fx = nn.Conv3d(dim, inner_dim, kernel, 1, kernel // 2)
+        if not plus:
+            self.in_project_fx = nn.Conv3d(dim, inner_dim, kernel, 1, kernel // 2)
 
     def project_input_onto_slices(
         self, x
