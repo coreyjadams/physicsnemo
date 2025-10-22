@@ -16,3 +16,4 @@
 
 from .domino_datapipe import DoMINODataPipe
 from .mesh_datapipe import MeshDatapipe
+from .transolver_datapipe import TransolverDataPipe
