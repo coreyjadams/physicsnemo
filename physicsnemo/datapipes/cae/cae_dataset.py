@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import pathlib
 import time
 from abc import ABC, abstractmethod
@@ -86,6 +87,13 @@ class BackendReader(ABC):
     def read_file(self, filename: pathlib.Path) -> dict[str, torch.Tensor]:
         """
         Read a file and return a dictionary of tensors.
+        """
+        pass
+
+    @abstractmethod
+    def read_file_attributes(self, filename: pathlib.Path) -> dict[str, torch.Tensor]:
+        """
+        Read the attributes of a file and return a dictionary of tensors.
         """
         pass
 
@@ -255,14 +263,16 @@ class NpzFileReader(BackendReader):
 
         # Make sure to select the slice outside of the loop.
         if self.is_volumetric:
+            volume_key = next(key for key in in_data.keys() if "volume" in key)
+            volume_shape = in_data[volume_key].shape[0]
             if self.volume_sampling_size is not None:
                 volume_slice = self.select_random_sections_from_slice(
                     0,
-                    in_data["volume_mesh_centers"].shape[0],
+                    volume_shape,
                     self.volume_sampling_size,
                 )
             else:
-                volume_slice = slice(0, in_data["volume_mesh_centers"].shape[0])
+                volume_slice = slice(0, volume_shape)
 
         # This is a slower basic way to do this, to be improved:
         data = {}
@@ -302,34 +312,46 @@ class ZarrFileReader(BackendReader):
     ) -> None:
         super().__init__(keys_to_read, keys_to_read_if_available)
 
+    def read_file_attributes(self, filename: pathlib.Path) -> dict[str, torch.Tensor]:
+        """
+        Read the attributes of a file and return a dictionary of tensors.
+        """
+        group = zarr.open_group(filename, mode="r")
+        return group.attrs
+
     def read_file(self, filename: pathlib.Path) -> dict[str, torch.Tensor]:
         """
         Read a file and return a dictionary of tensors.
         """
         group = zarr.open_group(filename, mode="r")
 
-        missing_keys = set(self.keys_to_read) - set(group.keys())
-        data = {}
+        attributes = self.read_file_attributes(filename)
 
-        # Check if the missing keys are attributes:
-        for key in list(missing_keys):
-            if key in group.attrs:
-                missing_keys.remove(key)
-                data[key] = torch.tensor(group.attrs[key])
+        missing_keys = (
+            set(self.keys_to_read) - set(group.keys()) - set(attributes.keys())
+        )
+        data = {}
 
         if len(missing_keys) > 0:
             raise ValueError(f"Keys {missing_keys} not found in file {filename}")
 
+        # Read in attributes:
+        for key in self.keys_to_read:
+            if key in attributes.keys():
+                data[key] = torch.tensor(attributes[key])
+
         # Make sure to select the slice outside of the loop.
         if self.is_volumetric:
+            volume_key = next(key for key in group.keys() if "volume" in key)
+            volume_shape = group[volume_key].shape[0]
             if self.volume_sampling_size is not None:
                 volume_slice = self.select_random_sections_from_slice(
                     0,
-                    group["volume_mesh_centers"].shape[0],
+                    volume_shape,
                     self.volume_sampling_size,
                 )
             else:
-                volume_slice = slice(0, group["volume_mesh_centers"].shape[0])
+                volume_slice = slice(0, volume_shape)
 
         # This is a slower basic way to do this, to be improved:
         for key in self.keys_to_read:
@@ -357,14 +379,28 @@ class ZarrFileReader(BackendReader):
 
         group = zarr.open_group(filename, mode="r")
 
-        missing_keys = set(self.keys_to_read) - set(group.keys())
+        attributes = self.read_file_attributes(filename)
+
+        missing_keys = (
+            set(self.keys_to_read) - set(group.keys()) - set(attributes.keys())
+        )
 
         if len(missing_keys) > 0:
             raise ValueError(f"Keys {missing_keys} not found in file {filename}")
 
         data = {}
+
+        # Read in attributes:
+        for key in self.keys_to_read:
+            if key in attributes.keys():
+                data[key] = torch.tensor(attributes[key])
+
         specs = {}
         for key in self.keys_to_read:
+            # Skip attributes:
+            if key in data.keys():
+                continue
+
             # Open the array in zarr without reading it and get info:
             zarr_array = group[key]
             array_shape = zarr_array.shape
@@ -582,14 +618,49 @@ if TENSORSTORE_AVAILABLE:
                 }
             )
 
+        def read_file_attributes(
+            self, filename: pathlib.Path
+        ) -> dict[str, torch.Tensor]:
+            """
+            Read the attributes of a file and return a dictionary of tensors.
+            """
+            store_spec = self.spec_template["kvstore"].copy()
+            store_spec["path"] = str(filename)
+            store = ts.KvStore.open(store_spec).result()
+
+            keys = store.list().result()
+            # print(list(keys))
+            # Zarr 3 check:
+            if b"/zarr.json" in keys:
+                zarr_json = store.read(b"/zarr.json").result()
+                # load into json's parser:
+                attributes_dict = json.loads(zarr_json.value)["attributes"]
+                attributes = {k: torch.tensor(v) for k, v in attributes_dict.items()}
+                return attributes
+            elif b"/.zattrs" in keys:
+                # Zarr 2:
+                zarr_attrs = store.read(b"/.zattrs").result()
+                attributes_dict = json.loads(zarr_attrs.value)
+                attributes = {k: torch.tensor(v) for k, v in attributes_dict.items()}
+                return attributes
+            else:
+                return {}
+
         def read_file(self, filename: pathlib.Path) -> dict[str, torch.Tensor]:
             """
             Read a file and return a dictionary of tensors.
             """
 
+            print(f"Reading file: {filename}")
+
+            # We need to figure out, first, which keys are attributes.
+            attributes = self.read_file_attributes(filename)
+
+            local_keys_to_read = set(self.keys_to_read) - set(attributes.keys())
+
             # Trigger an async open of each data item:
             read_futures = {}
-            for key in self.keys_to_read:
+            for key in local_keys_to_read:
                 spec = self.spec_template.copy()
                 spec["kvstore"]["path"] = str(filename) + "/" + str(key)
 
@@ -603,23 +674,22 @@ if TENSORSTORE_AVAILABLE:
             }
 
             # Make sure to select the slice outside of the loop.
-            # We need
             if self.is_volumetric:
+                volume_key = next(key for key in read_futures.keys() if "volume" in key)
+                volume_shape = read_futures[volume_key].shape[0]
                 if self.volume_sampling_size is not None:
                     volume_slice = self.select_random_sections_from_slice(
                         0,
-                        read_futures["volume_mesh_centers"].shape[0],
+                        volume_shape,
                         self.volume_sampling_size,
                     )
                 else:
-                    volume_slice = slice(
-                        0, read_futures["volume_mesh_centers"].shape[0]
-                    )
+                    volume_slice = slice(0, volume_shape)
 
             # Trigger an async read of each data item:
             # (Each item will be a numpy ndarray after this:)
             tensor_futures = {}
-            for key in self.keys_to_read:
+            for key in local_keys_to_read:
                 if "volume" not in key:
                     tensor_futures[key] = read_futures[key].read()
                 # For the volume data, read the slice:
@@ -630,8 +700,11 @@ if TENSORSTORE_AVAILABLE:
             # (make sure to block for the result)
             data = {
                 key: torch.as_tensor(tensor_futures[key].result(), dtype=torch.float32)
-                for key in self.keys_to_read
+                for key in local_keys_to_read
             }
+
+            # Patch in the attributes:
+            data.update(attributes)
 
             return self.fill_optional_keys(data)
 
@@ -641,6 +714,10 @@ if TENSORSTORE_AVAILABLE:
             """
             Read a file and return a dictionary of tensors.
             """
+            # We need to figure out, first, which keys are attributes.
+            attributes = self.read_file_attributes(filename)
+
+            local_keys_to_read = set(self.keys_to_read) - set(attributes.keys())
 
             # We need the coordinates of this GPU:
             this_rank = device_mesh.get_local_rank()
@@ -648,7 +725,7 @@ if TENSORSTORE_AVAILABLE:
 
             # This pulls a list of store objects in tensorstore:
             stores = {}
-            for key in self.keys_to_read:
+            for key in local_keys_to_read:
                 spec = self.spec_template.copy()
                 spec["kvstore"]["path"] = str(filename) + "/" + str(key)
 
@@ -660,7 +737,7 @@ if TENSORSTORE_AVAILABLE:
 
             data = {}
             specs = {}
-            for key in self.keys_to_read:
+            for key in local_keys_to_read:
                 # Open the array in zarr without reading it and get info:
                 store = stores[key]
                 array_shape = store.shape
@@ -704,7 +781,7 @@ if TENSORSTORE_AVAILABLE:
                 specs[key] = (placement, chunk_sizes)
 
             # Finally, await the full data read:
-            for key in self.keys_to_read:
+            for key in local_keys_to_read:
                 data[key] = torch.as_tensor(data[key].result())
 
             # Patch in the optional keys:

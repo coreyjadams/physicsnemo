@@ -130,8 +130,9 @@ def main(cfg: DictConfig):
         start_time = time.time()
         # Training phase
         for i_batch, data in enumerate(train_dataloader):
+            print(f"Batch {i_batch} data: {data}")
             fields, coords = data
-            if i_batch > 10:
+            if i_batch > 5:
                 break
 
         end_time = time.time()
@@ -140,6 +141,7 @@ def main(cfg: DictConfig):
         start_time = time.time()
         # Validation phase
         for i_batch, data in enumerate(val_dataloader):
+            print(f"val Batch {i_batch} data: {data}")
             fields, coords = data
             if i_batch > 10:
                 break

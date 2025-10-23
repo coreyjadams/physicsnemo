@@ -306,8 +306,8 @@ class TransolverDataPipe(Dataset):
         # using the size of each mesh point as weight.
         center_of_mass = torch.mean(data_dict["stl_centers"], dim=0)
 
-        fields = data_dict["surface_fields"]
-        coords = data_dict["surface_mesh_centers"] - center_of_mass
+        fields = data_dict[field_key]
+        coords = data_dict[coords_key] - center_of_mass
 
         return fields, coords
 

@@ -17,6 +17,7 @@
 
 
 output_dir: "runs"
+checkpoint_dir: null  # Optional: set custom checkpoint path, defaults to output_dir
 run_id: "surface/float32"
 
 # Training configuration
@@ -73,7 +74,8 @@ data:
   val:
     data_path: /user_data/datasets/domino/val/
   max_workers: 8
-  preload_depth: 1
+  normalization_dir: "."  # Directory for normalization files
+  preload_depth: 0
   pin_memory: true
   resolution: 300_000
   mode: volume
