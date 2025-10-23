@@ -629,7 +629,7 @@ if TENSORSTORE_AVAILABLE:
             store = ts.KvStore.open(store_spec).result()
 
             keys = store.list().result()
-            # print(list(keys))
+
             # Zarr 3 check:
             if b"/zarr.json" in keys:
                 zarr_json = store.read(b"/zarr.json").result()
@@ -650,8 +650,6 @@ if TENSORSTORE_AVAILABLE:
             """
             Read a file and return a dictionary of tensors.
             """
-
-            print(f"Reading file: {filename}")
 
             # We need to figure out, first, which keys are attributes.
             attributes = self.read_file_attributes(filename)
