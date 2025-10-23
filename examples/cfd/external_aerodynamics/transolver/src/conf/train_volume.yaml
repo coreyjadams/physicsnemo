@@ -76,11 +76,10 @@ data:
   preload_depth: 1
   pin_memory: true
   resolution: 300_000
-  mode: surface
+  mode: volume
   data_keys:
-    - "surface_fields"
-    - "surface_mesh_centers"
-    - "surface_normals"
+    - "volume_fields"
+    - "volume_mesh_centers"
     - "air_density"
     - "stream_velocity"
     - "stl_faces"

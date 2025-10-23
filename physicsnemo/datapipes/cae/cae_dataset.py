@@ -309,6 +309,13 @@ class ZarrFileReader(BackendReader):
         group = zarr.open_group(filename, mode="r")
 
         missing_keys = set(self.keys_to_read) - set(group.keys())
+        data = {}
+
+        # Check if the missing keys are attributes:
+        for key in list(missing_keys):
+            if key in group.attrs:
+                missing_keys.remove(key)
+                data[key] = torch.tensor(group.attrs[key])
 
         if len(missing_keys) > 0:
             raise ValueError(f"Keys {missing_keys} not found in file {filename}")
@@ -325,8 +332,11 @@ class ZarrFileReader(BackendReader):
                 volume_slice = slice(0, group["volume_mesh_centers"].shape[0])
 
         # This is a slower basic way to do this, to be improved:
-        data = {}
         for key in self.keys_to_read:
+            # Don't read things that came from attributes, potentially;
+            if key in data.keys():
+                continue
+
             if "volume" not in key:
                 data[key] = torch.from_numpy(group[key][:])
             else:

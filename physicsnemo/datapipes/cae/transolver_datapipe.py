@@ -39,7 +39,6 @@ from physicsnemo.datapipes.cae.cae_dataset import (
 )
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.utils.domino.utils import (
-    calculate_center_of_mass,
     normalize,
     standardize,
     unnormalize,
@@ -92,7 +91,7 @@ class TransolverDataConfig:
     """
 
     data_path: Path | None
-
+    model_type: Literal["surface", "volume"] = "surface"
     resolution: int = 200_000
     # Apply some normalization to coordinate values of inputs,
     # and derived features
@@ -158,37 +157,18 @@ class TransolverDataPipe(Dataset):
     def __init__(
         self,
         input_path,
-        model_type: Literal["surface", "volume", "combined"],
+        model_type: Literal["surface", "volume"],
         pin_memory: bool = False,
         **data_config_overrides,
     ):
         # Perform config packaging and validation
-        # self.config = TransolverDataConfig(data_path=input_path, **data_config_overrides)
+        self.config = TransolverDataConfig(
+            data_path=input_path, model_type=model_type, **data_config_overrides
+        )
 
         # Set up the distributed manager:
         if not DistributedManager.is_initialized():
             DistributedManager.initialize()
-
-        # dist = DistributedManager()
-
-        # Ensure the volume and surface scaling factors are torch tensors
-        # and on the right device:
-        if self.config.volume_factors is not None:
-            if not isinstance(self.config.volume_factors, torch.Tensor):
-                self.config.volume_factors = torch.from_numpy(
-                    self.config.volume_factors
-                )
-            self.config.volume_factors = self.config.volume_factors.to(
-                self.preproc_device, dtype=torch.float32
-            )
-        if self.config.surface_factors is not None:
-            if not isinstance(self.config.surface_factors, torch.Tensor):
-                self.config.surface_factors = torch.from_numpy(
-                    self.config.surface_factors
-                )
-            self.config.surface_factors = self.config.surface_factors.to(
-                self.preproc_device, dtype=torch.float32
-            )
 
         self.dataset = None
 
@@ -268,13 +248,28 @@ class TransolverDataPipe(Dataset):
 
         # Validate that all required keys are present in data_dict
         required_keys = [
-            "global_params_values",
-            "global_params_reference",
-            "stl_coordinates",
-            "stl_faces",
             "stl_centers",
-            "stl_areas",
         ]
+
+        if self.config.model_type == "volume":
+            # We need these for the SDF calculation:
+            required_keys.extend(
+                [
+                    "stl_coordinates",
+                    "stl_faces",
+                ]
+            )
+
+        field_key = f"{self.config.model_type}_fields"
+        coords_key = f"{self.config.model_type}_mesh_centers"
+
+        required_keys.extend(
+            [
+                field_key,
+                coords_key,
+            ]
+        )
+
         missing_keys = [key for key in required_keys if key not in data_dict]
         if missing_keys:
             raise ValueError(
@@ -309,9 +304,7 @@ class TransolverDataPipe(Dataset):
 
         # This is a center of mass computation for the stl surface,
         # using the size of each mesh point as weight.
-        center_of_mass = calculate_center_of_mass(
-            data_dict["stl_centers"], data_dict["stl_areas"]
-        )
+        center_of_mass = torch.mean(data_dict["stl_centers"], dim=0)
 
         fields = data_dict["surface_fields"]
         coords = data_dict["surface_mesh_centers"] - center_of_mass
@@ -362,7 +355,7 @@ class TransolverDataPipe(Dataset):
         """
         self.dataset = dataset
 
-        if self.config.volume_sample_from_disk:
+        if self.config.sample_from_disk:
             # We deliberately double the data to read compared to the sampling size:
             self.dataset.set_volume_sampling_size(25 * self.config.volume_points_sample)
 
@@ -404,17 +397,13 @@ class TransolverDataPipe(Dataset):
             Dictionary containing the processed data as torch.Tensors.
 
         """
-        data_dict = self.process_data(data_dict)
-
-        # If the data is not on the target device, put it there:
-        for key, value in data_dict.items():
-            if value.device != self.output_device:
-                data_dict[key] = value.to(self.output_device)
+        fields, coords = self.process_data(data_dict)
 
         # Add a batch dimension to the data_dict
-        data_dict = {k: v.unsqueeze(0) for k, v in data_dict.items()}
+        fields = fields.unsqueeze(0)
+        coords = coords.unsqueeze(0)
 
-        return data_dict
+        return fields, coords
 
     def __iter__(self):
         if self.dataset is None:
@@ -429,23 +418,20 @@ class TransolverDataPipe(Dataset):
 def create_transolver_dataset(
     cfg: DictConfig,
     phase: Literal["train", "val", "test"],
-    keys_to_read: list[str],
-    keys_to_read_if_available: dict[str, torch.Tensor],
+    # keys_to_read: list[str],
+    # keys_to_read_if_available: dict[str, torch.Tensor],
     scaling_factors: list[float],
     # normalize_coordinates: bool = True,
     device_mesh: torch.distributed.DeviceMesh | None = None,
     placements: dict[str, torch.distributed.tensor.Placement] | None = None,
 ):
-    model_type = cfg.model.model_type
+    model_type = cfg.mode
     if phase == "train":
-        input_path = cfg.data.input_dir
-        dataloader_cfg = cfg.train.dataloader
+        input_path = cfg.train.data_path
     elif phase == "val":
-        input_path = cfg.data.input_dir_val
-        dataloader_cfg = cfg.val.dataloader
-    elif phase == "test":
-        input_path = cfg.eval.test_path
-        dataloader_cfg = None
+        input_path = cfg.val.data_path
+    # elif phase == "test":
+    # input_path = cfg.eval.test_path
     else:
         raise ValueError(f"Invalid phase {phase}")
 
@@ -458,6 +444,8 @@ def create_transolver_dataset(
     # The iteration function will loop over the dataset, preprocess the
     # output, and return it.
 
+    keys_to_read = cfg.data_keys
+
     overrides = {}
 
     dm = DistributedManager()
@@ -469,17 +457,20 @@ def create_transolver_dataset(
         device = torch.device("cpu")
         consumer_stream = None
 
-    if dataloader_cfg is not None:
-        preload_depth = dataloader_cfg.preload_depth
-        pin_memory = dataloader_cfg.pin_memory
+    if cfg.get("preload_depth", None) is not None:
+        preload_depth = cfg.preload_depth
     else:
         preload_depth = 1
+
+    if cfg.get("pin_memory", None) is not None:
+        pin_memory = cfg.pin_memory
+    else:
         pin_memory = False
 
     dataset = CAEDataset(
         data_dir=input_path,
         keys_to_read=keys_to_read,
-        keys_to_read_if_available=keys_to_read_if_available,
+        keys_to_read_if_available={},
         output_device=device,
         preload_depth=preload_depth,
         pin_memory=pin_memory,
@@ -490,7 +481,7 @@ def create_transolver_dataset(
 
     datapipe = TransolverDataPipe(
         input_path,
-        resolution=cfg.data.resolution,
+        resolution=cfg.resolution,
         normalization_factors=scaling_factors,
         model_type=model_type,
         scaling_type="mean_std_scaling",
