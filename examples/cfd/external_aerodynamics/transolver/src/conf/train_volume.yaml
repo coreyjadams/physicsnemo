@@ -31,8 +31,8 @@ training:
 model:
   _target_: physicsnemo.models.transolver.Transolver
   functional_dim: 2 # Input feature dimension
-  out_dim: 4        # Output feature dimension
-  embedding_dim: 6  # Spatial embedding dimension
+  out_dim: 5        # Output feature dimension
+  embedding_dim: 7  # Spatial embedding dimension
   n_layers: 8       # Number of transformer layers
   n_hidden: 256     # Hidden dimension
   dropout: 0.0      # Dropout rate
@@ -70,14 +70,19 @@ optimizer:
 # Data configuration
 data:
   train:
-    data_path: /user_data/datasets/domino/train/
+    data_path: /group_data/datasets/drivaer_aws/domino/train/
   val:
-    data_path: /user_data/datasets/domino/val/
+    data_path: /group_data/datasets/drivaer_aws/domino/val/
   max_workers: 8
-  normalization_dir: "."  # Directory for normalization files
-  preload_depth: 0
+  normalization_dir: "src/"  # Directory for normalization files
+  preload_depth: 1
+  volume_sample_from_disk: False # Enable faster IO on pre-shuffled volumetric data
   pin_memory: true
-  resolution: 300_000
+  resolution: 200_000
+  # Preprocessing switches:
+  # (Changing thes will change the embedding dim)
+  include_normals: true
+  include_sdf: true
   mode: volume
   data_keys:
     - "volume_fields"

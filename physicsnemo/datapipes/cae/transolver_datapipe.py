@@ -44,8 +44,7 @@ from physicsnemo.utils.domino.utils import (
     unnormalize,
     unstandardize,
 )
-
-# from physicsnemo.utils.sdf import signed_distance_field
+from physicsnemo.utils.sdf import signed_distance_field
 
 
 @dataclass
@@ -106,21 +105,21 @@ class TransolverDataConfig:
     scaling_type: Optional[Literal["min_max_scaling", "mean_std_scaling"]] = None
     normalization_factors: Optional[torch.Tensor] = None
 
-    # Add these invariances?
-    rotational_invariance: bool = True
-    reference_direction: torch.Tensor = torch.tensor([1.0, 0.0, 0.0])
+    # # Add these invariances?
+    # rotational_invariance: bool = True
+    # reference_direction: torch.Tensor = torch.tensor([1.0, 0.0, 0.0])
 
     translational_invariance: bool = True
     # If none, uses the center of mass:
     reference_origin: torch.Tensor | None = None
 
-    scale_invariance: bool = True
-    # Scale factor is aligned with the preferred direction!
-    reference_scale_factor: torch.Tensor = torch.tensor([1.0, 1.0, 1.0])
+    # scale_invariance: bool = True
+    # # Scale factor is aligned with the preferred direction!
+    # reference_scale_factor: torch.Tensor = torch.tensor([1.0, 1.0, 1.0])
 
     broadcast_global_features: bool = True
 
-    sample_from_disk: bool = False
+    volume_sample_from_disk: bool = True
 
     def __post_init__(self):
         if self.data_path is not None:
@@ -200,6 +199,138 @@ class TransolverDataPipe(Dataset):
 
     #     return geom_centers
 
+    def preprocess_surface_data(self, data_dict):
+        positions = data_dict["surface_mesh_centers"]
+
+        if self.config.resolution is not None:
+            idx = torch.multinomial(
+                torch.ones(data_dict["surface_mesh_centers"].shape[0]),
+                self.config.resolution,
+            )
+        else:
+            idx = None
+
+        if idx is not None:
+            positions = positions[idx]
+
+        # This is a center of mass computation for the stl surface,
+        # using the size of each mesh point as weight.
+        if self.config.translational_invariance:
+            if self.config.reference_origin is not None:
+                center_of_mass = self.config.reference_origin
+            else:
+                center_of_mass = torch.mean(data_dict["stl_centers"], dim=0)
+
+            positions -= center_of_mass
+
+        # Build the embeddings:
+        embeddings_inputs = [positions]
+
+        if self.config.include_sdf:
+            sdf = torch.zeros_like(positions[:, 0:1])
+            embeddings_inputs.append(sdf)
+
+        if self.config.include_normals:
+            normals = data_dict["surface_normals"]
+            if idx is not None:
+                normals = normals[idx]
+            normals = normals / torch.norm(normals, dim=-1, keepdim=True)
+            embeddings_inputs.append(normals)
+
+        embeddings = torch.cat(embeddings_inputs, dim=-1)
+
+        # Build fx:
+        fx_inputs = [
+            data_dict["air_density"],
+            data_dict["stream_velocity"],
+        ]
+        fx = torch.stack(fx_inputs, dim=-1)
+
+        if self.config.broadcast_global_features:
+            fx = fx.broadcast_to(embeddings.shape[0], -1)
+
+        fields = data_dict["surface_fields"]
+        if idx is not None:
+            fields = fields[idx]
+
+        if self.config.scaling_type is not None:
+            fields = self.scale_model_targets(fields, self.config.normalization_factors)
+
+        return {
+            "embeddings": embeddings,
+            "fx": fx,
+            "fields": fields,
+        }
+
+    def preprocess_volume_data(self, data_dict):
+        positions = data_dict["volume_mesh_centers"]
+
+        if self.config.resolution is not None:
+            idx = torch.multinomial(
+                torch.ones(positions.shape[0]), self.config.resolution
+            )
+        else:
+            idx = None
+
+        if idx is not None:
+            positions = positions[idx]
+
+        # This is a center of mass computation for the stl surface,
+        # using the size of each mesh point as weight.
+        if self.config.translational_invariance:
+            if self.config.reference_origin is not None:
+                center_of_mass = self.config.reference_origin
+            else:
+                center_of_mass = torch.mean(data_dict["stl_centers"], dim=0)
+
+            positions -= center_of_mass
+
+        # Build the embeddings:
+        embeddings_inputs = [positions]
+
+        if self.config.include_sdf:
+            sdf, closest_points = signed_distance_field(
+                data_dict["stl_coordinates"],
+                data_dict["stl_faces"].flatten().to(torch.int32),
+                positions,
+            )
+            embeddings_inputs.append(sdf.reshape(-1, 1))
+        else:
+            closest_points = center_of_mass
+
+        if self.config.include_normals:
+            normals = positions - closest_points
+
+            # Be sure to normalize:
+            normals = normals / torch.norm(normals, dim=-1, keepdim=True)
+
+            embeddings_inputs.append(normals)
+
+        embeddings = torch.cat(embeddings_inputs, dim=-1)
+
+        # Build fx:
+        fx_inputs = [
+            data_dict["air_density"],
+            data_dict["stream_velocity"],
+        ]
+        fx = torch.stack(fx_inputs, dim=-1)
+
+        if self.config.broadcast_global_features:
+            fx = fx.broadcast_to(embeddings.shape[0], -1)
+
+        fields = data_dict["volume_fields"]
+        if idx is not None:
+            fields = fields[idx]
+
+        if self.config.scaling_type is not None:
+            fields = self.scale_model_targets(fields, self.config.normalization_factors)
+
+        return {
+            "embeddings": embeddings,
+            "fx": fx,
+            "fields": fields,
+        }
+
     @torch.no_grad()
     def process_data(self, data_dict):
         """
@@ -259,6 +390,12 @@ class TransolverDataPipe(Dataset):
                     "stl_faces",
                 ]
             )
+        elif self.config.model_type == "surface":
+            required_keys.extend(
+                [
+                    "surface_normals",
+                ]
+            )
 
         field_key = f"{self.config.model_type}_fields"
         coords_key = f"{self.config.model_type}_mesh_centers"
@@ -277,11 +414,10 @@ class TransolverDataPipe(Dataset):
                 f"Required keys are: {required_keys}"
             )
 
-        # # Start building the preprocessed return dict:
-        # return_dict = {
-        #     "global_params_values": data_dict["global_params_values"],
-        #     "global_params_reference": data_dict["global_params_reference"],
-        # }
+        if self.config.model_type == "surface":
+            outputs = self.preprocess_surface_data(data_dict)
+        elif self.config.model_type == "volume":
+            outputs = self.preprocess_volume_data(data_dict)
 
         ########################################################################
         # Process the core STL information
@@ -302,14 +438,7 @@ class TransolverDataPipe(Dataset):
         # For SDF calculations, make sure the mesh_indices_flattened is an integer array:
         # mesh_indices_flattened = data_dict["stl_faces"].to(torch.int32)
 
-        # This is a center of mass computation for the stl surface,
-        # using the size of each mesh point as weight.
-        center_of_mass = torch.mean(data_dict["stl_centers"], dim=0)
-
-        fields = data_dict[field_key]
-        coords = data_dict[coords_key] - center_of_mass
-
-        return fields, coords
+        return outputs
 
     def scale_model_targets(
         self, fields: torch.Tensor, factors: torch.Tensor
@@ -318,12 +447,12 @@ class TransolverDataPipe(Dataset):
         Scale the model targets based on the configured scaling factors.
         """
         if self.config.scaling_type == "mean_std_scaling":
-            field_mean = factors[0]
-            field_std = factors[1]
+            field_mean = factors["mean"]
+            field_std = factors["std"]
             return standardize(fields, field_mean, field_std)
         elif self.config.scaling_type == "min_max_scaling":
-            field_min = factors[1]
-            field_max = factors[0]
+            field_min = factors["min"]
+            field_max = factors["max"]
             return normalize(fields, field_max, field_min)
 
     def unscale_model_outputs(
@@ -355,9 +484,9 @@ class TransolverDataPipe(Dataset):
         """
         self.dataset = dataset
 
-        if self.config.sample_from_disk:
+        if self.config.volume_sample_from_disk:
             # We deliberately double the data to read compared to the sampling size:
-            self.dataset.set_volume_sampling_size(25 * self.config.volume_points_sample)
+            self.dataset.set_volume_sampling_size(25 * self.config.resolution)
 
     def __len__(self):
         if self.dataset is not None:
@@ -397,13 +526,12 @@ class TransolverDataPipe(Dataset):
             Dictionary containing the processed data as torch.Tensors.
 
         """
-        fields, coords = self.process_data(data_dict)
+        outputs = self.process_data(data_dict)
 
-        # Add a batch dimension to the data_dict
-        fields = fields.unsqueeze(0)
-        coords = coords.unsqueeze(0)
+        for key in outputs.keys():
+            outputs[key] = outputs[key].unsqueeze(0)
 
-        return fields, coords
+        return outputs
 
     def __iter__(self):
         if self.dataset is None:
@@ -466,6 +594,15 @@ def create_transolver_dataset(
         pin_memory = cfg.pin_memory
     else:
         pin_memory = False
+
+    if cfg.get("include_normals", None) is not None:
+        overrides["include_normals"] = cfg.include_normals
+
+    if cfg.get("include_sdf", None) is not None:
+        overrides["include_sdf"] = cfg.include_sdf
+
+    if cfg.get("volume_sample_from_disk", None) is not None:
+        overrides["volume_sample_from_disk"] = cfg.volume_sample_from_disk
 
     dataset = CAEDataset(
         data_dir=input_path,

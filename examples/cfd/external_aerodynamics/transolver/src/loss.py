@@ -42,13 +42,45 @@ def loss_fn(
 
 
 def loss_fn_volume(
-    pred: torch.Tensor, target: torch.Tensor, mode: Literal["mse", "rmse"]
+    output: torch.Tensor, target: torch.Tensor, loss_type: Literal["mse", "rmse"]
 ) -> torch.Tensor:
-    """
-    Compute the main loss function for the model.
-    """
+    """Calculate loss for surface data by handling scalar and vector components separately.
 
-    raise NotImplementedError("Volumetric loss not yet implemented.")
+    Args:
+        output: Predicted surface values from the model.
+        target: Ground truth surface values.
+        loss_type: Type of loss to calculate ("mse" or "rmse").
+
+    Returns:
+        Combined scalar and vector loss as a scalar tensor.
+    """
+    # Separate the scalar and vector components:
+    output_pressure, output_vel, output_nut = torch.split(output, [1, 3, 1], dim=2)
+    target_pressure, target_vel, target_nut = torch.split(target, [1, 3, 1], dim=2)
+
+    numerator_pressure = torch.mean((output_pressure - target_pressure) ** 2.0)
+    numerator_vel = torch.mean((target_vel - output_vel) ** 2.0, (0, 1))
+    numerator_nut = torch.mean((target_nut - output_nut) ** 2.0)
+
+    eps = 1e-8
+    if loss_type == "mse":
+        loss_pressure = numerator_pressure
+        loss_wall_vel = torch.sum(numerator_vel)
+        loss_nut = numerator_nut
+    else:
+        denom = torch.mean((target_pressure) ** 2.0) + eps
+        loss_pressure = numerator_pressure / denom
+
+        # Compute the mean diff**2 of the vector component, leave the last dimension:
+        denom_vel = torch.mean((target_vel) ** 2.0, (0, 1)) + eps
+        loss_wall_vel = torch.sum(numerator_vel / denom_vel)
+
+        denom_nut = torch.mean((target_nut) ** 2.0) + eps
+        loss_nut = numerator_nut / denom_nut
+
+    loss = loss_pressure + loss_wall_vel + loss_nut
+
+    return loss / 5.0
 
 
 def loss_fn_surface(

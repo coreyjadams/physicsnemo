@@ -43,7 +43,7 @@ model:
   unified_pos: false # Whether to use unified positional embeddings
   ref: 8            # Reference dimension for unified pos
   structured_shape: null
-  use_te: true     # Use transformer engine
+  use_te: False     # Use transformer engine
   time_input: false # Whether to use time embeddings
 
 scheduler:
@@ -70,15 +70,20 @@ optimizer:
 # Data configuration
 data:
   train:
-    data_path: /user_data/datasets/domino/train/
+    data_path: /group_data/datasets/drivaer_aws/domino/train/
   val:
-    data_path: /user_data/datasets/domino/val/
+    data_path: /group_data/datasets/drivaer_aws/domino/val/
   max_workers: 8
-  normalization_dir: "."  # Directory for normalization files
+  normalization_dir: "src/"  # Directory for normalization files
   preload_depth: 1
   pin_memory: true
   resolution: 300_000
   mode: surface
+  # Preprocessing switches:
+  # (Changing thes will change the embedding dim)
+  include_normals: true
+  include_sdf: false
+
   data_keys:
     - "surface_fields"
     - "surface_mesh_centers"

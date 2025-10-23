@@ -34,7 +34,9 @@ from physicsnemo.distributed import DistributedManager
 
 from physicsnemo.utils.profiling import profile, Profiler
 
-from datapipe import DomainParallelZarrDataset
+from physicsnemo.datapipes.cae.transolver_datapipe import (
+    create_transolver_dataset,
+)
 from loss import loss_fn
 from metrics import metrics_fn
 from preprocess import (
@@ -148,21 +150,9 @@ def forward_pass(
     Run the forward pass of the model for one batch, including metrics and loss calculation.
     """
 
-    if cfg.data.mode == "surface":
-        features, embeddings, targets, others = preprocess_surface_data(
-            batch, norm_factors
-        )
-        features, embeddings, targets = downsample_surface(
-            features, embeddings, targets, cfg.data.resolution
-        )
-
-    elif cfg.data.mode == "volume":
-        # This is a feature to implement in the future.
-        pass
-    else:
-        raise ValueError(f"Unknown data mode: {cfg.data.mode}")
-
-    # del batch
+    features = batch["fx"]
+    embeddings = batch["embeddings"]
+    targets = batch["fields"]
 
     # Cast precisions:
     features, embeddings = cast_precisions(features, embeddings, precision)
@@ -177,9 +167,7 @@ def forward_pass(
 
         loss = loss_fn(outputs, targets, cfg.data.mode)
 
-    metrics = metrics_fn(
-        outputs, targets, others, dist_manager, cfg.data.mode, norm_factors
-    )
+    metrics = metrics_fn(outputs, targets, dist_manager, cfg.data.mode)
 
     return loss, metrics
 
@@ -231,10 +219,6 @@ def train_epoch(
     with Profiler():
         for i, batch_idx in enumerate(epoch_indices):
             batch = dataloader[batch_idx]
-
-            # preload the next batch, if we're not on the last batch
-            if i < epoch_len - 1 and sampler is not None:
-                dataloader.preload(epoch_indices[i + 1])
 
             loss, metrics = forward_pass(
                 batch,
@@ -355,10 +339,6 @@ def val_epoch(
         for i, batch_idx in enumerate(epoch_indices):
             # Get data from batch
             batch = dataloader[batch_idx]
-
-            # preload the next batch, if we're not on the last batch
-            if i < epoch_len - 1 and sampler is not None:
-                dataloader.preload(epoch_indices[i + 1])
 
             loss, metrics = forward_pass(
                 batch,
@@ -509,24 +489,32 @@ def main(cfg: DictConfig):
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Number of parameters: {num_params}")
 
-    # Training dataset
+    # Load the normalization file from configured directory (defaults to current dir)
+    norm_dir = getattr(cfg.data, "normalization_dir", ".")
+    if cfg.data.mode == "surface":
+        norm_file = str(Path(norm_dir) / "surface_fields_normalization.npz")
+    elif cfg.data.mode == "volume":
+        norm_file = str(Path(norm_dir) / "volume_fields_normalization.npz")
 
-    train_dataset = DomainParallelZarrDataset(
-        data_path=cfg.data.train.data_path,
-        max_workers=cfg.data.max_workers,
-        pin_memory=cfg.data.pin_memory,
-        keys_to_read=cfg.data.data_keys,
-        large_keys=cfg.data.large_keys,
+    norm_data = np.load(norm_file)
+    norm_factors = {
+        "mean": torch.from_numpy(norm_data["mean"]).to(dist_manager.device),
+        "std": torch.from_numpy(norm_data["std"]).to(dist_manager.device),
+    }
+
+    # Training dataset
+    train_dataloader = create_transolver_dataset(
+        cfg.data,
+        phase="train",
+        scaling_factors=norm_factors,
     )
 
     # Validation dataset
 
-    val_dataset = DomainParallelZarrDataset(
-        data_path=cfg.data.val.data_path,  # Assuming validation data path is configured
-        max_workers=cfg.data.max_workers,
-        pin_memory=cfg.data.pin_memory,
-        keys_to_read=cfg.data.data_keys,
-        large_keys=cfg.data.large_keys,
+    val_dataloader = create_transolver_dataset(
+        cfg.data,
+        phase="val",
+        scaling_factors=norm_factors,
     )
 
     num_replicas = dist_manager.world_size
@@ -534,7 +522,7 @@ def main(cfg: DictConfig):
 
     # Set up distributed samplers
     train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset,
+        train_dataloader,
         num_replicas=num_replicas,
         rank=data_rank,
         shuffle=True,
@@ -542,25 +530,12 @@ def main(cfg: DictConfig):
     )
 
     val_sampler = torch.utils.data.distributed.DistributedSampler(
-        val_dataset,
+        val_dataloader,
         num_replicas=num_replicas,
         rank=data_rank,
         shuffle=False,  # No shuffling for validation
         drop_last=True,
     )
-
-    # Load the normalization file from configured directory (defaults to current dir)
-    norm_dir = getattr(cfg.data, "normalization_dir", ".")
-    if cfg.data.mode == "surface":
-        norm_file = str(Path(norm_dir) / "surface_fields_normalization.npz")
-    elif cfg.data.mode == "volume":
-        raise Exception("Volume training not yet supported.")
-
-    norm_data = np.load(norm_file)
-    norm_factors = {
-        "mean": torch.from_numpy(norm_data["mean"]).to(dist_manager.device),
-        "std": torch.from_numpy(norm_data["std"]).to(dist_manager.device),
-    }
 
     # Set up optimizer and scheduler
     optimizer = hydra.utils.instantiate(cfg.optimizer, params=model.parameters())
@@ -606,11 +581,13 @@ def main(cfg: DictConfig):
         # Set the epoch in the samplers
         train_sampler.set_epoch(epoch)
         val_sampler.set_epoch(epoch)
+        train_dataloader.dataset.set_indices(list(train_sampler))
+        val_dataloader.dataset.set_indices(list(val_sampler))
 
         start_time = time.time()
         # Training phase
         train_loss = train_epoch(
-            train_dataset,
+            train_dataloader,
             train_sampler,
             model,
             output_pad_size,
@@ -630,7 +607,7 @@ def main(cfg: DictConfig):
         start_time = time.time()
         # Validation phase
         val_loss = val_epoch(
-            val_dataset,
+            val_dataloader,
             val_sampler,
             model,
             output_pad_size,

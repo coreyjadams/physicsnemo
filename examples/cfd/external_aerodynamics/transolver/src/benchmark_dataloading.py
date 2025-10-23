@@ -19,6 +19,8 @@ This is a standalone script for benchmarking and testing the Transolver
 datapipe in surface or volume mode.
 """
 
+from pathlib import Path
+
 import time
 import os
 import re
@@ -41,13 +43,8 @@ from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
 
 from physicsnemo.datapipes.cae.transolver_datapipe import (
-    TransolverDataPipe,
     create_transolver_dataset,
 )
-
-
-# This is included for GPU memory tracking:
-from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
 
 
 from physicsnemo.utils.profiling import profile, Profiler
@@ -72,10 +69,11 @@ def main(cfg: DictConfig):
     logger.info(f"Config:\n{OmegaConf.to_yaml(cfg, resolve=True)}")
 
     # Load the normalization file:
+    norm_dir = getattr(cfg.data, "normalization_dir", ".")
     if cfg.data.mode == "surface":
-        norm_file = "surface_fields_normalization.npz"
+        norm_file = str(Path(norm_dir) / "surface_fields_normalization.npz")
     elif cfg.data.mode == "volume":
-        norm_file = "volume_fields_normalization.npz"
+        norm_file = str(Path(norm_dir) / "volume_fields_normalization.npz")
 
     norm_data = np.load(norm_file)
     norm_factors = {
@@ -120,7 +118,7 @@ def main(cfg: DictConfig):
 
     # Training loop
     logger.info("Starting IO benchmark...")
-    for epoch in range(2):
+    for epoch in range(1):
         # Set the epoch in the samplers
         train_sampler.set_epoch(epoch)
         val_sampler.set_epoch(epoch)
@@ -129,22 +127,20 @@ def main(cfg: DictConfig):
 
         start_time = time.time()
         # Training phase
+        start = time.time()
         for i_batch, data in enumerate(train_dataloader):
-            print(f"Batch {i_batch} data: {data}")
-            fields, coords = data
-            if i_batch > 5:
-                break
+            print(f"Train {i_batch} elapsed time: {time.time() - start}")
+            start = time.time()
 
         end_time = time.time()
         train_duration = end_time - start_time
 
         start_time = time.time()
         # Validation phase
+        start = time.time()
         for i_batch, data in enumerate(val_dataloader):
-            print(f"val Batch {i_batch} data: {data}")
-            fields, coords = data
-            if i_batch > 10:
-                break
+            print(f"Val {i_batch} elapsed time: {time.time() - start}")
+            start = time.time()
 
         end_time = time.time()
         val_duration = end_time - start_time

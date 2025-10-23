@@ -359,10 +359,13 @@ class ZarrFileReader(BackendReader):
             if key in data.keys():
                 continue
 
-            if "volume" not in key:
-                data[key] = torch.from_numpy(group[key][:])
+            if group[key].shape == ():
+                data[key] = torch.from_numpy(np.array(group[key])).to(torch.float32)
             else:
-                data[key] = torch.from_numpy(group[key][volume_slice])
+                if "volume" not in key:
+                    data[key] = torch.from_numpy(group[key][:])
+                else:
+                    data[key] = torch.from_numpy(group[key][volume_slice])
 
         return self.fill_optional_keys(data)
 
