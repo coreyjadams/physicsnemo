@@ -76,7 +76,7 @@ data:
   max_workers: 8
   normalization_dir: "src/"  # Directory for normalization files
   preload_depth: 1
-  volume_sample_from_disk: False # Enable faster IO on pre-shuffled volumetric data
+  volume_sample_from_disk: true # Enable faster IO on pre-shuffled volumetric data
   pin_memory: true
   resolution: 200_000
   # Preprocessing switches:

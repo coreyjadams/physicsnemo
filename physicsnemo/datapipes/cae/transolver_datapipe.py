@@ -94,7 +94,6 @@ class TransolverDataConfig:
     resolution: int = 200_000
     # Apply some normalization to coordinate values of inputs,
     # and derived features
-    # normalize_coordinates: bool = False
     # geom_points_sample: int = 300000
 
     # Control what features are added to the inputs to the model:
@@ -109,7 +108,7 @@ class TransolverDataConfig:
     # rotational_invariance: bool = True
     # reference_direction: torch.Tensor = torch.tensor([1.0, 0.0, 0.0])
 
-    translational_invariance: bool = True
+    translational_invariance: bool = False
     # If none, uses the center of mass:
     reference_origin: torch.Tensor | None = None
 
@@ -277,23 +276,32 @@ class TransolverDataPipe(Dataset):
 
         # This is a center of mass computation for the stl surface,
         # using the size of each mesh point as weight.
-        if self.config.translational_invariance:
-            if self.config.reference_origin is not None:
-                center_of_mass = self.config.reference_origin
-            else:
-                center_of_mass = torch.mean(data_dict["stl_centers"], dim=0)
+        # We always compute the CoM, but don't always apply it.
+        if self.config.reference_origin is not None:
+            center_of_mass = self.config.reference_origin
+        else:
+            center_of_mass = torch.mean(data_dict["stl_centers"], dim=0)
 
+        center_of_mass = center_of_mass.unsqueeze(0)  # (1, 3)
+
+        if self.config.translational_invariance:
             positions -= center_of_mass
 
         # Build the embeddings:
         embeddings_inputs = [positions]
 
         if self.config.include_sdf:
+            coords = data_dict["stl_coordinates"]
+            if self.config.translational_invariance:
+                coords = coords - center_of_mass
+
             sdf, closest_points = signed_distance_field(
-                data_dict["stl_coordinates"],
+                coords,
                 data_dict["stl_faces"].flatten().to(torch.int32),
                 positions,
+                use_sign_winding_number=True,
             )
+
             embeddings_inputs.append(sdf.reshape(-1, 1))
         else:
             closest_points = center_of_mass
@@ -302,7 +310,18 @@ class TransolverDataPipe(Dataset):
             normals = positions - closest_points
 
             # Be sure to normalize:
-            normals = normals / torch.norm(normals, dim=-1, keepdim=True)
+
+            # Sometimes, if the points are very close or on the mesh, the
+            # sdf is 0.0, and the norm goes to 0.0
+
+            distance_to_closest_point = torch.norm(positions - closest_points, dim=-1)
+            null_points = distance_to_closest_point < 1e-6
+
+            # In these cases, we update the vector to be from the center of mass
+            normals[null_points] = positions[null_points] - center_of_mass
+
+            norm = torch.norm(normals, dim=-1, keepdim=True) + 1e-6
+            normals = normals / norm
 
             embeddings_inputs.append(normals)
 
