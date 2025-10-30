@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -176,7 +176,6 @@ def test_sharded_radius_search_layer_forward(
 
     # Create the model:
     model = BQWarp(
-        grid_resolution=[nx, ny, nz],
         radius=1.0,
         neighbors_in_radius=num_neigh,
     ).to(device)
