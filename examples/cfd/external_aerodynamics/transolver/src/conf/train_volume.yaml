@@ -18,14 +18,14 @@
 
 output_dir: "runs"
 checkpoint_dir: null  # Optional: set custom checkpoint path, defaults to output_dir
-run_id: "surface/float32"
+run_id: "volume/bfloat16"
 
 # Training configuration
 training:
-  precision: float32 # float32, float16, bfloat16, or float8
+  precision: bfloat16 # float32, float16, bfloat16, or float8
   num_epochs: 251 # Add one to save at 250
   save_interval: 25  # Save checkpoint every N epochs
-  compile: false
+  compile: true
 
 # Model configuration
 model:
@@ -39,11 +39,11 @@ model:
   n_head: 8         # Number of attention heads
   act: "gelu"       # Activation function
   mlp_ratio: 4      # MLP ratio in attention blocks
-  slice_num: 128     # Number of slices in physics attention
+  slice_num: 256     # Number of slices in physics attention
   unified_pos: false # Whether to use unified positional embeddings
   ref: 8            # Reference dimension for unified pos
   structured_shape: null
-  use_te: true     # Use transformer engine
+  use_te: false     # Use transformer engine
   time_input: false # Whether to use time embeddings
 
 scheduler:
@@ -70,15 +70,15 @@ optimizer:
 # Data configuration
 data:
   train:
-    data_path: /group_data/datasets/drivaer_aws/domino/train/
+    data_path: /group_data/drivaer_aws/domino/train/
   val:
-    data_path: /group_data/datasets/drivaer_aws/domino/val/
+    data_path: /group_data/drivaer_aws/domino/val/
   max_workers: 8
   normalization_dir: "src/"  # Directory for normalization files
   preload_depth: 1
   volume_sample_from_disk: true # Enable faster IO on pre-shuffled volumetric data
   pin_memory: true
-  resolution: 200_000
+  resolution: 650_000
   # Preprocessing switches:
   # (Changing thes will change the embedding dim)
   include_normals: true

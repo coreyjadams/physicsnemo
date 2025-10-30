@@ -17,6 +17,8 @@
 import torch
 from typing import Literal
 
+from physicsnemo.distributed import DistributedManager
+
 
 def loss_fn(
     pred: torch.Tensor,
@@ -54,6 +56,7 @@ def loss_fn_volume(
     Returns:
         Combined scalar and vector loss as a scalar tensor.
     """
+
     # Separate the scalar and vector components:
     output_pressure, output_vel, output_nut = torch.split(output, [1, 3, 1], dim=2)
     target_pressure, target_vel, target_nut = torch.split(target, [1, 3, 1], dim=2)
@@ -62,7 +65,7 @@ def loss_fn_volume(
     numerator_vel = torch.mean((target_vel - output_vel) ** 2.0, (0, 1))
     numerator_nut = torch.mean((target_nut - output_nut) ** 2.0)
 
-    eps = 1e-8
+    eps = 1e-4
     if loss_type == "mse":
         loss_pressure = numerator_pressure
         loss_wall_vel = torch.sum(numerator_vel)
@@ -103,7 +106,7 @@ def loss_fn_surface(
     numerator_pressure = torch.mean((output_pressure - target_pressure) ** 2.0)
     numerator_sheer = torch.mean((target_sheer - output_sheer) ** 2.0, (0, 1))
 
-    eps = 1e-8
+    eps = 1e-4
     if loss_type == "mse":
         loss_pressure = numerator_pressure
         loss_wall_sheer = torch.sum(numerator_sheer)
