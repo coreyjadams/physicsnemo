@@ -49,52 +49,25 @@ from physicsnemo.utils.sdf import signed_distance_field
 
 @dataclass
 class TransolverDataConfig:
-    """Base Configuration for Transolver dataset processing pipeline.
+    """
+    Configuration for Transolver data processing pipeline.
+
+    Attributes:
 
     Attributes:
         data_path: Path to the dataset to load.
-        phase: Which phase of data to load ("train", "val", or "test").
+        model_type: Type of the model ("surface" or "volume").
         resolution: Resolution of the sampled data, per batch.
-        volume_sample_from_disk: (Volume specific) If the volume data is in a shuffled state on disk,
-            read contiguous chunks of the data rather than the entire volume data.  This greatly
-            accelerates IO in bandwidth limited systems or when the volumetric data is very large.
-        volume_factors: (Volume specific) Non-dimensionalization factors for volume variables scaling.
-            If set, and scaling_type is:
-            - min_max_scaling -> rescale volume_fields to the min/max set here
-            - mean_std_scaling -> rescale volume_fields to the mean and std set here.
-        bounding_box_dims: (Volume specific) Dimensions of bounding box. Must be an object with min/max
-            attributes that are arraylike.
-        grid_resolution: Resolution of the latent grid.
-        normalize_coordinates: Whether to normalize coordinates based on min/max values.
-        sample_in_bbox: Whether to sample points in a specified bounding box.
-            Uses the same min/max points as coordinate normalization.
-            Only performed if compute_scaling_factors is false.
-        sampling: Whether to downsample the full resolution mesh to fit in GPU memory.
-            Surface and volume sampling points are configured separately as:
-            - surface.points_sample
-            - volume.points_sample
-        geom_points_sample: Number of STL points sampled per batch.
-            Independent of volume.points_sample and surface.points_sample.
-        scaling_type: Scaling type for volume variables.
-            If used, will rescale the volume_fields and surface fields outputs.
-            Requires volume.factor and surface.factor to be set.
-        compute_scaling_factors: Whether to compute scaling factors.
-            Not available if caching.
-            Many preprocessing pieces are disabled if computing scaling factors.
-        caching: Whether this is for caching or serving.
-        deterministic: Whether to use a deterministic seed for sampling and random numbers.
-        gpu_preprocessing: Whether to do preprocessing on the GPU (False for CPU).
-        gpu_output: Whether to return output on the GPU as cupy arrays.
-            If False, returns numpy arrays.
-            You might choose gpu_preprocessing=True and gpu_output=False if caching.
+        include_normals: Whether to include surface normals in embeddings.
+        include_sdf: Whether to include signed distance fields in embeddings.
+        translational_invariance: Enable translational adjustment using center of mass.
+        reference_origin: Origin for translational invariance, defaults to the center of mass.
+        broadcast_global_features: Whether to apply global features across all points.
     """
 
     data_path: Path | None
     model_type: Literal["surface", "volume"] = "surface"
     resolution: int = 200_000
-    # Apply some normalization to coordinate values of inputs,
-    # and derived features
-    # geom_points_sample: int = 300000
 
     # Control what features are added to the inputs to the model:
     include_normals: bool = True
@@ -104,17 +77,9 @@ class TransolverDataConfig:
     scaling_type: Optional[Literal["min_max_scaling", "mean_std_scaling"]] = None
     normalization_factors: Optional[torch.Tensor] = None
 
-    # # Add these invariances?
-    # rotational_invariance: bool = True
-    # reference_direction: torch.Tensor = torch.tensor([1.0, 0.0, 0.0])
-
     translational_invariance: bool = False
     # If none, uses the center of mass:
     reference_origin: torch.Tensor | None = None
-
-    # scale_invariance: bool = True
-    # # Scale factor is aligned with the preferred direction!
-    # reference_scale_factor: torch.Tensor = torch.tensor([1.0, 1.0, 1.0])
 
     broadcast_global_features: bool = True
 
@@ -169,34 +134,6 @@ class TransolverDataPipe(Dataset):
             DistributedManager.initialize()
 
         self.dataset = None
-
-    # @profile
-    # def downsample_geometry(
-    #     self,
-    #     stl_vertices,
-    # ) -> torch.Tensor:
-    #     """
-    #     Downsample the geometry to the desired number of points.
-
-    #     Args:
-    #         stl_vertices: The vertices of the surface.
-    #     """
-
-    #     if self.config.sampling:
-    #         geometry_points = self.config.geom_points_sample
-
-    #         geometry_coordinates_sampled, idx_geometry = shuffle_array(
-    #             stl_vertices, geometry_points
-    #         )
-    #         if geometry_coordinates_sampled.shape[0] < geometry_points:
-    #             raise ValueError(
-    #                 "Surface mesh has fewer points than requested sample size"
-    #             )
-    #         geom_centers = geometry_coordinates_sampled
-    #     else:
-    #         geom_centers = stl_vertices
-
-    #     return geom_centers
 
     def preprocess_surface_data(self, data_dict):
         positions = data_dict["surface_mesh_centers"]
