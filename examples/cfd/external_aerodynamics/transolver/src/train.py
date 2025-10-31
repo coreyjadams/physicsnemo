@@ -75,26 +75,23 @@ def get_autocast_context(precision: str) -> nullcontext:
         return nullcontext()
 
 
-def cast_precisions(
-    features: torch.Tensor, embeddings: torch.Tensor, precision: str
-) -> tuple[torch.Tensor, torch.Tensor]:
+def cast_precisions(*tensors: torch.Tensor, precision: str) -> list[torch.Tensor]:
     """
-    Casts the features and embeddings tensors to the specified precision.
-
-    Args:
-        features (torch.Tensor): The input features tensor.
-        embeddings (torch.Tensor): The input embeddings tensor.
-        precision (str): The desired precision ("float16", "bfloat16", or other for no cast).
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: The features and embeddings tensors cast to the specified precision.
+    Casts the tensors to the specified precision.
     """
-    if precision == "float16":
-        return features.to(torch.float16), embeddings.to(torch.float16)
-    elif precision == "bfloat16":
-        return features.to(torch.bfloat16), embeddings.to(torch.bfloat16)
-    else:
-        return features, embeddings
+
+    match precision:
+        case "float16":
+            dtype = torch.float16
+        case "bfloat16":
+            dtype = torch.bfloat16
+        case _:
+            dtype = None
+
+    if dtype is not None:
+        tensors = [t.to(dtype) for t in tensors]
+
+    return tensors
 
 
 def pad_input_for_fp8(features: torch.Tensor, embeddings: torch.Tensor) -> torch.Tensor:
@@ -155,13 +152,55 @@ def forward_pass(
     targets = batch["fields"]
 
     # Cast precisions:
-    features, embeddings = cast_precisions(features, embeddings, precision)
+    features, embeddings = cast_precisions(features, embeddings, precision=precision)
     with get_autocast_context(precision):
         # For fp8, we may have to pad the inputs:
         if precision == "float8":
             features = pad_input_for_fp8(features, embeddings)
 
         outputs = model(features, embeddings)
+
+        outputs = unpad_output_for_fp8(outputs, output_pad_size)
+
+        loss = loss_fn(outputs, targets, cfg.data.mode)
+
+    metrics = metrics_fn(outputs, targets, dist_manager, cfg.data.mode)
+
+    return loss, metrics
+
+
+def forward_passX(
+    batch: dict,
+    model: torch.nn.Module,
+    precision: str,
+    output_pad_size: int | None,
+    dist_manager: DistributedManager,
+    cfg: DictConfig,
+    norm_factors: dict[str, torch.Tensor],
+):
+    """
+    Run the forward pass of the model for one batch, including metrics and loss calculation.
+    """
+
+    features = batch["fx"]
+    embeddings = batch["embeddings"]
+    targets = batch["fields"]
+    geometry = batch["geometry"]
+
+    # Cast precisions:
+    features, embeddings, geometry = cast_precisions(
+        features, embeddings, geometry, precision=precision
+    )
+    with get_autocast_context(precision):
+        # For fp8, we may have to pad the inputs:
+        # if precision == "float8":
+        #     features = pad_input_for_fp8(features, embeddings)
+
+        outputs = model(
+            local_embedding=embeddings,
+            global_embedding=features,
+            geometry=geometry,
+        )
 
         outputs = unpad_output_for_fp8(outputs, output_pad_size)
 
@@ -220,15 +259,27 @@ def train_epoch(
         for i, batch_idx in enumerate(epoch_indices):
             batch = dataloader[batch_idx]
 
-            loss, metrics = forward_pass(
-                batch,
-                model,
-                precision,
-                output_pad_size,
-                dist_manager,
-                cfg,
-                norm_factors,
-            )
+            # TransolverX has a different forward pass:
+            if "geometry" in batch.keys():
+                loss, metrics = forward_passX(
+                    batch,
+                    model,
+                    precision,
+                    output_pad_size,
+                    dist_manager,
+                    cfg,
+                    norm_factors,
+                )
+            else:
+                loss, metrics = forward_pass(
+                    batch,
+                    model,
+                    precision,
+                    output_pad_size,
+                    dist_manager,
+                    cfg,
+                    norm_factors,
+                )
 
             optimizer.zero_grad()
             if precision == "float16" and scaler is not None:
@@ -340,15 +391,27 @@ def val_epoch(
             # Get data from batch
             batch = dataloader[batch_idx]
 
-            loss, metrics = forward_pass(
-                batch,
-                model,
-                precision,
-                output_pad_size,
-                dist_manager,
-                cfg,
-                norm_factors,
-            )
+            # TransolverX has a different forward pass:
+            if "geometry" in batch.keys():
+                loss, metrics = forward_passX(
+                    batch,
+                    model,
+                    precision,
+                    output_pad_size,
+                    dist_manager,
+                    cfg,
+                    norm_factors,
+                )
+            else:
+                loss, metrics = forward_pass(
+                    batch,
+                    model,
+                    precision,
+                    output_pad_size,
+                    dist_manager,
+                    cfg,
+                    norm_factors,
+                )
 
             if i == 0:
                 total_metrics = metrics

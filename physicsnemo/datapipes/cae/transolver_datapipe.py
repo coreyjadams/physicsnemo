@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -72,6 +72,10 @@ class TransolverDataConfig:
     # Control what features are added to the inputs to the model:
     include_normals: bool = True
     include_sdf: bool = True
+
+    # Control the geometry configuration:
+    include_geometry: bool = False
+    geometry_sampling: int = 300_000
 
     # For controlling the normalization of target values:
     scaling_type: Optional[Literal["min_max_scaling", "mean_std_scaling"]] = None
@@ -184,6 +188,8 @@ class TransolverDataPipe(Dataset):
 
         if self.config.broadcast_global_features:
             fx = fx.broadcast_to(embeddings.shape[0], -1)
+        else:
+            fx = fx.unsqueeze(0)
 
         fields = data_dict["surface_fields"]
         if idx is not None:
@@ -273,6 +279,8 @@ class TransolverDataPipe(Dataset):
 
         if self.config.broadcast_global_features:
             fx = fx.broadcast_to(embeddings.shape[0], -1)
+        else:
+            fx = fx.unsqueeze(0)
 
         fields = data_dict["volume_fields"]
         if idx is not None:
@@ -286,6 +294,19 @@ class TransolverDataPipe(Dataset):
             "fx": fx,
             "fields": fields,
         }
+
+    def process_geometry(self, data_dict):
+        """
+        Process the geometry data.
+        """
+        geometry_coordinates = data_dict["stl_coordinates"]
+        if self.config.geometry_sampling is not None:
+            idx = torch.multinomial(
+                torch.ones(data_dict["stl_coordinates"].shape[0]),
+                self.config.geometry_sampling,
+            )
+        geometry_coordinates = geometry_coordinates[idx]
+        return geometry_coordinates
 
     @torch.no_grad()
     def process_data(self, data_dict):
@@ -374,6 +395,9 @@ class TransolverDataPipe(Dataset):
             outputs = self.preprocess_surface_data(data_dict)
         elif self.config.model_type == "volume":
             outputs = self.preprocess_volume_data(data_dict)
+
+        if self.config.include_geometry:
+            outputs["geometry"] = self.process_geometry(data_dict)
 
         ########################################################################
         # Process the core STL information
@@ -551,14 +575,18 @@ def create_transolver_dataset(
     else:
         pin_memory = False
 
-    if cfg.get("include_normals", None) is not None:
-        overrides["include_normals"] = cfg.include_normals
+    optional_cfg_keys = [
+        "include_normals",
+        "include_sdf",
+        "volume_sample_from_disk",
+        "broadcast_global_features",
+        "include_geometry",
+        "geometry_sampling",
+    ]
 
-    if cfg.get("include_sdf", None) is not None:
-        overrides["include_sdf"] = cfg.include_sdf
-
-    if cfg.get("volume_sample_from_disk", None) is not None:
-        overrides["volume_sample_from_disk"] = cfg.volume_sample_from_disk
+    for optional_key in optional_cfg_keys:
+        if cfg.get(optional_key, None) is not None:
+            overrides[optional_key] = cfg[optional_key]
 
     dataset = CAEDataset(
         data_dir=input_path,

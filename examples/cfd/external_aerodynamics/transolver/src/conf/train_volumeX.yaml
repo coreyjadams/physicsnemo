@@ -18,21 +18,22 @@
 
 output_dir: "runs"
 checkpoint_dir: null  # Optional: set custom checkpoint path, defaults to output_dir
-run_id: "volume/bfloat16"
+run_id: "volumeX/bfloat16"
 
 # Training configuration
 training:
   precision: bfloat16 # float32, float16, bfloat16, or float8
   num_epochs: 251 # Add one to save at 250
-  save_interval: 25  # Save checkpoint every N epochs
+  save_interval: 5  # Save checkpoint every N epochs
   compile: true
 
 # Model configuration
 model:
   _target_: physicsnemo.models.transolver.TransolverX
-  functional_dim: 2 # Input feature dimension
+  functional_dim: 6 # Input feature dimension
+  global_dim: 2
+  geometry_dim: 3
   out_dim: 5        # Output feature dimension
-  embedding_dim: 7  # Spatial embedding dimension
   n_layers: 8       # Number of transformer layers
   n_hidden: 256     # Hidden dimension
   dropout: 0.0      # Dropout rate
@@ -40,11 +41,7 @@ model:
   act: "gelu"       # Activation function
   mlp_ratio: 1      # MLP ratio in attention blocks
   slice_num: 256     # Number of slices in physics attention
-  unified_pos: false # Whether to use unified positional embeddings
-  ref: 8            # Reference dimension for unified pos
-  structured_shape: null
   use_te: false     # Use transformer engine
-  time_input: false # Whether to use time embeddings
   plus: false
 
 scheduler:
@@ -79,11 +76,14 @@ data:
   preload_depth: 1
   volume_sample_from_disk: true # Enable faster IO on pre-shuffled volumetric data
   pin_memory: true
-  resolution: 650_000
+  resolution: 250_000
   # Preprocessing switches:
   # (Changing thes will change the embedding dim)
   include_normals: true
-  include_sdf: true
+  include_sdf: false
+  include_geometry: true
+  geometry_sampling: 300_000
+  broadcast_global_features: false
   mode: volume
   data_keys:
     - "volume_fields"
