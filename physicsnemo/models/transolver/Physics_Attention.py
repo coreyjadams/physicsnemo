@@ -36,6 +36,10 @@ import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te  # noqa: F401
 from einops import rearrange
+from torch.autograd.profiler import record_function
+from torch.distributed.tensor.placement_types import Replicate
+
+from physicsnemo.distributed import ShardTensor
 
 
 def gumbel_softmax(logits: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
@@ -150,17 +154,22 @@ class PhysicsAttentionBase(nn.Module, ABC):
         """
         Compute slice weights and slice tokens from input projections and latent features.
 
+        In a domain-parallel setting, this function will do an implicit allreduce.
+        When we sum over the slice_weights over a sharded dimension
+        and use the output, it will resolve Partial->Replicated placement (aka
+        allreduce) implicitly.
+
         Args:
             slice_projections (torch.Tensor):
-                The projected input tensor of shape [Batch, N_heads, N_tokens, Slice_num],
+                The projected input tensor of shape [Batch, N_tokens, N_heads, Slice_num],
                 representing the projection of each token onto each slice for each attention head.
             fx (torch.Tensor):
-                The latent feature tensor of shape [Batch, N_heads, N_tokens, Head_dim],
+                The latent feature tensor of shape [Batch, N_tokens, N_heads, Head_dim],
                 representing the learned states to be aggregated by the slice weights.
 
         Returns:
             tuple[torch.Tensor, torch.Tensor]:
-                - slice_weights: Tensor of shape [Batch, N_heads, N_tokens, Slice_num],
+                - slice_weights: Tensor of shape [Batch, N_tokens, N_heads, Slice_num],
                 representing the normalized weights for each slice per token and head.
                 - slice_token: Tensor of shape [Batch, N_heads, Slice_num, Head_dim],
                 representing the aggregated latent features for each slice, head, and batch.
@@ -198,11 +207,29 @@ class PhysicsAttentionBase(nn.Module, ABC):
 
         # Computing the slice tokens is a matmul followed by a normalization.
         # It can, unfortunately, overflow in reduced precision, so normalize first:
-        slice_norm = slice_weights.sum(2)  # [Batch, N_heads, Slice_num]
-        normed_weights = slice_weights / (slice_norm[:, :, None, :] + 1e-2)
-        slice_token = torch.matmul(normed_weights.transpose(2, 3), fx)
+        slice_norm = slice_weights.sum(1)  # [Batch, N_heads, Slice_num]
+        # Sharded note: slice_norm will be a partial sum at this point.
+        # That's because the we're summing over the tokens, which are distributed
+        normed_weights = slice_weights / (slice_norm[:, None, :, :] + 1e-2)
+        # Normed weights has shape
+        # (batch, n_tokens, n_heads, slice_num)
+
+        # Sharded note: normed_weights will resolve the partial slice_norm
+        # and the output normed_weights will be sharded.
+        # fx has shape (Batch, n_tokens, n_heads, head_dim)
+        # This matmul needs to contract over the tokens
+        # This should produce an output with shape
+        # [Batch, N_heads, Slice_num, Head_dim]
+
+        # Like the weight norm, this sum is a **partial** sum since we are summing
+        # over the tokens
+
+        slice_token = torch.matmul(
+            normed_weights.permute(0, 2, 3, 1), fx.permute(0, 2, 1, 3)
+        )
 
         # Return the original weights, not the normed weights:
+
         return slice_weights, slice_token
 
     def compute_slice_attention_te(self, slice_tokens: torch.Tensor) -> torch.Tensor:
@@ -224,18 +251,33 @@ class PhysicsAttentionBase(nn.Module, ABC):
     def compute_slice_attention_sdpa(self, slice_tokens: torch.Tensor) -> torch.Tensor:
         """
         Torch SDPA implementation of slice attention
+
+        Args:
+            slice_tokens (torch.Tensor):
+                The slice tokens tensor of shape [Batch, N_heads, Slice_num, Head_dim].
+
+        Returns:
+            torch.Tensor:
+                The output tensor of shape [Batch, N_heads, Slice_num, Head_dim].
         """
+        with record_function("compute_slice_attention_sdpa"):
+            # In this case we're using ShardTensor, ensure slice_token is *replicated*
 
-        qkv = self.qkv_project(slice_tokens)
-        qkv = rearrange(qkv, " b h s (t d) -> t b h s d", t=3, d=self.dim_head)
+            qkv = self.qkv_project(slice_tokens)
 
-        q_slice_token, k_slice_token, v_slice_token = qkv.unbind(0)
+            qkv = rearrange(qkv, " b h s (t d) -> b h s t d", t=3, d=self.dim_head)
 
-        out_slice_token3 = torch.nn.functional.scaled_dot_product_attention(
-            q_slice_token, k_slice_token, v_slice_token, is_causal=False
-        )
+            if isinstance(qkv, ShardTensor):
+                # This will be a differentiable allreduce
+                qkv = qkv.redistribute(placements=[Replicate()])
 
-        return out_slice_token3
+            q_slice_token, k_slice_token, v_slice_token = qkv.unbind(3)
+
+            out_slice_token = torch.nn.functional.scaled_dot_product_attention(
+                q_slice_token, k_slice_token, v_slice_token, is_causal=False
+            )
+
+            return out_slice_token
 
     def project_attention_outputs(
         self, out_slice_token: torch.Tensor, slice_weights: torch.Tensor
@@ -243,12 +285,15 @@ class PhysicsAttentionBase(nn.Module, ABC):
         """
         Project the attended slice tokens back onto the original token space.
 
+        Note that in the distributed case, this will have a replicated and
+        sharded inputs.  Slice tokens will be replicated, and slice weights will be sharded.
+
         Args:
             out_slice_token (torch.Tensor):
                 The output tensor from the attention mechanism over slices,
                 of shape [Batch, N_heads, Slice_num, Head_dim].
             slice_weights (torch.Tensor):
-                The slice weights tensor of shape [Batch, N_heads, N_tokens, Slice_num],
+                The slice weights tensor of shape [Batch, N_tokens, N_heads, Slice_num],
                 representing the contribution of each slice to each token.
 
         Returns:
@@ -260,11 +305,21 @@ class PhysicsAttentionBase(nn.Module, ABC):
             - The function projects the attended slice tokens back to the token space using the slice weights.
             - The output is reshaped to concatenate all attention heads for each token.
         """
+        with record_function("project_attention_outputs"):
+            # Slice weights has shape (Batch, n_tokens, n_heads, slice_num)
+            # Out slice tokens has shape (Batch, n_heads, slice_num, head_dim)
+            # The output of this function needs to have shape
+            # (Batch, n_tokens, n_channels) == (Batch, n_tokens, n_heads * head_dim)
+            # Note that tokens may be sharded, in which case slice_weights
+            # is a sharded tensor and out_slice_token is a replicated tensor
 
-        out_x = torch.matmul(slice_weights, out_slice_token)
-        out_x = rearrange(out_x, "b h n d -> b n (h d)")
-        out_x = self.out_linear(out_x)
-        return self.out_dropout(out_x)
+            out_x = torch.einsum("bths,bhsd->bthd", slice_weights, out_slice_token)
+
+            # Condense the last two dimensions:
+            out_x = rearrange(out_x, "b t h d -> b t (h d)")
+
+            out_x = self.out_linear(out_x)
+            return self.out_dropout(out_x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -283,16 +338,17 @@ class PhysicsAttentionBase(nn.Module, ABC):
             x_mid, fx_mid = self.project_input_onto_slices(x)
 
         # Perform the linear projection of learned latent space onto slices:
+
         slice_projections = self.in_project_slice(x_mid)
 
-        # Slice projections has shape [B, N_head, N_tokens, Head_dim], but head_dim may have changed!
+        # Slice projections has shape [B, N_tokens, N_head, Head_dim], but head_dim may have changed!
 
         # Use the slice projections and learned spaces to compute the slices, and their weights:
         slice_weights, slice_tokens = self.compute_slices_from_projections(
             slice_projections, fx_mid
         )
-        # slice_weights has shape [Batch, N_heads, N_tokens, Slice_num]
-        # slice_tokens has shape  [Batch, N_heads, N_tokens, head_dim]
+        # slice_weights has shape [Batch, N_tokens, N_heads, Slice_num]
+        # slice_tokens has shape  [Batch, N_tokens, N_heads, head_dim]
 
         # Apply attention to the slice tokens
         if self.use_te:
@@ -341,16 +397,23 @@ class PhysicsAttentionIrregularMesh(PhysicsAttentionBase):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Project the input onto the slice space.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape [Batch, N_tokens, N_Channels]
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: The projected x and fx tensors of shape [Batch, N_tokens, N_Channels], [Batch, N_tokens, N_heads, Head_dim]
+
         """
         x_mid = rearrange(
-            self.in_project_x(x), "B N (h d) -> B h N d", h=self.heads, d=self.dim_head
+            self.in_project_x(x), "B N (h d) -> B N h d", h=self.heads, d=self.dim_head
         )
         if self.plus:
             return x_mid
         else:
             fx_mid = rearrange(
                 self.in_project_fx(x),
-                "B N (h d) -> B h N d",
+                "B N (h d) -> B N h d",
                 h=self.heads,
                 d=self.dim_head,
             )
@@ -361,6 +424,8 @@ class PhysicsAttentionIrregularMesh(PhysicsAttentionBase):
 class PhysicsAttentionStructuredMesh2D(PhysicsAttentionBase):
     """
     Specialization for 2d image-like meshes
+
+    Only implements the projection onto the slice space.
     """
 
     def __init__(
@@ -389,13 +454,18 @@ class PhysicsAttentionStructuredMesh2D(PhysicsAttentionBase):
         self, x
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Rearrange the input tokens back to an image shape:
-        x = rearrange(x, "b (h w) c -> b c h w", h=self.H, w=self.W)
+        b = x.shape[0]
+        c = x.shape[-1]
+
+        x = x.view(b, self.H, self.W, c)
+        x = x.permute(0, 3, 1, 2)
+
         # Apply the projections, here they are convolutions in 2D:
 
         input_projected_x = self.in_project_x(x)
         input_projected_x = rearrange(
             input_projected_x,
-            "b (n_heads head_dim) h w -> b n_heads (h w) head_dim",
+            "b (n_heads head_dim) h w -> b (h w) n_heads head_dim",
             head_dim=self.dim_head,
             n_heads=self.heads,
         )
@@ -407,7 +477,7 @@ class PhysicsAttentionStructuredMesh2D(PhysicsAttentionBase):
             # Next, re-reshape the projections into token-like shapes:
             input_projected_fx = rearrange(
                 input_projected_fx,
-                "b (n_heads head_dim) h w -> b n_heads (h w) head_dim",
+                "b (n_heads head_dim) h w -> b (h w) n_heads head_dim",
                 head_dim=self.dim_head,
                 n_heads=self.heads,
             )
@@ -419,6 +489,8 @@ class PhysicsAttentionStructuredMesh2D(PhysicsAttentionBase):
 class PhysicsAttentionStructuredMesh3D(PhysicsAttentionBase):
     """
     Specialization for 3D-image like meshes
+
+    Only implements the projection onto the slice space.
     """
 
     def __init__(
@@ -449,18 +521,24 @@ class PhysicsAttentionStructuredMesh3D(PhysicsAttentionBase):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Project the input onto the slice space.
+
+        Input tensor has shape [Batch, N_tokens, N_Channels]
         """
 
-        x = rearrange(x, "b (h w) c -> b c h w", h=self.H, w=self.W)
+        b = x.shape[0]
+        c = x.shape[-1]
+
+        # x = rearrange(x, "b (h w d) c -> b c h w d", h=self.H, w=self.W, d=self.D)
+        x = x.view(b, self.H, self.W, self.D, c)
+        x = x.permute(0, 4, 1, 2, 3)
 
         # Apply the projections, here they are convolutions:
         input_projected_x = self.in_project_x(x)
 
         # Next, re-reshape the projections into token-like shapes:
-
         input_projected_x = rearrange(
             input_projected_x,
-            "b (n_heads head_dim) h w -> b n_heads (h w) head_dim",
+            "b (n_heads head_dim) h w d -> b (h w d) n_heads head_dim",
             head_dim=self.dim_head,
             n_heads=self.heads,
         )
@@ -470,7 +548,7 @@ class PhysicsAttentionStructuredMesh3D(PhysicsAttentionBase):
             input_projected_fx = self.in_project_fx(x)
             input_projected_fx = rearrange(
                 input_projected_fx,
-                "b (n_heads head_dim) h w -> b n_heads (h w) head_dim",
+                "b (n_heads head_dim) h w -> b (h w d) n_heads head_dim",
                 head_dim=self.dim_head,
                 n_heads=self.heads,
             )
