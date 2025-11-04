@@ -208,8 +208,11 @@ class TransolverDataPipe(Dataset):
         positions = data_dict["volume_mesh_centers"]
 
         if self.config.resolution is not None:
-            idx = torch.multinomial(
-                torch.ones(positions.shape[0]), self.config.resolution
+            # idx = torch.multinomial(
+            #     torch.ones(positions.shape[0], device=positions.device), self.config.resolution,
+            # )
+            idx = poisson_sample_indices_fixed(
+                positions.shape[0], self.config.resolution, device=positions.device
             )
         else:
             idx = None
@@ -301,11 +304,16 @@ class TransolverDataPipe(Dataset):
         """
         geometry_coordinates = data_dict["stl_coordinates"]
         if self.config.geometry_sampling is not None:
-            idx = torch.multinomial(
-                torch.ones(data_dict["stl_coordinates"].shape[0]),
+            # idx = torch.multinomial(
+            #     torch.ones(data_dict["stl_coordinates"].shape[0]),
+            #     self.config.geometry_sampling,
+            # )
+            idx = poisson_sample_indices_fixed(
+                data_dict["stl_coordinates"].shape[0],
                 self.config.geometry_sampling,
+                device=data_dict["stl_coordinates"].device,
             )
-        geometry_coordinates = geometry_coordinates[idx]
+            geometry_coordinates = geometry_coordinates[idx]
         return geometry_coordinates
 
     @torch.no_grad()
@@ -612,3 +620,32 @@ def create_transolver_dataset(
     datapipe.set_dataset(dataset)
 
     return datapipe
+
+
+def poisson_sample_indices_fixed(N: int, k: int, device=None):
+    """
+    This function is a nearly uniform sampler of indices for when the
+    number of indices to sample is very, very large.  It's useful when
+    the number of indices to sample is larger than 2^24 and torch
+    multinomial cna't work.  Unlike using randperm, there is no
+    need to materialize and randomize the entire tensor of indices.
+
+    """
+    # Draw exponential gaps off of random initializations:
+    gaps = torch.rand(k, device=device).exponential_()
+
+    summed = gaps.sum()
+
+    # Normalize so total cumulative sum == N
+    gaps *= N / summed
+
+    # Compute cumulative positions
+    idx = torch.cumsum(gaps, dim=0)
+
+    # Shift down so range starts at 0 and ends below N
+    idx -= gaps[0] / 2
+
+    # Round to nearest integer index
+    idx = torch.clamp(idx.floor().long(), min=0, max=N - 1)
+
+    return idx
