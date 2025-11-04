@@ -214,7 +214,7 @@ def forward_passX(
 @profile
 def train_epoch(
     dataloader,
-    sampler: torch.utils.data.Sampler,
+    epoch_len: int,
     model: torch.nn.Module,
     output_pad_size: int | None,
     optimizer: torch.optim.Optimizer,
@@ -232,8 +232,8 @@ def train_epoch(
 
     Args:
         dataloader: Training data loader
-        sampler (torch.utils.data.Sampler): Sampler for distributed or sequential sampling.
         model (torch.nn.Module): The neural network model to train.
+        epoch_len (int): Length of the epoch.
         output_pad_size (int | None): Optional output padding size for lowest precisions (FP8).
         optimizer (torch.optim.Optimizer): Optimizer for model parameters.
         scheduler (torch.optim.lr_scheduler._LRScheduler): Learning rate scheduler.
@@ -251,84 +251,83 @@ def train_epoch(
     total_loss = 0
     total_metrics = {}
 
-    epoch_indices = list(sampler) if sampler is not None else range(len(dataloader))
-    epoch_len = len(epoch_indices)
     precision = getattr(cfg.training, "precision", "float32")
     start_time = time.time()
-    with Profiler():
-        for i, batch_idx in enumerate(epoch_indices):
-            batch = dataloader[batch_idx]
 
-            # TransolverX has a different forward pass:
-            if "geometry" in batch.keys():
-                loss, metrics = forward_passX(
-                    batch,
-                    model,
-                    precision,
-                    output_pad_size,
-                    dist_manager,
-                    cfg,
-                    norm_factors,
-                )
-            else:
-                loss, metrics = forward_pass(
-                    batch,
-                    model,
-                    precision,
-                    output_pad_size,
-                    dist_manager,
-                    cfg,
-                    norm_factors,
-                )
-
-            optimizer.zero_grad()
-            if precision == "float16" and scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
-
-            if not isinstance(scheduler, torch.optim.lr_scheduler.StepLR):
-                scheduler.step()
-
-            end_time = time.time()
-
-            # Logging
-            this_loss = loss.detach().item()
-            total_loss += this_loss
-
-            if i == 0:
-                total_metrics = metrics
-            else:
-                total_metrics = {
-                    k: total_metrics[k] + metrics[k].item() for k in metrics.keys()
-                }
-
-            duration = end_time - start_time
-            start_time = end_time
-            images_per_second = 1 / duration
-
-            mem_usage = torch.cuda.memory_reserved() / 1024**3
-
-            logger.info(
-                f"Epoch {epoch} [{i}/{epoch_len}] Loss: {this_loss:.6f} Duration: {duration:.2f}s Mem: {mem_usage:.2f}GB"
+    for i, batch in enumerate(dataloader):
+        # TransolverX has a different forward pass:
+        if "geometry" in batch.keys():
+            loss, metrics = forward_passX(
+                batch,
+                model,
+                precision,
+                output_pad_size,
+                dist_manager,
+                cfg,
+                norm_factors,
             )
-            if dist_manager.rank == 0:
+        else:
+            loss, metrics = forward_pass(
+                batch,
+                model,
+                precision,
+                output_pad_size,
+                dist_manager,
+                cfg,
+                norm_factors,
+            )
+
+        optimizer.zero_grad()
+        if precision == "float16" and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        if not isinstance(scheduler, torch.optim.lr_scheduler.StepLR):
+            scheduler.step()
+
+        end_time = time.time()
+
+        # Logging
+        this_loss = loss.detach().item()
+        total_loss += this_loss
+
+        if i == 0:
+            total_metrics = metrics
+        else:
+            total_metrics = {
+                k: total_metrics[k] + metrics[k].item() for k in metrics.keys()
+            }
+
+        duration = end_time - start_time
+        start_time = end_time
+        images_per_second = 1 / duration
+
+        mem_usage = torch.cuda.memory_reserved() / 1024**3
+
+        logger.info(
+            f"Epoch {epoch} [{i}/{epoch_len}] Loss: {this_loss:.6f} Duration: {duration:.2f}s Mem: {mem_usage:.2f}GB"
+        )
+        if dist_manager.rank == 0:
+            writer.add_scalar(
+                "batch/learning_rate",
+                optimizer.param_groups[0]["lr"],
+                i + epoch_len * epoch,
+            )
+            writer.add_scalar("batch/loss", this_loss, i + epoch_len * epoch)
+            writer.add_scalar(
+                "batch/throughpu_per_gpu", images_per_second, i + epoch_len * epoch
+            )
+            for metric_name, metric_value in metrics.items():
                 writer.add_scalar(
-                    "batch/learning_rate",
-                    optimizer.param_groups[0]["lr"],
-                    i + epoch_len * epoch,
+                    f"batch/{metric_name}", metric_value, i + epoch_len * epoch
                 )
-                writer.add_scalar("batch/loss", this_loss, i + epoch_len * epoch)
-                writer.add_scalar(
-                    "batch/throughpu_per_gpu", images_per_second, i + epoch_len * epoch
-                )
-                for metric_name, metric_value in metrics.items():
-                    writer.add_scalar(
-                        f"batch/{metric_name}", metric_value, i + epoch_len * epoch
-                    )
+
+        if cfg.profile and i >= 10:
+            break  # Stop profiling after 10 batches
 
     avg_loss = total_loss / epoch_len
     avg_metrics = {k: v / epoch_len for k, v in total_metrics.items()}
@@ -349,7 +348,7 @@ def train_epoch(
 @profile
 def val_epoch(
     dataloader,
-    sampler: torch.utils.data.Sampler | None,
+    epoch_len: int,
     model: torch.nn.Module,
     output_pad_size: int | None,
     logger: PythonLogger,
@@ -364,7 +363,7 @@ def val_epoch(
 
     Args:
         dataloader: Validation data loader.
-        sampler (torch.utils.data.Sampler | None): Sampler for distributed or sequential sampling.
+        epoch_len (int): Length of the epoch.
         model (torch.nn.Module): The model to evaluate.
         output_pad_size (int | None): Optional output padding size for lowest precisions (FP8).
         logger (PythonLogger): Logger for validation progress.
@@ -381,16 +380,11 @@ def val_epoch(
     total_loss = 0
     total_metrics = {}
 
-    epoch_indices = list(sampler) if sampler is not None else range(len(dataloader))
-    epoch_len = len(epoch_indices)
     precision = getattr(cfg.training, "precision", "float32")
 
     start_time = time.time()
     with torch.no_grad():  # Disable gradient computation
-        for i, batch_idx in enumerate(epoch_indices):
-            # Get data from batch
-            batch = dataloader[batch_idx]
-
+        for i, batch in enumerate(dataloader):
             # TransolverX has a different forward pass:
             if "geometry" in batch.keys():
                 loss, metrics = forward_passX(
@@ -432,6 +426,9 @@ def val_epoch(
                 f"Val [{i}/{epoch_len}] Loss: {this_loss:.6f} Duration: {duration:.2f}s"
             )
             # We don't add individual loss measurements to tensorboard in the validation loop.
+
+            if cfg.profile and i >= 10:
+                break  # Stop profiling after 10 batches
 
     avg_loss = total_loss / epoch_len
     avg_metrics = {k: v / epoch_len for k, v in total_metrics.items()}
@@ -649,40 +646,41 @@ def main(cfg: DictConfig):
 
         start_time = time.time()
         # Training phase
-        train_loss = train_epoch(
-            train_dataloader,
-            train_sampler,
-            model,
-            output_pad_size,
-            optimizer,
-            scheduler,
-            logger,
-            writer,
-            epoch,
-            cfg,
-            dist_manager,
-            norm_factors,
-            scaler,
-        )
-        end_time = time.time()
-        train_duration = end_time - start_time
+        with Profiler():
+            train_loss = train_epoch(
+                train_dataloader,
+                len(list(train_sampler)),
+                model,
+                output_pad_size,
+                optimizer,
+                scheduler,
+                logger,
+                writer,
+                epoch,
+                cfg,
+                dist_manager,
+                norm_factors,
+                scaler,
+            )
+            end_time = time.time()
+            train_duration = end_time - start_time
 
-        start_time = time.time()
-        # Validation phase
-        val_loss = val_epoch(
-            val_dataloader,
-            val_sampler,
-            model,
-            output_pad_size,
-            logger,
-            val_writer,
-            epoch,
-            cfg,
-            dist_manager,
-            norm_factors,
-        )
-        end_time = time.time()
-        val_duration = end_time - start_time
+            start_time = time.time()
+            # Validation phase
+            val_loss = val_epoch(
+                val_dataloader,
+                len(list(val_sampler)),
+                model,
+                output_pad_size,
+                logger,
+                val_writer,
+                epoch,
+                cfg,
+                dist_manager,
+                norm_factors,
+            )
+            end_time = time.time()
+            val_duration = end_time - start_time
 
         # Log epoch results
         logger.info(
@@ -710,8 +708,9 @@ def launch(cfg: DictConfig):
     # If you want to use `line_profiler` or PyTorch's profiler, enable them here.
 
     profiler = Profiler()
-    # profiler.enable("torch")
-    # profiler.enable("line_profiler")
+    if cfg.profile:
+        profiler.enable("torch")
+        profiler.enable("line_profiler")
     profiler.initialize()
     main(cfg)
     profiler.finalize()
