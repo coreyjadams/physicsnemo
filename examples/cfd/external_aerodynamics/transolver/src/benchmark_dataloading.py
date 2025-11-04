@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -128,26 +128,17 @@ def main(cfg: DictConfig):
         start_time = time.time()
         # Training phase
         start = time.time()
-        for i_batch, data in enumerate(train_dataloader):
-            print(f"Train {i_batch} elapsed time: {time.time() - start}")
-            start = time.time()
+        with Profiler():
+            for i_batch, data in enumerate(train_dataloader):
+                print(f"Train {i_batch} elapsed time: {time.time() - start}")
+                start = time.time()
 
         end_time = time.time()
         train_duration = end_time - start_time
 
-        start_time = time.time()
-        # Validation phase
-        start = time.time()
-        for i_batch, data in enumerate(val_dataloader):
-            print(f"Val {i_batch} elapsed time: {time.time() - start}")
-            start = time.time()
-
-        end_time = time.time()
-        val_duration = end_time - start_time
-
         # Log epoch results
         logger.info(
-            f"Epoch [{epoch}/{cfg.training.num_epochs}] [duration: {train_duration:.2f}s]  Val - [duration: {val_duration:.2f}s]"
+            f"Epoch [{epoch}/{cfg.training.num_epochs}] [duration: {train_duration:.2f}s]"
         )
 
     logger.info("Benchmark completed!")
@@ -164,8 +155,8 @@ def launch(cfg: DictConfig):
     # If you want to use `line_profiler` or PyTorch's profiler, enable them here.
 
     profiler = Profiler()
-    # profiler.enable("torch")
-    # profiler.enable("line_profiler")
+    if cfg.profile:
+        profiler.enable("torch")
     profiler.initialize()
     main(cfg)
     profiler.finalize()
