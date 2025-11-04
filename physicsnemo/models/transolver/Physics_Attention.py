@@ -103,7 +103,7 @@ class PhysicsAttentionBase(nn.Module, ABC):
 
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
-        self.temperature = nn.Parameter(torch.ones([1, 1, heads, 1]) * 0.5)
+        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
 
         if plus:
             linear_layer = te.Linear if self.use_te else nn.Linear
@@ -198,7 +198,7 @@ class PhysicsAttentionBase(nn.Module, ABC):
             )
             slice_weights = nn.functional.softmax(
                 slice_projections / clamped_temp, dim=-1
-            )  # [Batch, N_tokens, N_heads, Slice_num]
+            )  # [Batch, N_heads, N_tokens, Slice_num]
 
         # Cast to the computation type (since the parameter is probably fp32)
         slice_weights = slice_weights.to(slice_projections.dtype)
