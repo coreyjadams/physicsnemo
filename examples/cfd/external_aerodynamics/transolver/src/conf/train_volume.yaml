@@ -19,6 +19,7 @@
 output_dir: "runs"
 checkpoint_dir: null  # Optional: set custom checkpoint path, defaults to output_dir
 run_id: "volume/bfloat16"
+profile: false
 
 # Training configuration
 training:
@@ -29,7 +30,7 @@ training:
 
 # Model configuration
 model:
-  _target_: physicsnemo.models.transolver.TransolverX
+  _target_: physicsnemo.models.transolver.Transolver
   functional_dim: 2 # Input feature dimension
   out_dim: 5        # Output feature dimension
   embedding_dim: 7  # Spatial embedding dimension
@@ -79,11 +80,11 @@ data:
   preload_depth: 1
   volume_sample_from_disk: true # Enable faster IO on pre-shuffled volumetric data
   pin_memory: true
-  resolution: 650_000
+  resolution: 800_000
   # Preprocessing switches:
   # (Changing thes will change the embedding dim)
   include_normals: true
-  include_sdf: true
+  include_sdf: false
   mode: volume
   data_keys:
     - "volume_fields"
