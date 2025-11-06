@@ -18,7 +18,7 @@
 
 output_dir: "runs"
 checkpoint_dir: null  # Optional: set custom checkpoint path, defaults to output_dir
-run_id: "volume/bfloat16/6layers/1000k/"
+run_id: "volume/fake-name"
 profile: false
 
 # Training configuration
@@ -33,7 +33,7 @@ model:
   _target_: physicsnemo.models.transolver.Transolver
   functional_dim: 2 # Input feature dimension
   out_dim: 5        # Output feature dimension
-  embedding_dim: 6  # Spatial embedding dimension
+  embedding_dim: 7  # Spatial embedding dimension
   n_layers: 6       # Number of transformer layers
   n_hidden: 256     # Hidden dimension
   dropout: 0.0      # Dropout rate
@@ -51,9 +51,8 @@ model:
 scheduler:
   name: "OneCycleLR"
   params:
-    final_div_factor: 1e4
-  div_factor: 10
-  final_div_factor: 1e3
+    final_div_factor: 1e3
+    div_factor: 10
 
 # # StepLR scheduler: Decays the learning rate by gamma every step_size epochs
 # scheduler:
@@ -66,7 +65,7 @@ scheduler:
 # Optimizer configuration
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 2.0e-4
+  lr: 3.0e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   eps: 1.0e-8
@@ -83,11 +82,14 @@ data:
   preload_depth: 1
   volume_sample_from_disk: true # Enable faster IO on pre-shuffled volumetric data
   pin_memory: true
-  resolution: 1_000_000
+  resolution: 400_000
   # Preprocessing switches:
   # (Changing thes will change the embedding dim)
   include_normals: true
-  include_sdf: false
+  include_sdf: true
+  translational_invariance: true
+  scale_invariance: true
+  reference_scale: [12.0, 4.5, 3.25]
   mode: volume
   data_keys:
     - "volume_fields"

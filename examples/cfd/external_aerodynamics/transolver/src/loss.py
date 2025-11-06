@@ -44,7 +44,7 @@ def loss_fn(
 
 
 def loss_fn_volume(
-    output: torch.Tensor, target: torch.Tensor, loss_type: Literal["mse", "rmse"]
+    output: torch.Tensor, target: torch.Tensor, loss_type: Literal["mse", "smooth_l1"]
 ) -> torch.Tensor:
     """Calculate loss for surface data by handling scalar and vector components separately.
 
@@ -61,29 +61,23 @@ def loss_fn_volume(
     output_pressure, output_vel, output_nut = torch.split(output, [1, 3, 1], dim=2)
     target_pressure, target_vel, target_nut = torch.split(target, [1, 3, 1], dim=2)
 
-    numerator_pressure = torch.mean((output_pressure - target_pressure) ** 2.0)
-    numerator_vel = torch.mean((target_vel - output_vel) ** 2.0, (0, 1))
-    numerator_nut = torch.mean((target_nut - output_nut) ** 2.0)
-
-    eps = 1e-4
     if loss_type == "mse":
-        loss_pressure = numerator_pressure
-        loss_wall_vel = torch.sum(numerator_vel)
-        loss_nut = numerator_nut
-    else:
-        denom = torch.mean((target_pressure) ** 2.0) + eps
-        loss_pressure = numerator_pressure / denom
+        loss_pressure = torch.nn.functional.mse_loss(output_pressure, target_pressure)
+        loss_wall_vel = torch.nn.functional.mse_loss(output_vel, target_vel)
+        loss_nut = torch.nn.functional.mse_loss(output_nut, target_nut)
 
-        # Compute the mean diff**2 of the vector component, leave the last dimension:
-        denom_vel = torch.mean((target_vel) ** 2.0, (0, 1)) + eps
-        loss_wall_vel = torch.sum(numerator_vel / denom_vel)
+        loss = (loss_pressure + loss_wall_vel + loss_nut) / 4.0
 
-        denom_nut = torch.mean((target_nut) ** 2.0) + eps
-        loss_nut = numerator_nut / denom_nut
+    elif loss_type == "smooth_l1":
+        loss_pressure = torch.nn.functional.smooth_l1_loss(
+            output_pressure, target_pressure
+        )
+        loss_wall_vel = torch.nn.functional.smooth_l1_loss(output_vel, target_vel)
+        loss_nut = torch.nn.functional.smooth_l1_loss(output_nut, target_nut)
 
-    loss = loss_pressure + loss_wall_vel + loss_nut
+        loss = loss_pressure + loss_wall_vel + loss_nut
 
-    return loss / 5.0
+    return loss
 
 
 def loss_fn_surface(
@@ -103,21 +97,18 @@ def loss_fn_surface(
     output_pressure, output_sheer = torch.split(output, [1, 3], dim=2)
     target_pressure, target_sheer = torch.split(target, [1, 3], dim=2)
 
-    numerator_pressure = torch.mean((output_pressure - target_pressure) ** 2.0)
-    numerator_sheer = torch.mean((target_sheer - output_sheer) ** 2.0, (0, 1))
-
-    eps = 1e-4
     if loss_type == "mse":
-        loss_pressure = numerator_pressure
-        loss_wall_sheer = torch.sum(numerator_sheer)
-    else:
-        denom = torch.mean((target_pressure) ** 2.0) + eps
-        loss_pressure = numerator_pressure / denom
+        loss_pressure = torch.nn.functional.mse_loss(output_pressure, target_pressure)
+        loss_wall_sheer = torch.nn.functional.mse_loss(output_sheer, target_sheer)
 
-        # Compute the mean diff**2 of the vector component, leave the last dimension:
-        denom_sheer = torch.mean((target_sheer) ** 2.0, (0, 1)) + eps
-        loss_wall_sheer = torch.sum(numerator_sheer / denom_sheer)
+        loss = loss_pressure + loss_wall_sheer
 
-    loss = loss_pressure + loss_wall_sheer
+    elif loss_type == "smooth_l1":
+        loss_pressure = torch.nn.functional.smooth_l1_loss(
+            output_pressure, target_pressure
+        )
+        loss_wall_sheer = torch.nn.functional.smooth_l1_loss(output_sheer, target_sheer)
 
-    return loss / 4.0
+        loss = loss_pressure + loss_wall_sheer
+
+    return loss

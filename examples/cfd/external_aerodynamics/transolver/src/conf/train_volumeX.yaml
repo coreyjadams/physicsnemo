@@ -18,23 +18,24 @@
 
 output_dir: "runs"
 checkpoint_dir: null  # Optional: set custom checkpoint path, defaults to output_dir
-run_id: "volumeX/bfloat16"
+run_id: "volumeX/fake-name"
+profile: false
 
 # Training configuration
 training:
   precision: bfloat16 # float32, float16, bfloat16, or float8
-  num_epochs: 251 # Add one to save at 250
-  save_interval: 5  # Save checkpoint every N epochs
+  num_epochs: 500 # Add one to save at 250
+  save_interval: 10  # Save checkpoint every N epochs
   compile: true
 
 # Model configuration
 model:
   _target_: physicsnemo.models.transolver.TransolverX
-  functional_dim: 6 # Input feature dimension
+  functional_dim: 7 # Input feature dimension
   global_dim: 2
   geometry_dim: 3
   out_dim: 5        # Output feature dimension
-  n_layers: 8       # Number of transformer layers
+  n_layers: 6       # Number of transformer layers
   n_hidden: 256     # Hidden dimension
   dropout: 0.0      # Dropout rate
   n_head: 8         # Number of attention heads
@@ -47,7 +48,8 @@ model:
 scheduler:
   name: "OneCycleLR"
   params:
-    final_div_factor: 1e4
+    final_div_factor: 1e3
+    div_factor: 10
 
 # # StepLR scheduler: Decays the learning rate by gamma every step_size epochs
 # scheduler:
@@ -60,7 +62,7 @@ scheduler:
 # Optimizer configuration
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 5.0e-4
+  lr: 3.0e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   eps: 1.0e-8
@@ -76,13 +78,16 @@ data:
   preload_depth: 1
   volume_sample_from_disk: true # Enable faster IO on pre-shuffled volumetric data
   pin_memory: true
-  resolution: 250_000
+  resolution: 1_000_000
   # Preprocessing switches:
   # (Changing thes will change the embedding dim)
-  include_normals: true
-  include_sdf: false
   include_geometry: true
-  geometry_sampling: 300_000
+  include_normals: true
+  include_sdf: true
+  translational_invariance: true
+  scale_invariance: true
+  reference_scale: [12.0, 4.5, 3.25]
+  geometry_sampling: 700_000
   broadcast_global_features: false
   mode: volume
   data_keys:

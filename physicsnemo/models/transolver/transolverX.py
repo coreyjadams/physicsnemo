@@ -510,6 +510,9 @@ class TransolverX(Module):
         Whether to use transformer engine backend when possible.
     time_input : bool
         Whether to include time embeddings. Default is false
+    plus: bool
+        Use Transolver++ implementation in the Physics Attention layers.
+
     """
 
     def __init__(
@@ -526,6 +529,7 @@ class TransolverX(Module):
         mlp_ratio: int = 4,
         slice_num: int = 32,
         use_te: bool = True,
+        time_input: bool = False,
         plus: bool = False,
     ) -> None:
         super().__init__(meta=MetaData())
@@ -599,6 +603,12 @@ class TransolverX(Module):
                 nn.Linear(n_hidden, out_dim),
             )
 
+        self.time_input = time_input
+        if time_input:
+            self.time_fc = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden), nn.SiLU(), nn.Linear(n_hidden, n_hidden)
+            )
+
     def project_geometry_to_states(self, geometry: torch.Tensor) -> torch.Tensor:
         geometry_features = self.geometry_project(geometry)
         geometry_features = geometry_features / self.geometry_temperature
@@ -608,6 +618,7 @@ class TransolverX(Module):
         local_embedding: torch.Tensor,
         global_embedding: torch.Tensor | None = None,
         geometry: torch.Tensor | None = None,
+        time: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
 

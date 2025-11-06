@@ -19,13 +19,14 @@
 output_dir: "runs"
 checkpoint_dir: null  # Optional: set custom checkpoint path, defaults to output_dir
 run_id: "surface/bfloat16"
+profile: false
 
 # Training configuration
 training:
   precision: bfloat16 # float32, float16, bfloat16, or float8
   num_epochs: 251 # Add one to save at 250
   save_interval: 25  # Save checkpoint every N epochs
-  compile: true
+  compile: false
 
 # Model configuration
 model:
@@ -38,7 +39,7 @@ model:
   dropout: 0.0      # Dropout rate
   n_head: 8         # Number of attention heads
   act: "gelu"       # Activation function
-  mlp_ratio: 4      # MLP ratio in attention blocks
+  mlp_ratio: 2      # MLP ratio in attention blocks
   slice_num: 256     # Number of slices in physics attention
   unified_pos: false # Whether to use unified positional embeddings
   ref: 8            # Reference dimension for unified pos
@@ -83,7 +84,9 @@ data:
   # (Changing thes will change the embedding dim)
   include_normals: true
   include_sdf: false
-
+  translational_invariance: true
+  scale_invariance: true
+  reference_scale: [12.0, 4.5, 3.25]
   data_keys:
     - "surface_fields"
     - "surface_mesh_centers"

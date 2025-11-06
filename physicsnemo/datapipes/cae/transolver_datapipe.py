@@ -81,9 +81,21 @@ class TransolverDataConfig:
     scaling_type: Optional[Literal["min_max_scaling", "mean_std_scaling"]] = None
     normalization_factors: Optional[torch.Tensor] = None
 
+    ############################################################
+    # Translation invariance configuration:
+    ############################################################
+
     translational_invariance: bool = False
-    # If none, uses the center of mass:
+    # If none, uses the center of mass from the STLs:
     reference_origin: torch.Tensor | None = None
+
+    ############################################################
+    # Scale Invariance:
+    ############################################################
+    scale_invariance: bool = False
+    # Must be set if scale invariance is enabled.
+    # Should be castable to torch tensor
+    reference_scale: list[float] | None = None
 
     broadcast_global_features: bool = True
 
@@ -110,6 +122,19 @@ class TransolverDataConfig:
                 raise ValueError(
                     f"scaling_type should be one of ['min_max_scaling', 'mean_std_scaling'], got {self.scaling_type}"
                 )
+
+        if self.scale_invariance:
+            if self.reference_scale is None:
+                raise ValueError(
+                    "reference_scale must be set if scale invariance is enabled"
+                )
+
+            self.reference_scale = list(self.reference_scale)
+            if len(self.reference_scale) != 3:
+                raise ValueError("reference_scale must be a list of 3 floats")
+            self.reference_scale = (
+                torch.tensor(self.reference_scale).to(torch.float32).reshape(1, 3)
+            )
 
 
 class TransolverDataPipe(Dataset):
@@ -139,7 +164,12 @@ class TransolverDataPipe(Dataset):
 
         self.dataset = None
 
-    def preprocess_surface_data(self, data_dict):
+    def preprocess_surface_data(
+        self,
+        data_dict,
+        center_of_mass: torch.Tensor | None = None,
+        scale_factor: torch.Tensor | None = None,
+    ):
         positions = data_dict["surface_mesh_centers"]
 
         if self.config.resolution is not None:
@@ -156,16 +186,15 @@ class TransolverDataPipe(Dataset):
         # This is a center of mass computation for the stl surface,
         # using the size of each mesh point as weight.
         if self.config.translational_invariance:
-            if self.config.reference_origin is not None:
-                center_of_mass = self.config.reference_origin
-            else:
-                center_of_mass = torch.mean(data_dict["stl_centers"], dim=0)
-
             positions -= center_of_mass
+
+        if self.config.scale_invariance:
+            positions = positions / scale_factor
 
         # Build the embeddings:
         embeddings_inputs = [positions]
 
+        # Surface SDF is always 0:
         if self.config.include_sdf:
             sdf = torch.zeros_like(positions[:, 0:1])
             embeddings_inputs.append(sdf)
@@ -204,7 +233,12 @@ class TransolverDataPipe(Dataset):
             "fields": fields,
         }
 
-    def preprocess_volume_data(self, data_dict):
+    def preprocess_volume_data(
+        self,
+        data_dict,
+        center_of_mass: torch.Tensor | None = None,
+        scale_factor: torch.Tensor | None = None,
+    ):
         positions = data_dict["volume_mesh_centers"]
 
         if self.config.resolution is not None:
@@ -220,26 +254,28 @@ class TransolverDataPipe(Dataset):
         if idx is not None:
             positions = positions[idx]
 
-        # This is a center of mass computation for the stl surface,
-        # using the size of each mesh point as weight.
-        # We always compute the CoM, but don't always apply it.
-        if self.config.reference_origin is not None:
-            center_of_mass = self.config.reference_origin
-        else:
-            center_of_mass = torch.mean(data_dict["stl_centers"], dim=0)
-
-        center_of_mass = center_of_mass.unsqueeze(0)  # (1, 3)
+        # We need the CoM for some operations, regardless of translation invariance:
+        if center_of_mass is None:
+            center_of_mass = torch.mean(data_dict["stl_centers"], dim=0).unsqueeze(0)
 
         if self.config.translational_invariance:
             positions -= center_of_mass
+
+        if self.config.scale_invariance:
+            positions = positions / scale_factor
 
         # Build the embeddings:
         embeddings_inputs = [positions]
 
         if self.config.include_sdf:
             coords = data_dict["stl_coordinates"]
+            # Remove CoM, optionally:
             if self.config.translational_invariance:
                 coords = coords - center_of_mass
+
+            # Set scale, optionally:
+            if self.config.scale_invariance:
+                coords = coords / scale_factor
 
             sdf, closest_points = signed_distance_field(
                 coords,
@@ -251,6 +287,11 @@ class TransolverDataPipe(Dataset):
             embeddings_inputs.append(sdf.reshape(-1, 1))
         else:
             closest_points = center_of_mass
+
+            # Make sure we have a scale-invariant component to subtract
+            # from scale-invariant positions, below:
+            if self.config.scale_invariance:
+                closest_points = closest_points / scale_factor
 
         if self.config.include_normals:
             normals = positions - closest_points
@@ -298,7 +339,12 @@ class TransolverDataPipe(Dataset):
             "fields": fields,
         }
 
-    def process_geometry(self, data_dict):
+    def process_geometry(
+        self,
+        data_dict,
+        center_of_mass: torch.Tensor | None = None,
+        scale_factor: torch.Tensor | None = None,
+    ):
         """
         Process the geometry data.
         """
@@ -314,6 +360,13 @@ class TransolverDataPipe(Dataset):
                 device=data_dict["stl_coordinates"].device,
             )
             geometry_coordinates = geometry_coordinates[idx]
+
+        if self.config.translational_invariance:
+            geometry_coordinates -= center_of_mass
+
+        if self.config.scale_invariance:
+            geometry_coordinates = geometry_coordinates / scale_factor
+
         return geometry_coordinates
 
     @torch.no_grad()
@@ -382,6 +435,15 @@ class TransolverDataPipe(Dataset):
                 ]
             )
 
+        if self.config.translational_invariance:
+            if self.config.reference_origin is not None:
+                center_of_mass = self.config.reference_origin
+            else:
+                center_of_mass = torch.mean(data_dict["stl_centers"], dim=0)
+            center_of_mass = center_of_mass.unsqueeze(0)  # (1, 3)
+        else:
+            center_of_mass = None
+
         field_key = f"{self.config.model_type}_fields"
         coords_key = f"{self.config.model_type}_mesh_centers"
 
@@ -399,13 +461,23 @@ class TransolverDataPipe(Dataset):
                 f"Required keys are: {required_keys}"
             )
 
+        scale_factor = (
+            self.config.reference_scale if self.config.scale_invariance else None
+        )
+
         if self.config.model_type == "surface":
-            outputs = self.preprocess_surface_data(data_dict)
+            outputs = self.preprocess_surface_data(
+                data_dict, center_of_mass, scale_factor
+            )
         elif self.config.model_type == "volume":
-            outputs = self.preprocess_volume_data(data_dict)
+            outputs = self.preprocess_volume_data(
+                data_dict, center_of_mass, scale_factor
+            )
 
         if self.config.include_geometry:
-            outputs["geometry"] = self.process_geometry(data_dict)
+            outputs["geometry"] = self.process_geometry(
+                data_dict, center_of_mass, scale_factor
+            )
 
         ########################################################################
         # Process the core STL information
@@ -471,6 +543,11 @@ class TransolverDataPipe(Dataset):
         Pass a dataset to the datapipe to enable iterating over both in one pass.
         """
         self.dataset = dataset
+
+        if self.config.scale_invariance:
+            self.config.reference_scale = self.config.reference_scale.to(
+                self.dataset.output_device
+            )
 
         if self.config.volume_sample_from_disk:
             # We deliberately double the data to read compared to the sampling size:
@@ -583,6 +660,8 @@ def create_transolver_dataset(
     else:
         pin_memory = False
 
+    # These are keys that could be set in the config,
+    # but have a sensible default if not.
     optional_cfg_keys = [
         "include_normals",
         "include_sdf",
@@ -590,6 +669,10 @@ def create_transolver_dataset(
         "broadcast_global_features",
         "include_geometry",
         "geometry_sampling",
+        "translational_invariance",
+        "reference_origin",
+        "scale_invariance",
+        "reference_scale",
     ]
 
     for optional_key in optional_cfg_keys:
@@ -627,7 +710,7 @@ def poisson_sample_indices_fixed(N: int, k: int, device=None):
     This function is a nearly uniform sampler of indices for when the
     number of indices to sample is very, very large.  It's useful when
     the number of indices to sample is larger than 2^24 and torch
-    multinomial cna't work.  Unlike using randperm, there is no
+    multinomial can't work.  Unlike using randperm, there is no
     need to materialize and randomize the entire tensor of indices.
 
     """
