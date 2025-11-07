@@ -34,7 +34,15 @@ from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te  # noqa: F401
+
+try:
+    import transformer_engine.pytorch as te
+except (ImportError, FileNotFoundError):
+    te = None
+    TE_AVAILABLE = False
+else:
+    TE_AVAILABLE = True
+
 from einops import rearrange
 from torch.autograd.profiler import record_function
 from torch.distributed.tensor.placement_types import Replicate

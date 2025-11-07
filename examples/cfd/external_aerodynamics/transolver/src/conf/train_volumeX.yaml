@@ -26,7 +26,7 @@ training:
   precision: bfloat16 # float32, float16, bfloat16, or float8
   num_epochs: 500 # Add one to save at 250
   save_interval: 10  # Save checkpoint every N epochs
-  compile: true
+  compile: false
 
 # Model configuration
 model:
@@ -45,18 +45,18 @@ model:
   use_te: false     # Use transformer engine
   plus: false
 
-scheduler:
-  name: "OneCycleLR"
-  params:
-    final_div_factor: 1e3
-    div_factor: 10
-
-# # StepLR scheduler: Decays the learning rate by gamma every step_size epochs
 # scheduler:
-#   name: "StepLR"
+#   name: "OneCycleLR"
 #   params:
-#     step_size: 50     # Decay every 100 epochs (set X as desired)
-#     gamma: 0.5        # Decay factor
+#     final_div_factor: 1e3
+#     div_factor: 10
+
+# StepLR scheduler: Decays the learning rate by gamma every step_size epochs
+scheduler:
+  name: "StepLR"
+  params:
+    step_size: 200    # Decay every 200 epochs (set X as desired)
+    gamma: 0.5        # Decay factor
 
 
 # Optimizer configuration
@@ -70,15 +70,15 @@ optimizer:
 # Data configuration
 data:
   train:
-    data_path: /group_data/drivaer_aws/domino/train/
+    data_path: /lustre/fsw/portfolios/coreai/projects/coreai_modulus_cae/drivaer_aws/domino/train/
   val:
-    data_path: /group_data/drivaer_aws/domino/val/
+    data_path: /lustre/fsw/portfolios/coreai/projects/coreai_modulus_cae/drivaer_aws/domino/val/
   max_workers: 8
   normalization_dir: "src/"  # Directory for normalization files
   preload_depth: 1
   volume_sample_from_disk: true # Enable faster IO on pre-shuffled volumetric data
   pin_memory: true
-  resolution: 1_000_000
+  resolution: 100_000
   # Preprocessing switches:
   # (Changing thes will change the embedding dim)
   include_geometry: true
@@ -87,7 +87,7 @@ data:
   translational_invariance: true
   scale_invariance: true
   reference_scale: [12.0, 4.5, 3.25]
-  geometry_sampling: 700_000
+  geometry_sampling: 300_000
   broadcast_global_features: false
   mode: volume
   data_keys:

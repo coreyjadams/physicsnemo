@@ -40,7 +40,7 @@ try:
     import transformer_engine.pytorch as te
 
     TE_AVAILABLE = True
-except ImportError:
+except (ImportError, FileNotFoundError):
     TE_AVAILABLE = False
 
 import physicsnemo  # noqa: F401 for docs
