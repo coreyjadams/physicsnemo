@@ -57,31 +57,17 @@ def loss_fn_volume(
         Combined scalar and vector loss as a scalar tensor.
     """
 
-    # Separate the scalar and vector components:
-    output_pressure, output_vel, output_nut = torch.split(output, [1, 3, 1], dim=2)
-    target_pressure, target_vel, target_nut = torch.split(target, [1, 3, 1], dim=2)
-
     if loss_type == "mse":
-        loss_pressure = torch.nn.functional.mse_loss(output_pressure, target_pressure)
-        loss_wall_vel = torch.nn.functional.mse_loss(output_vel, target_vel)
-        loss_nut = torch.nn.functional.mse_loss(output_nut, target_nut)
-
-        loss = (loss_pressure + loss_wall_vel + loss_nut) / 4.0
-
+        loss = torch.nn.functional.mse_loss(output, target)
     elif loss_type == "smooth_l1":
-        loss_pressure = torch.nn.functional.smooth_l1_loss(
-            output_pressure, target_pressure
-        )
-        loss_wall_vel = torch.nn.functional.smooth_l1_loss(output_vel, target_vel)
-        loss_nut = torch.nn.functional.smooth_l1_loss(output_nut, target_nut)
-
-        loss = loss_pressure + loss_wall_vel + loss_nut
+        loss = torch.nn.functional.smooth_l1_loss(output, target)
+    return loss
 
     return loss
 
 
 def loss_fn_surface(
-    output: torch.Tensor, target: torch.Tensor, loss_type: Literal["mse", "rmse"]
+    output: torch.Tensor, target: torch.Tensor, loss_type: Literal["mse", "smooth_l1"]
 ) -> torch.Tensor:
     """Calculate loss for surface data by handling scalar and vector components separately.
 

@@ -63,6 +63,9 @@ class TransolverDataConfig:
         translational_invariance: Enable translational adjustment using center of mass.
         reference_origin: Origin for translational invariance, defaults to the center of mass.
         broadcast_global_features: Whether to apply global features across all points.
+        volume_sample_from_disk: Whether to sample points from the disk for volume data.
+        return_mesh_features: Whether to return the mesh areas and normals for the surface data.
+            Used to compute force coefficients. Transformations are applied to the mesh coordinates.
     """
 
     data_path: Path | None
@@ -100,6 +103,8 @@ class TransolverDataConfig:
     broadcast_global_features: bool = True
 
     volume_sample_from_disk: bool = True
+
+    return_mesh_features: bool = False
 
     def __post_init__(self):
         if self.data_path is not None:
@@ -479,24 +484,14 @@ class TransolverDataPipe(Dataset):
                 data_dict, center_of_mass, scale_factor
             )
 
-        ########################################################################
-        # Process the core STL information
-        ########################################################################
+        if self.config.return_mesh_features:
+            outputs["surface_areas"] = data_dict["surface_areas"]
+            outputs["surface_normals"] = data_dict["surface_normals"]
 
-        # This function gets information about the surface scale,
-        # and decides what the surface grid will be:
-
-        # stl_coordinates = data_dict["stl_coordinates"]
-
-        # # We always need to calculate the SDF on the surface grid:
-        # # This is for the SDF Later:
-        # if self.config.normalize_coordinates:
-        #     normed_vertices = normalize(data_dict["stl_coordinates"], s_max, s_min)
-        # else:
-        #     normed_vertices = data_dict["stl_coordinates"]
-
-        # For SDF calculations, make sure the mesh_indices_flattened is an integer array:
-        # mesh_indices_flattened = data_dict["stl_faces"].to(torch.int32)
+        if "air_density" in data_dict:
+            outputs["air_density"] = data_dict["air_density"]
+        if "stream_velocity" in data_dict:
+            outputs["stream_velocity"] = data_dict["stream_velocity"]
 
         return outputs
 
@@ -515,9 +510,11 @@ class TransolverDataPipe(Dataset):
             field_max = factors["max"]
             return normalize(fields, field_max, field_min)
 
-    def unscale_model_outputs(
+    def unscale_model_targets(
         self,
         fields: torch.Tensor | None = None,
+        air_density: torch.Tensor | None = None,
+        stream_velocity: torch.Tensor | None = None,
     ):
         """
         Unscale the model outputs based on the configured scaling factors.
@@ -527,14 +524,19 @@ class TransolverDataPipe(Dataset):
 
         """
 
+        factors = self.config.normalization_factors
+
         if self.config.scaling_type == "mean_std_scaling":
-            field_mean = self.config.volume_factors[0]
-            field_std = self.config.volume_factors[1]
+            field_mean = factors["mean"]
+            field_std = factors["std"]
             fields = unstandardize(fields, field_mean, field_std)
         elif self.config.scaling_type == "min_max_scaling":
-            field_min = self.config.volume_factors[1]
-            field_max = self.config.volume_factors[0]
+            field_min = factors["min"]
+            field_max = factors["max"]
             fields = unnormalize(fields, field_max, field_min)
+
+        if air_density is not None and stream_velocity is not None:
+            fields = fields * air_density * stream_velocity**2
 
         return fields
 
@@ -549,7 +551,7 @@ class TransolverDataPipe(Dataset):
                 self.dataset.output_device
             )
 
-        if self.config.volume_sample_from_disk:
+        if self.config.model_type == "volume" and self.config.volume_sample_from_disk:
             # We deliberately double the data to read compared to the sampling size:
             self.dataset.set_volume_sampling_size(25 * self.config.resolution)
 
@@ -673,6 +675,7 @@ def create_transolver_dataset(
         "reference_origin",
         "scale_invariance",
         "reference_scale",
+        "return_mesh_features",
     ]
 
     for optional_key in optional_cfg_keys:
