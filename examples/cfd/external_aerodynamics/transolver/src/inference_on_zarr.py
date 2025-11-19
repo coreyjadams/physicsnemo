@@ -40,7 +40,7 @@ from physicsnemo.datapipes.cae.transolver_datapipe import (
     create_transolver_dataset,
     TransolverDataPipe,
 )
-from train import forward_pass
+from train import forward_passX
 from tabulate import tabulate
 
 # import transformer_engine.pytorch as te
@@ -162,7 +162,7 @@ def batched_inference_loop(
             local_batch["geometry"] = batch["geometry"]
 
         # Run the forward inference pass:
-        local_loss, local_metrics, local_preds_targets = forward_pass(
+        local_loss, local_metrics, local_preds_targets = forward_passX(
             local_batch,
             model,
             precision,
@@ -309,7 +309,7 @@ def inference(cfg: DictConfig) -> None:
             pred_pressure = pred_pressure.reshape(-1)
             pred_drag_coeff, _, _ = compute_force_coefficients(
                 batch["surface_normals"][0],
-                batch["surface_areas"],
+                batch["surface_areas"][0],
                 coeff,
                 pred_pressure,
                 pred_shear,
@@ -318,7 +318,7 @@ def inference(cfg: DictConfig) -> None:
 
             pred_lift_coeff, _, _ = compute_force_coefficients(
                 batch["surface_normals"][0],
-                batch["surface_areas"],
+                batch["surface_areas"][0],
                 coeff,
                 pred_pressure,
                 pred_shear,
@@ -333,7 +333,7 @@ def inference(cfg: DictConfig) -> None:
             true_pressure = true_pressure.reshape(-1)
             true_drag_coeff, _, _ = compute_force_coefficients(
                 batch["surface_normals"][0],
-                batch["surface_areas"],
+                batch["surface_areas"][0],
                 coeff,
                 true_pressure,
                 true_shear,
@@ -342,7 +342,7 @@ def inference(cfg: DictConfig) -> None:
 
             true_lift_coeff, _, _ = compute_force_coefficients(
                 batch["surface_normals"][0],
-                batch["surface_areas"],
+                batch["surface_areas"][0],
                 coeff,
                 true_pressure,
                 true_shear,
@@ -351,6 +351,9 @@ def inference(cfg: DictConfig) -> None:
 
             pred_lift_coeff = pred_lift_coeff.item()
             pred_drag_coeff = pred_drag_coeff.item()
+
+            true_lift_coeff = true_lift_coeff.item()
+            true_drag_coeff = true_drag_coeff.item()
 
             # Extract metric values and convert tensors to floats
             l2_pressure = (
@@ -431,7 +434,7 @@ def inference(cfg: DictConfig) -> None:
         )
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="train_surface")
+@hydra.main(version_base=None, config_path="conf", config_name="train_surfaceX")
 def launch(cfg: DictConfig) -> None:
     """
     Launch inference with Hydra configuration.

@@ -103,7 +103,7 @@ def compute_mean_std_min_max(
     return mean, std, min_val, max_val
 
 
-@hydra.main(version_base="1.3", config_path="conf", config_name="train_surface")
+@hydra.main(version_base="1.3", config_path="conf", config_name="train_surfaceX")
 def main(cfg: DictConfig) -> None:
     """
     Script entry point for computing normalization statistics for a specified field

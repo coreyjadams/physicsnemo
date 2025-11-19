@@ -32,7 +32,7 @@ SOFTWARE.
 
 from dataclasses import dataclass
 
-import torch
+import torch, math
 import torch.nn as nn
 from einops import rearrange
 
@@ -52,6 +52,8 @@ from .Physics_Attention import (
     gumbel_softmax,
 )
 from .transolver import MLP
+from physicsnemo.models.layers import BQWarp, fourier_encode, Mlp
+import torch.nn.functional as F
 
 ACTIVATION = {
     "gelu": nn.GELU,
@@ -433,6 +435,83 @@ class ContextProjector(nn.Module):
         return slice_tokens
 
 
+class GeoConvOut(nn.Module):
+    """
+    Geometry layer to project STL geometry data onto regular grids.
+    """
+
+    def __init__(
+        self,
+        input_features: int,
+        neighbors_in_radius: int,
+        base_neurons: int,
+        fourier_features: bool,
+        num_modes: int,
+    ):
+        """
+        Initialize the GeoConvOut layer.
+
+        Args:
+            input_features: Number of input feature dimensions
+            neighbors_in_radius: Number of neighbors in radius
+        """
+        super().__init__()
+        self.base_neurons = base_neurons
+        self.fourier_features = fourier_features
+        self.num_modes = num_modes
+
+        if self.fourier_features:
+            input_features_calculated = (
+                input_features * (1 + 2 * self.num_modes) * neighbors_in_radius
+            )
+        else:
+            input_features_calculated = input_features * neighbors_in_radius
+
+        self.mlp = Mlp(
+            in_features=input_features_calculated,
+            hidden_features=[base_neurons, base_neurons // 2],
+            out_features=base_neurons,
+            act_layer=nn.GELU,
+            drop=0.0,
+        )
+
+        self.activation = nn.GELU
+
+        self.neighbors_in_radius = neighbors_in_radius
+
+        if self.fourier_features:
+            self.register_buffer(
+                "freqs", torch.exp(torch.linspace(0, math.pi, self.num_modes))
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Process and project geometric features onto a 3D grid.
+
+        Args:
+            x: Input tensor containing coordinates of the neighboring points
+               (batch_size, n_points, n_neighbors, 3)
+            
+        Returns:
+            Processed geometry features of shape (batch_size, n_points, n_neighbors, base_neurons)
+        """
+
+        b, n_points, n_neighbors, c = x.shape
+        x = rearrange(
+            x, "b x y z -> b x (y z)", x=n_points, y=n_neighbors, z=c
+        )
+        if self.fourier_features:
+            facets = torch.cat((x, fourier_encode(x, self.freqs)), axis=-1)
+        else:
+            facets = x
+
+        x = F.tanh(self.mlp(facets))
+
+        return x
+
 class TransolverX(Module):
     """
     Transolver model, adapted from original transolver code.
@@ -512,6 +591,14 @@ class TransolverX(Module):
         Whether to include time embeddings. Default is false
     plus: bool
         Use Transolver++ implementation in the Physics Attention layers.
+    include_local_features: bool
+        Whether to include local features. Default is false
+    radii: list[float]
+        The radii for the local features. Default is [0.05, 0.25]
+    neighbors_in_radius: list[int]
+        The neighbors in radius for the local features. Default is [8, 32]
+    n_hidden_local: int
+        The hidden dimension for the local features. Default is 512
 
     """
 
@@ -531,9 +618,15 @@ class TransolverX(Module):
         use_te: bool = True,
         time_input: bool = False,
         plus: bool = False,
+        include_local_features: bool = False,
+        radii: list[float] = [0.05, 0.25],
+        neighbors_in_radius: list[int] = [8, 32],
+        n_hidden_local: int = 512,
     ) -> None:
         super().__init__(meta=MetaData())
         self.__name__ = "Transolver"
+
+        self.include_local_features = include_local_features
 
         self.use_te = use_te
         # Check that the hidden dimension and head dimensions are compatible:
@@ -544,7 +637,40 @@ class TransolverX(Module):
 
         # These are to project geometry embeddings and global embeddings onto
         # a physical state space:
+
         context_dim = 0
+        if geometry_dim is not None and self.include_local_features:
+            self.radii = [0.05, 0.25]
+            self.neighbors_in_radius = [8, 32]
+            self.bq_warp = nn.ModuleList()
+            self.geo_conv_out = nn.ModuleList()
+            self.geometry_features_tokenizer = nn.ModuleList()
+
+            for h in range(len(self.radii)):
+                self.bq_warp.append(BQWarp(
+                    radius=radii[h],
+                    neighbors_in_radius=neighbors_in_radius[h],
+                ))
+
+                self.geo_conv_out.append(GeoConvOut(
+                    input_features=geometry_dim,
+                    neighbors_in_radius=neighbors_in_radius[h],
+                    base_neurons=n_hidden_local,
+                    fourier_features=False,
+                    num_modes=1,
+                ))
+                
+                self.geometry_features_tokenizer.append(ContextProjector(
+                    n_hidden_local,
+                    n_head,
+                    n_hidden // n_head,
+                    dropout,
+                    slice_num,
+                    use_te,
+                    plus,
+                ))
+                context_dim += n_hidden // n_head
+        
         if geometry_dim is not None:
             self.geometry_tokenizer = ContextProjector(
                 geometry_dim,
@@ -644,6 +770,12 @@ class TransolverX(Module):
         global_context_input = []
 
         if geometry is not None:
+            if self.include_local_features:
+                for h in range(len(self.radii)):
+                    mapping, k_short = self.bq_warp[h](geometry, geometry)
+                    geometry_features = self.geo_conv_out[h](k_short)
+                    geometry_states = self.geometry_features_tokenizer[h](geometry_features)
+                    global_context_input.append(geometry_states)
             geometry_states = self.geometry_tokenizer(geometry)
             global_context_input.append(geometry_states)
 

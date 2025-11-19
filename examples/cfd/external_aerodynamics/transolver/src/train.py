@@ -17,7 +17,6 @@
 import os
 import time
 from pathlib import Path
-from typing import Literal
 
 import torch
 import hydra
@@ -37,7 +36,6 @@ from physicsnemo.utils.profiling import profile, Profiler
 
 from physicsnemo.datapipes.cae.transolver_datapipe import (
     create_transolver_dataset,
-    TransolverDataPipe,
 )
 from loss import loss_fn
 from metrics import metrics_fn
@@ -54,6 +52,19 @@ from torch.amp import autocast, GradScaler
 
 from torch.optim import Optimizer
 from typing import Any, Callable, Sequence
+import typing
+import collections
+from typing import Literal
+
+torch.serialization.add_safe_globals([omegaconf.listconfig.ListConfig])
+torch.serialization.add_safe_globals([omegaconf.base.ContainerMetadata])
+torch.serialization.add_safe_globals([typing.Any])
+torch.serialization.add_safe_globals([list])
+torch.serialization.add_safe_globals([collections.defaultdict])
+torch.serialization.add_safe_globals([dict])
+torch.serialization.add_safe_globals([int])
+torch.serialization.add_safe_globals([omegaconf.nodes.AnyNode])
+torch.serialization.add_safe_globals([omegaconf.base.Metadata])
 
 
 class CombinedOptimizer(Optimizer):
@@ -153,11 +164,7 @@ def cast_precisions(*tensors: torch.Tensor, precision: str) -> list[torch.Tensor
     return tensors
 
 
-def pad_input_for_fp8(
-    features: torch.Tensor,
-    embeddings: torch.Tensor,
-    geometry: torch.Tensor | None = None,
-) -> torch.Tensor:
+def pad_input_for_fp8(features: torch.Tensor, embeddings: torch.Tensor) -> torch.Tensor:
     """
     Pads the input features tensor so that the concatenated feature and embedding dimension is a multiple of 16,
     which is required for FP8 operations.  Only the features is updated.
@@ -175,14 +182,7 @@ def pad_input_for_fp8(
         features = torch.nn.functional.pad(features, (0, pad_size))
         fx_dim = features.shape[-1] + embeddings.shape[-1]
 
-    if geometry is not None:
-        geometry_dim = geometry.shape[-1] if geometry is not None else 0
-        if geometry_dim % 16 != 0:
-            pad_size = 16 - (geometry_dim % 16)
-            geometry = torch.nn.functional.pad(geometry, (0, pad_size))
-            geometry_dim = geometry.shape[-1]
-
-    return features, geometry
+    return features
 
 
 def unpad_output_for_fp8(
@@ -210,8 +210,8 @@ def forward_pass(
     precision: str,
     output_pad_size: int | None,
     dist_manager: DistributedManager,
-    data_mode: Literal["surface", "volume"],
-    datapipe: TransolverDataPipe,
+    cfg: DictConfig,
+    norm_factors: dict[str, torch.Tensor],
 ):
     """
     Run the forward pass of the model for one batch, including metrics and loss calculation.
@@ -223,43 +223,62 @@ def forward_pass(
 
     # Cast precisions:
     features, embeddings = cast_precisions(features, embeddings, precision=precision)
-
-    if "geometry" in batch.keys():
-        (geometry,) = cast_precisions(batch["geometry"], precision=precision)
-    else:
-        geometry = None
-
     with get_autocast_context(precision):
         # For fp8, we may have to pad the inputs:
         if precision == "float8":
-            features, geometry = pad_input_for_fp8(features, embeddings, geometry)
+            features = pad_input_for_fp8(features, embeddings)
 
-        if "geometry" in batch.keys():
-            outputs = model(
-                global_embedding=features, local_embedding=embeddings, geometry=geometry
-            )
-        else:
-            outputs = model(fx=features, embedding=embeddings)
+        outputs = model(features, embeddings)
+
+        outputs = unpad_output_for_fp8(outputs, output_pad_size)
+
+        loss = loss_fn(outputs, targets, cfg.data.mode)
+
+    metrics = metrics_fn(outputs, targets, dist_manager, cfg.data.mode)
+
+    return loss, metrics
+
+
+def forward_passX(
+    batch: dict,
+    model: torch.nn.Module,
+    precision: str,
+    output_pad_size: int | None,
+    dist_manager: DistributedManager,
+    data_mode: Literal["surface", "volume"],
+    norm_factors: dict[str, torch.Tensor],
+):
+    """
+    Run the forward pass of the model for one batch, including metrics and loss calculation.
+    """
+
+    features = batch["fx"]
+    embeddings = batch["embeddings"]
+    targets = batch["fields"]
+    geometry = batch["geometry"]
+
+    # Cast precisions:
+    features, embeddings, geometry = cast_precisions(
+        features, embeddings, geometry, precision=precision
+    )
+    with get_autocast_context(precision):
+        # For fp8, we may have to pad the inputs:
+        # if precision == "float8":
+        #     features = pad_input_for_fp8(features, embeddings)
+
+        outputs = model(
+            local_embedding=embeddings,
+            global_embedding=features,
+            geometry=geometry,
+        )
 
         outputs = unpad_output_for_fp8(outputs, output_pad_size)
 
         loss = loss_fn(outputs, targets, data_mode)
 
-    air_density = batch["air_density"] if "air_density" in batch.keys() else None
-    stream_velocity = (
-        batch["stream_velocity"] if "stream_velocity" in batch.keys() else None
-    )
+    metrics = metrics_fn(outputs, targets, dist_manager, data_mode)
 
-    unscaled_outputs = datapipe.unscale_model_targets(
-        outputs, air_density=air_density, stream_velocity=stream_velocity
-    )
-    unscaled_targets = datapipe.unscale_model_targets(
-        targets, air_density=air_density, stream_velocity=stream_velocity
-    )
-
-    metrics = metrics_fn(unscaled_outputs, unscaled_targets, dist_manager, data_mode)
-
-    return loss, metrics, (unscaled_outputs, unscaled_targets)
+    return loss, metrics, [outputs, targets]
 
 
 @profile
@@ -275,6 +294,7 @@ def train_epoch(
     epoch: int,
     cfg: DictConfig,
     dist_manager: DistributedManager,
+    norm_factors: dict[str, torch.Tensor],
     scaler: GradScaler | None = None,
 ) -> float:
     """
@@ -292,6 +312,7 @@ def train_epoch(
         epoch (int): Current epoch number.
         cfg (DictConfig): Hydra configuration object.
         dist_manager (DistributedManager): Distributed manager from physicsnemo.
+        norm_factors (dict[str, torch.Tensor]): Normalization factors for the data.
         scaler (GradScaler | None, optional): Gradient scaler for mixed precision training.
     Returns:
         float: The average training loss for the epoch.
@@ -305,16 +326,26 @@ def train_epoch(
 
     for i, batch in enumerate(dataloader):
         # TransolverX has a different forward pass:
-
-        loss, metrics, _ = forward_pass(
-            batch,
-            model,
-            precision,
-            output_pad_size,
-            dist_manager,
-            cfg.data.mode,
-            dataloader,
-        )
+        if "geometry" in batch.keys():
+            loss, metrics, local_preds_targets = forward_passX(
+                batch,
+                model,
+                precision,
+                output_pad_size,
+                dist_manager,
+                cfg.data.mode,
+                norm_factors,
+            )
+        else:
+            loss, metrics = forward_pass(
+                batch,
+                model,
+                precision,
+                output_pad_size,
+                dist_manager,
+                cfg,
+                norm_factors,
+            )
 
         optimizer.zero_grad()
         if precision == "float16" and scaler is not None:
@@ -395,6 +426,7 @@ def val_epoch(
     epoch: int,
     cfg: DictConfig,
     dist_manager: DistributedManager,
+    norm_factors: dict[str, torch.Tensor],
 ) -> float:
     """
     Run validation for one epoch.
@@ -409,6 +441,7 @@ def val_epoch(
         epoch (int): Current epoch number.
         cfg (DictConfig): Hydra configuration object.
         dist_manager (DistributedManager): Distributed manager instance.
+        norm_factors (dict[str, torch.Tensor]): Normalization factors for the data.
     Returns:
         float: The average validation loss for the epoch.
     """
@@ -422,15 +455,27 @@ def val_epoch(
     start_time = time.time()
     with torch.no_grad():  # Disable gradient computation
         for i, batch in enumerate(dataloader):
-            loss, metrics, _ = forward_pass(
-                batch,
-                model,
-                precision,
-                output_pad_size,
-                dist_manager,
-                cfg.data.mode,
-                dataloader,
-            )
+            # TransolverX has a different forward pass:
+            if "geometry" in batch.keys():
+                loss, metrics, local_preds_targets = forward_passX(
+                    batch,
+                    model,
+                    precision,
+                    output_pad_size,
+                    dist_manager,
+                    cfg.data.mode,
+                    norm_factors,
+                )
+            else:
+                loss, metrics = forward_pass(
+                    batch,
+                    model,
+                    precision,
+                    output_pad_size,
+                    dist_manager,
+                    cfg,
+                    norm_factors,
+                )
 
             if i == 0:
                 total_metrics = metrics
@@ -700,6 +745,7 @@ def main(cfg: DictConfig):
                 epoch,
                 cfg,
                 dist_manager,
+                norm_factors,
                 scaler,
             )
             end_time = time.time()
@@ -717,6 +763,7 @@ def main(cfg: DictConfig):
                 epoch,
                 cfg,
                 dist_manager,
+                norm_factors,
             )
             end_time = time.time()
             val_duration = end_time - start_time
@@ -736,7 +783,7 @@ def main(cfg: DictConfig):
     logger.info("Training completed!")
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="train_surface")
+@hydra.main(version_base=None, config_path="conf", config_name="train_volumeX")
 def launch(cfg: DictConfig):
     """Launch training with hydra configuration
 

@@ -18,12 +18,12 @@
 
 output_dir: "runs"
 checkpoint_dir: null  # Optional: set custom checkpoint path, defaults to output_dir
-run_id: "surfaceX/bfloat16"
+run_id: "surfaceX/runs1"
 profile: false
 
 # Training configuration
 training:
-  precision: bfloat16 # float32, float16, bfloat16, or float8
+  precision: float32 # float32, float16, bfloat16, or float8
   num_epochs: 501 # Add one to save at 250
   save_interval: 25  # Save checkpoint every N epochs
   compile: false
@@ -44,7 +44,10 @@ model:
   slice_num: 512     # Number of slices in physics attention
   use_te: false     # Use transformer engine
   plus: false
-
+  include_local_features: true # use local features
+  radii: [0.05, 0.25] # radius for local features
+  neighbors_in_radius: [8, 32] # neighbors in radius for local features
+  n_hidden_local: 512 # hidden dimension for local features
 
 # StepLR scheduler: Decays the learning rate by gamma every step_size epochs
 scheduler:
@@ -65,14 +68,14 @@ optimizer:
 # Data configuration
 data:
   train:
-    data_path: /lustre/fsw/portfolios/coreai/projects/coreai_modulus_cae/drivaer_aws/domino/train/
+    data_path: /lustre/fsw/portfolios/coreai/projects/coreai_modulus_cae/datasets/drivaer_aws/domino/train/
   val:
-    data_path: /lustre/fsw/portfolios/coreai/projects/coreai_modulus_cae/drivaer_aws/domino/val/
+    data_path: /lustre/fsw/portfolios/coreai/projects/coreai_modulus_cae/datasets/drivaer_aws/domino/val/
   max_workers: 8
   normalization_dir: "src/"  # Directory for normalization files
   preload_depth: 1
   pin_memory: true
-  resolution: 300_000
+  resolution: 80_000
   mode: surface
   # Preprocessing switches:
   # (Changing thes will change the embedding dim)
