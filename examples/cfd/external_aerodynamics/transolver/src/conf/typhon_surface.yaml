@@ -17,7 +17,7 @@
 defaults:
   - training: base
   - model: typhon
-  - datapipe: surface
+  - data: surface
 
 output_dir: "runs"
 checkpoint_dir: null  # Optional: set custom checkpoint path, defaults to output_dir
@@ -31,7 +31,7 @@ profile: false
 model:
   functional_dim: 6
 
-datapipe:
+data:
   include_sdf: false
   include_geometry: true
   geometry_sampling: 300_000
