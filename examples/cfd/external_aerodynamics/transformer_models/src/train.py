@@ -356,47 +356,6 @@ def forward_pass(
     )
     all_metrics.update(metrics)
 
-    # if "geometry" in batch.keys():
-    #     print(f"HERE")
-    #     unscaled_outputs = []
-    #     unscaled_targets = []
-    #     for i in range(len(outputs)):
-    #         local_unscaled_outputs = datapipe.unscale_model_targets(
-    #             outputs[i],
-    #             air_density=air_density,
-    #             stream_velocity=stream_velocity,
-    #             factor_type=modes[i],
-    #         )
-    #         local_unscaled_targets = datapipe.unscale_model_targets(
-    #             targets[i],
-    #             air_density=air_density,
-    #             stream_velocity=stream_velocity,
-    #             factor_type=modes[i],
-    #         )
-    #         print(f"local_unscaled_outputs: {local_unscaled_outputs.shape}")
-    #         print(f"local_unscaled_targets: {local_unscaled_targets.shape}")
-    #         metrics = metrics_fn(local_unscaled_outputs, local_unscaled_targets, dist_manager, modes[i])
-    #         print(f"metrics: {metrics}")
-    #         all_metrics.update(metrics)
-    #         unscaled_outputs.append(local_unscaled_outputs)
-    #         unscaled_targets.append(local_unscaled_targets)
-    # else:
-    #     unscaled_outputs = datapipe.unscale_model_targets(
-    #         outputs,
-    #         air_density=air_density,
-    #         stream_velocity=stream_velocity,
-    #         factor_type=modes[0],
-    #     )
-    #     unscaled_targets = datapipe.unscale_model_targets(
-    #         targets,
-    #         air_density=air_density,
-    #         stream_velocity=stream_velocity,
-    #         factor_type=modes[0],
-    #     )
-
-    #     metrics = metrics_fn(unscaled_outputs, unscaled_targets, dist_manager, modes[0])
-    #     all_metrics.update(metrics)
-
     return full_loss, all_metrics, (unscaled_outputs, unscaled_targets)
 
 
@@ -450,7 +409,7 @@ def train_epoch(
             precision,
             output_pad_size,
             dist_manager,
-            cfg.datapipe.mode,
+            cfg.data.mode,
             dataloader,
         )
 
@@ -566,7 +525,7 @@ def val_epoch(
                 precision,
                 output_pad_size,
                 dist_manager,
-                cfg.datapipe.mode,
+                cfg.data.mode,
                 dataloader,
             )
 
@@ -714,8 +673,8 @@ def main(cfg: DictConfig):
     logger.info(f"Number of parameters: {num_params}")
 
     # Load the normalization file from configured directory (defaults to current dir)
-    norm_dir = getattr(cfg.datapipe, "normalization_dir", ".")
-    if cfg.datapipe.mode == "surface" or cfg.datapipe.mode == "combined":
+    norm_dir = getattr(cfg.data, "normalization_dir", ".")
+    if cfg.data.mode == "surface" or cfg.data.mode == "combined":
         norm_file = str(Path(norm_dir) / "surface_fields_normalization.npz")
         norm_data = np.load(norm_file)
         surface_factors = {
@@ -725,7 +684,7 @@ def main(cfg: DictConfig):
     else:
         surface_factors = None
 
-    if cfg.datapipe.mode == "volume" or cfg.datapipe.mode == "combined":
+    if cfg.data.mode == "volume" or cfg.data.mode == "combined":
         norm_file = str(Path(norm_dir) / "volume_fields_normalization.npz")
         norm_data = np.load(norm_file)
         volume_factors = {
@@ -737,7 +696,7 @@ def main(cfg: DictConfig):
 
     # Training dataset
     train_dataloader = create_transolver_dataset(
-        cfg.datapipe,
+        cfg.data,
         phase="train",
         surface_factors=surface_factors,
         volume_factors=volume_factors,
@@ -746,7 +705,7 @@ def main(cfg: DictConfig):
     # Validation dataset
 
     val_dataloader = create_transolver_dataset(
-        cfg.datapipe,
+        cfg.data,
         phase="val",
         surface_factors=surface_factors,
         volume_factors=volume_factors,
