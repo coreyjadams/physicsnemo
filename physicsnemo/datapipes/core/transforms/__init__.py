@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Transforms module - Operations on Samples.
+
+Transforms are composable operations that take a Sample and return a modified Sample.
+They are designed for GPU preprocessing
+"""
+
+from physicsnemo.datapipes.core.transforms.base import Transform
+from physicsnemo.datapipes.core.transforms.compose import Compose
+
+# NOTE: Downsample and ToDevice transforms are not yet implemented
+# from physicsnemo.datapipes.core.transforms.downsample import Downsample
+# from physicsnemo.datapipes.core.transforms.to_device import ToDevice, cpu, cuda
+from physicsnemo.datapipes.core.transforms.field_processing import (
+    BroadcastGlobalFeatures,
+)
+from physicsnemo.datapipes.core.transforms.field_slice import FieldSlice
+from physicsnemo.datapipes.core.transforms.geometric import (
+    ComputeNormals,
+    ComputeSDF,
+    ReScale,
+    Translate,
+)
+from physicsnemo.datapipes.core.transforms.normalize import Normalize
+from physicsnemo.datapipes.core.transforms.spatial import (
+    BoundingBoxFilter,
+    CenterOfMass,
+    CreateGrid,
+    KNNNeighbors,
+)
+from physicsnemo.datapipes.core.transforms.subsample import (
+    SubsamplePoints,
+    poisson_sample_indices_fixed,
+    shuffle_array,
+)
+
+__all__ = [
+    # Base
+    "Transform",
+    "Compose",
+    # Existing transforms
+    "Normalize",
+    # "Downsample",  # Not yet implemented
+    # "ToDevice",  # Not yet implemented
+    # "cuda",  # Not yet implemented
+    # "cpu",  # Not yet implemented
+    # Subsampling
+    "SubsamplePoints",
+    "poisson_sample_indices_fixed",
+    "shuffle_array",
+    # Geometric
+    "ComputeSDF",
+    "ComputeNormals",
+    "Translate",
+    "ReScale",
+    # Field processing
+    "FieldSlice",
+    "BroadcastGlobalFeatures",
+    # Spatial
+    "BoundingBoxFilter",
+    "CreateGrid",
+    "KNNNeighbors",
+    "CenterOfMass",
+]
