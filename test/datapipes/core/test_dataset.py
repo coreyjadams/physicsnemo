@@ -135,7 +135,7 @@ def test_dataset_to_device_transform(numpy_data_dir):
     reader = dp.NumpyReader(numpy_data_dir, pin_memory=True)
     dataset = dp.Dataset(
         reader,
-        transforms=dp.ToDevice("cuda"),
+        device="cuda:0",
     )
 
     data, metadata = dataset[0]
@@ -220,7 +220,7 @@ def test_prefetch_with_stream(numpy_data_dir):
     reader = dp.NumpyReader(numpy_data_dir, pin_memory=True)
     dataset = dp.Dataset(
         reader,
-        transforms=dp.ToDevice("cuda"),
+        device="cuda:0",
     )
 
     stream = torch.cuda.Stream()

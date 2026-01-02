@@ -177,10 +177,7 @@ def test_prefetch_enabled(numpy_data_dir):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_prefetch_with_streams(numpy_data_dir):
     reader = dp.NumpyReader(numpy_data_dir, pin_memory=True)
-    dataset = dp.Dataset(
-        reader,
-        transforms=dp.ToDevice("cuda"),
-    )
+    dataset = dp.Dataset(reader, device="cuda:0")
     loader = dp.DataLoader(
         dataset,
         batch_size=2,
@@ -372,8 +369,8 @@ def test_gpu_training_loop(numpy_data_dir):
     reader = dp.NumpyReader(numpy_data_dir, pin_memory=True)
     dataset = dp.Dataset(
         reader,
+        device="cuda:0",
         transforms=[
-            dp.ToDevice("cuda"),
             dp.Normalize(
                 input_keys=["positions"],
                 method="mean_std",
