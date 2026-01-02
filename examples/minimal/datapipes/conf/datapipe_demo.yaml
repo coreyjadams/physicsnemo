@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Datapipe Demo Configuration
+# This demonstrates the same functionality as datapipe_python_configuration.py
+# but configured entirely via Hydra YAML.
+
+defaults:
+  - reader: tensorstore_zarr
+  - transforms: normalize
+  - _self_
+
+# Reader configuration overrides
+reader:
+  path: ./variable_size_data/zarr/
+  group_pattern: "*.zarr"
+  # Coordinated subsampling: reads contiguous chunks from large tensors
+  coordinated_subsampling:
+    n_points: 10000
+    target_keys:
+      - features
+      - coords
+
+# Dataset configuration
+dataset:
+  _target_: physicsnemo.datapipes.core.Dataset
+  reader: ${reader}
+  transforms: ${transforms}
+
+# DataLoader configuration
+dataloader:
+  _target_: physicsnemo.datapipes.core.DataLoader
+  dataset: ${dataset}
+  batch_size: 5
