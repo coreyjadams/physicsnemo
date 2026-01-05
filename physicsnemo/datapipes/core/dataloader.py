@@ -19,7 +19,8 @@ DataLoader - Batched iteration over datasets with prefetching.
 
 The DataLoader orchestrates efficient batch loading by leveraging
 the Dataset's prefetching capabilities with CUDA streams.
-Returns batched (TensorDict, list[dict]) tuples.
+By default, returns batched TensorDict for PyTorch DataLoader compatibility.
+When collate_metadata=True, returns (TensorDict, list[dict]) tuples.
 """
 
 from __future__ import annotations
@@ -86,6 +87,7 @@ class DataLoader:
                 ],
             ]
         ] = None,
+        collate_metadata: bool = False,
         prefetch_factor: int = 2,
         num_streams: int = 4,
         use_streams: bool = True,
@@ -100,6 +102,9 @@ class DataLoader:
             sampler: Custom sampler for index generation. If provided, shuffle is ignored.
             drop_last: If True, drop the last incomplete batch.
             collate_fn: Function to collate samples into batches. Defaults to stacking.
+            collate_metadata: If True, collate metadata into a list of dicts (default: False).
+                             Set to False for compatibility with PyTorch DataLoader.
+                             Only used when collate_fn is None (uses default collator).
             prefetch_factor: Number of batches to prefetch ahead (default: 2).
                             Set to 0 to disable prefetching.
             num_streams: Number of CUDA streams for prefetching (default: 4).
@@ -129,7 +134,7 @@ class DataLoader:
             self.sampler = SequentialSampler(dataset)
 
         # Handle collation
-        self.collate_fn = get_collator(collate_fn)
+        self.collate_fn = get_collator(collate_fn, collate_metadata=collate_metadata)
 
         # Create CUDA streams for prefetching
         self._streams: list[torch.cuda.Stream] = []
@@ -156,7 +161,9 @@ class DataLoader:
         if batch and not self.drop_last:
             yield batch
 
-    def __iter__(self) -> Iterator[tuple[TensorDict, list[dict[str, Any]]]]:
+    def __iter__(
+        self,
+    ) -> Iterator[Union[TensorDict, tuple[TensorDict, list[dict[str, Any]]]]]:
         """
         Iterate over batches.
 
@@ -164,20 +171,25 @@ class DataLoader:
         GPU transfers, and computation.
 
         Yields:
-            Tuple of (batched TensorDict, list of metadata dicts).
+            Batched TensorDict if collate_metadata=False (default),
+            or tuple of (batched TensorDict, list of metadata dicts) if collate_metadata=True.
         """
         if self.prefetch_factor > 0 and self.use_streams:
             yield from self._iter_prefetch()
         else:
             yield from self._iter_simple()
 
-    def _iter_simple(self) -> Iterator[tuple[TensorDict, list[dict[str, Any]]]]:
+    def _iter_simple(
+        self,
+    ) -> Iterator[Union[TensorDict, tuple[TensorDict, list[dict[str, Any]]]]]:
         """Simple synchronous iteration without prefetching."""
         for batch_indices in self._generate_batches():
             samples = [self.dataset[idx] for idx in batch_indices]
             yield self.collate_fn(samples)
 
-    def _iter_prefetch(self) -> Iterator[tuple[TensorDict, list[dict[str, Any]]]]:
+    def _iter_prefetch(
+        self,
+    ) -> Iterator[Union[TensorDict, tuple[TensorDict, list[dict[str, Any]]]]]:
         """
         Iteration with stream-based prefetching.
 

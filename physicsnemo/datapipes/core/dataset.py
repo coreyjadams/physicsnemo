@@ -136,6 +136,10 @@ class Dataset:
                 f"got {type(transforms).__name__}"
             )
 
+        # Share device with transforms so their internal state is on the right device
+        if self.target_device is not None and self.transforms is not None:
+            self.transforms.to(self.target_device)
+
         # Prefetch state - using thread-safe dict for results
         # Key: index, Value: Future[_PrefetchResult]
         self._prefetch_futures: dict[int, Future[_PrefetchResult]] = {}
@@ -329,10 +333,19 @@ class Dataset:
 
     def close(self) -> None:
         """Close the dataset and stop prefetching."""
+        # Wait for any in-flight prefetch tasks to complete before shutdown.
+        # This prevents "cannot schedule new futures after shutdown" errors
+        # from libraries like zarr that use async I/O internally.
+        for future in self._prefetch_futures.values():
+            try:
+                future.result(timeout=30.0)  # Wait up to 30s per task
+            except Exception:  # noqa: BLE001, S110
+                pass  # Ignore errors during shutdown
+
         self._prefetch_futures.clear()
 
         if self._executor is not None:
-            self._executor.shutdown(wait=False)
+            self._executor.shutdown(wait=True)
             self._executor = None
 
         self.reader.close()

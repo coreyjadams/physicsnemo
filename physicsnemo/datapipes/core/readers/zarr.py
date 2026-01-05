@@ -78,6 +78,7 @@ class ZarrReader(Reader):
         pin_memory: bool = False,
         include_index_in_metadata: bool = True,
         coordinated_subsampling: Optional[dict[str, Any]] = None,
+        cache_stores: bool = True,
     ) -> None:
         """
         Initialize the Zarr reader.
@@ -96,6 +97,9 @@ class ZarrReader(Reader):
             coordinated_subsampling: Optional dict to configure coordinated
                 subsampling. If provided, must contain ``n_points`` (int) and
                 ``target_keys`` (list of str).
+            cache_stores: If True (default), cache opened zarr stores to avoid
+                repeated opening and prevent executor shutdown errors. Set to
+                False if memory is a concern with many groups.
 
         Raises:
             ImportError: If zarr is not installed.
@@ -117,6 +121,8 @@ class ZarrReader(Reader):
         self._user_fields = fields
         self.default_values = default_values or {}
         self.group_pattern = group_pattern
+        self._cache_stores = cache_stores
+        self._cached_stores: dict[Path, Any] = {}  # Cache for opened zarr stores
 
         if not self.path.exists():
             raise FileNotFoundError(f"Path not found: {self.path}")
@@ -178,6 +184,26 @@ class ZarrReader(Reader):
             return self._user_fields
         return self._available_fields
 
+    def _open_zarr_store(self, path: Path) -> Any:
+        """
+        Open a zarr store, using cache if enabled.
+
+        This prevents the "cannot schedule new futures after shutdown" error
+        by reusing opened stores instead of repeatedly calling zarr.open().
+
+        Args:
+            path: Path to the zarr group.
+
+        Returns:
+            Opened zarr group.
+        """
+        if self._cache_stores:
+            if path not in self._cached_stores:
+                self._cached_stores[path] = zarr.open(path, mode="r")
+            return self._cached_stores[path]
+        else:
+            return zarr.open(path, mode="r")
+
     def _is_zarr_group(self, path: Path) -> bool:
         """
         Check if a path is a Zarr group.
@@ -222,12 +248,12 @@ class ZarrReader(Reader):
         """Load a single sample from a Zarr group."""
         if self._single_group_mode:
             # Single group: index into first dimension of each array
-            root = zarr.open(self._groups[0], mode="r")
             group_path = self._groups[0]
+            root = self._open_zarr_store(group_path)
         else:
             # Directory mode: each group is one sample
             group_path = self._groups[index]
-            root = zarr.open(group_path, mode="r")
+            root = self._open_zarr_store(group_path)
 
         data = {}
         fields_to_load = self.fields
@@ -314,7 +340,10 @@ class ZarrReader(Reader):
         return True
 
     def close(self) -> None:
-        """Close resources."""
+        """Close resources and cached zarr stores."""
+        # Clear cached stores to allow garbage collection
+        # This helps prevent executor shutdown issues
+        self._cached_stores.clear()
         super().close()
 
     def __repr__(self) -> str:
@@ -327,6 +356,7 @@ class ZarrReader(Reader):
             f"ZarrReader("
             f"path={self.path}, "
             f"len={len(self)}, "
-            f"fields={self.fields}"
+            f"fields={self.fields}, "
+            f"cache_stores={self._cache_stores}"
             f"{subsample_info})"
         )

@@ -20,7 +20,7 @@ Script to generate synthetic data with variable number of points per sample.
 Each sample has a semi-random number of points (between min_points and max_points),
 while maintaining consistent feature dimensions across fields.
 
-Supports .npy, .npz, and zarr storage formats.
+Supports .npz, and zarr storage formats.
 """
 
 import argparse
@@ -125,54 +125,6 @@ def generate_variable_sample(
         sample_data[key] = rng.uniform(-1.0, 1.0, size=full_shape).astype(np.float32)
 
     return sample_data
-
-
-def save_npy(
-    num_samples: int,
-    point_counts: np.ndarray,
-    shapes: Dict[str, Tuple[int, ...]],
-    output_dir: Path,
-    seed: int,
-):
-    """
-    Save data as separate .npy files per sample with variable points.
-
-    Each sample is saved as a dictionary containing all fields.
-
-    Parameters
-    ----------
-    num_samples : int
-        Number of samples to generate
-    point_counts : np.ndarray
-        Array of point counts for each sample
-    shapes : Dict[str, Tuple[int, ...]]
-        Dictionary of feature dimensions for each field
-    output_dir : Path
-        Output directory
-    seed : int
-        Random seed for reproducibility
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    rng = np.random.RandomState(seed)
-
-    total_size = 0
-    for i in range(num_samples):
-        num_points = point_counts[i]
-        sample_data = generate_variable_sample(num_points, shapes, rng)
-
-        # Save to individual file
-        filepath = output_dir / f"sample_{i:06d}.npy"
-        np.save(filepath, sample_data, allow_pickle=True)
-
-        # Track size
-        total_size += sum(array.nbytes for array in sample_data.values())
-
-        if (i + 1) % 10 == 0 or i == num_samples - 1:
-            print(f"  Saved {i + 1}/{num_samples} samples...")
-
-    print(
-        f"Saved {num_samples} samples as .npy files ({total_size / 1e6:.2f} MB total)"
-    )
 
 
 def save_npz(
@@ -384,7 +336,7 @@ Examples:
         "-b",
         "--backend",
         type=str,
-        choices=["npy", "npz", "zarr"],
+        choices=["npz", "zarr"],
         default="npz",
         help="Storage backend to use (default: npz)",
     )
@@ -430,9 +382,7 @@ Examples:
     output_dir = Path(args.output)
     print(f"\nSaving data to {output_dir} using backend '{args.backend}'...")
 
-    if args.backend == "npy":
-        save_npy(args.num_samples, point_counts, shapes, output_dir, args.seed)
-    elif args.backend == "npz":
+    if args.backend == "npz":
         save_npz(args.num_samples, point_counts, shapes, output_dir, args.seed)
     elif args.backend == "zarr":
         save_zarr(args.num_samples, point_counts, shapes, output_dir, args.seed)

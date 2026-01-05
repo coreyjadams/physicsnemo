@@ -18,10 +18,12 @@
 Collation utilities - Batch multiple (TensorDict, metadata) tuples.
 
 Collators combine multiple (TensorDict, dict) tuples from Dataset into a single
-batched (TensorDict, list[dict]) tuple suitable for model consumption.
-The default collator stacks TensorDicts along batch dimension using TensorDict.stack().
+batched output suitable for model consumption. By default, returns just the
+batched TensorDict for PyTorch DataLoader compatibility. When collate_metadata=True,
+returns a tuple of (TensorDict, list[dict]).
 
-Metadata is collated by collecting values into lists.
+The default collator stacks TensorDicts along batch dimension using TensorDict.stack().
+Metadata collation is optional and disabled by default.
 """
 
 from __future__ import annotations
@@ -54,17 +56,16 @@ class Collator(ABC):
     Abstract base class for collators.
 
     Collators take a sequence of (TensorDict, dict) tuples and combine them
-    into a single batched (TensorDict, list[dict]) tuple. The base class defines
-    the interface; subclasses implement specific batching strategies.
-
-    Metadata is automatically collated into a list of dicts.
+    into a batched output. By default, returns just the batched TensorDict
+    for PyTorch DataLoader compatibility. When collate_metadata=True, returns
+    a tuple of (TensorDict, list[dict]).
 
     Example:
         >>> class MyCollator(Collator):
         ...     def __call__(
         ...         self,
         ...         samples: Sequence[tuple[TensorDict, dict]]
-        ...     ) -> tuple[TensorDict, list[dict]]:
+        ...     ) -> TensorDict:
         ...         # Custom batching logic
         ...         ...
     """
@@ -72,7 +73,7 @@ class Collator(ABC):
     @abstractmethod
     def __call__(
         self, samples: Sequence[tuple[TensorDict, dict[str, Any]]]
-    ) -> tuple[TensorDict, list[dict[str, Any]]]:
+    ) -> Union[TensorDict, tuple[TensorDict, list[dict[str, Any]]]]:
         """
         Collate a batch of samples.
 
@@ -80,7 +81,8 @@ class Collator(ABC):
             samples: Sequence of (TensorDict, metadata dict) tuples to batch.
 
         Returns:
-            Tuple of (batched TensorDict, list of metadata dicts).
+            Batched TensorDict, or tuple of (batched TensorDict, list of metadata dicts)
+            if collate_metadata=True.
         """
         raise NotImplementedError
 
@@ -97,7 +99,8 @@ class DefaultCollator(Collator):
     - Tensors with matching shapes (per key)
     - Tensors on the same device
 
-    Metadata is collated into a list of dicts.
+    By default, returns just the batched TensorDict for PyTorch DataLoader
+    compatibility. Set collate_metadata=True to also return metadata.
 
     Example:
         >>> data1 = TensorDict({"x": torch.randn(10, 3)}, device="cpu")
@@ -107,8 +110,12 @@ class DefaultCollator(Collator):
         ...     (data2, {"file": "b.h5"}),
         ... ]
         >>> collator = DefaultCollator()
-        >>> batched_data, metadata_list = collator(samples)
+        >>> batched_data = collator(samples)
         >>> batched_data["x"].shape  # torch.Size([2, 10, 3])
+        >>>
+        >>> # With metadata collation enabled:
+        >>> collator = DefaultCollator(collate_metadata=True)
+        >>> batched_data, metadata_list = collator(samples)
         >>> metadata_list  # [{"file": "a.h5"}, {"file": "b.h5"}]
     """
 
@@ -117,7 +124,7 @@ class DefaultCollator(Collator):
         *,
         stack_dim: int = 0,
         keys: Optional[list[str]] = None,
-        collate_metadata: bool = True,
+        collate_metadata: bool = False,
     ) -> None:
         """
         Initialize the collator.
@@ -125,7 +132,8 @@ class DefaultCollator(Collator):
         Args:
             stack_dim: Dimension along which to stack tensors (default: 0).
             keys: If provided, only collate these tensor keys. Others are ignored.
-            collate_metadata: If True, collate metadata into list (default: True).
+            collate_metadata: If True, collate metadata into list (default: False).
+                             Default is False for compatibility with PyTorch DataLoader.
         """
         self.stack_dim = stack_dim
         self.keys = keys
@@ -133,7 +141,7 @@ class DefaultCollator(Collator):
 
     def __call__(
         self, samples: Sequence[tuple[TensorDict, dict[str, Any]]]
-    ) -> tuple[TensorDict, list[dict[str, Any]]]:
+    ) -> Union[TensorDict, tuple[TensorDict, list[dict[str, Any]]]]:
         """
         Collate samples by stacking TensorDicts.
 
@@ -141,7 +149,8 @@ class DefaultCollator(Collator):
             samples: Sequence of (TensorDict, metadata) tuples to batch.
 
         Returns:
-            Tuple of (batched TensorDict, list of metadata dicts).
+            Batched TensorDict if collate_metadata=False (default),
+            or tuple of (batched TensorDict, list of metadata dicts) if collate_metadata=True.
 
         Raises:
             ValueError: If samples is empty or samples have mismatched keys/shapes.
@@ -151,7 +160,6 @@ class DefaultCollator(Collator):
 
         # Separate data and metadata
         data_list = [data for data, _ in samples]
-        metadata_list = [meta for _, meta in samples]
 
         # Use TensorDict.stack() for efficient batching
         if self.keys is not None:
@@ -160,13 +168,12 @@ class DefaultCollator(Collator):
 
         batched_data = torch.stack(data_list, dim=self.stack_dim)
 
-        # Collate metadata
+        # Collate metadata only if requested
         if self.collate_metadata:
-            metadata = _collate_metadata(metadata_list)
-        else:
-            metadata = []
+            metadata_list = [meta for _, meta in samples]
+            return batched_data, _collate_metadata(metadata_list)
 
-        return batched_data, metadata
+        return batched_data
 
 
 class ConcatCollator(Collator):
@@ -178,7 +185,8 @@ class ConcatCollator(Collator):
     or other variable-length data where you want to combine all points.
 
     Optionally adds batch indices to track which points came from which sample.
-    Metadata is collated into a list of dicts.
+    By default, returns just the batched TensorDict for PyTorch DataLoader
+    compatibility. Set collate_metadata=True to also return metadata.
 
     Example:
         >>> data1 = TensorDict({"points": torch.randn(100, 3)})
@@ -188,9 +196,13 @@ class ConcatCollator(Collator):
         ...     (data2, {"file": "b.h5"}),
         ... ]
         >>> collator = ConcatCollator(dim=0, add_batch_idx=True)
-        >>> batched_data, metadata_list = collator(samples)
+        >>> batched_data = collator(samples)
         >>> batched_data["points"].shape  # torch.Size([250, 3])
         >>> batched_data["batch_idx"].shape  # torch.Size([250])
+        >>>
+        >>> # With metadata collation enabled:
+        >>> collator = ConcatCollator(dim=0, add_batch_idx=True, collate_metadata=True)
+        >>> batched_data, metadata_list = collator(samples)
         >>> metadata_list  # [{"file": "a.h5"}, {"file": "b.h5"}]
     """
 
@@ -201,7 +213,7 @@ class ConcatCollator(Collator):
         add_batch_idx: bool = True,
         batch_idx_key: str = "batch_idx",
         keys: Optional[list[str]] = None,
-        collate_metadata: bool = True,
+        collate_metadata: bool = False,
     ) -> None:
         """
         Initialize the collator.
@@ -211,7 +223,8 @@ class ConcatCollator(Collator):
             add_batch_idx: If True, add a tensor of batch indices.
             batch_idx_key: Key for the batch index tensor.
             keys: If provided, only collate these tensor keys.
-            collate_metadata: If True, collate metadata into lists (default: True).
+            collate_metadata: If True, collate metadata into lists (default: False).
+                             Default is False for compatibility with PyTorch DataLoader.
         """
         self.dim = dim
         self.add_batch_idx = add_batch_idx
@@ -221,7 +234,7 @@ class ConcatCollator(Collator):
 
     def __call__(
         self, samples: Sequence[tuple[TensorDict, dict[str, Any]]]
-    ) -> tuple[TensorDict, list[dict[str, Any]]]:
+    ) -> Union[TensorDict, tuple[TensorDict, list[dict[str, Any]]]]:
         """
         Collate samples by concatenating tensors.
 
@@ -229,7 +242,8 @@ class ConcatCollator(Collator):
             samples: Sequence of (TensorDict, metadata) tuples to batch.
 
         Returns:
-            Tuple of (batched TensorDict, list of metadata dicts).
+            Batched TensorDict if collate_metadata=False (default),
+            or tuple of (batched TensorDict, list of metadata dicts) if collate_metadata=True.
 
         Raises:
             ValueError: If samples is empty.
@@ -237,9 +251,8 @@ class ConcatCollator(Collator):
         if not samples:
             raise ValueError("Cannot collate empty sequence of samples")
 
-        # Separate data and metadata
+        # Separate data
         data_list = [data for data, _ in samples]
-        metadata_list = [meta for _, meta in samples]
 
         first_data = data_list[0]
         keys = self.keys if self.keys else list(first_data.keys())
@@ -272,10 +285,12 @@ class ConcatCollator(Collator):
         # Create batched TensorDict
         batched_data = TensorDict(batched_tensors, device=device)
 
-        # Collate metadata
-        metadata = _collate_metadata(metadata_list) if self.collate_metadata else []
+        # Collate metadata only if requested
+        if self.collate_metadata:
+            metadata_list = [meta for _, meta in samples]
+            return batched_data, _collate_metadata(metadata_list)
 
-        return batched_data, metadata
+        return batched_data
 
 
 class FunctionCollator(Collator):
@@ -311,7 +326,7 @@ class FunctionCollator(Collator):
 
     def __call__(
         self, samples: Sequence[tuple[TensorDict, dict[str, Any]]]
-    ) -> tuple[TensorDict, list[dict[str, Any]]]:
+    ) -> Union[TensorDict, tuple[TensorDict, list[dict[str, Any]]]]:
         """Apply the wrapped function."""
         return self.fn(samples)
 
@@ -371,18 +386,23 @@ def get_collator(
             ],
         ]
     ] = None,
+    *,
+    collate_metadata: bool = False,
 ) -> Collator:
     """
     Get a Collator instance from various input types.
 
     Args:
         collate_fn: Collator, callable, or None (uses default).
+        collate_metadata: If True, collate metadata into list (default: False).
+                         Only used when collate_fn is None.
+                         Default is False for compatibility with PyTorch DataLoader.
 
     Returns:
         Collator instance.
     """
     if collate_fn is None:
-        return _default_collator
+        return DefaultCollator(collate_metadata=collate_metadata)
     elif isinstance(collate_fn, Collator):
         return collate_fn
     elif callable(collate_fn):

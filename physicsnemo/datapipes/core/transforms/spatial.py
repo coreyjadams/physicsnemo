@@ -23,7 +23,7 @@ filtering, grid creation, k-NN neighbor computation, and center of mass calculat
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from tensordict import TensorDict
@@ -110,7 +110,15 @@ class BoundingBoxFilter(Transform):
                 if dep_key in data:
                     updates[dep_key] = data[dep_key][ids_in_bbox]
 
-        return data.with_updates(updates)
+        return data.update(updates)
+
+    def to(self, device: Union[torch.device, str]) -> "BoundingBoxFilter":
+        """Move bounding box tensors to the specified device."""
+        super().to(device)
+        device = torch.device(device) if isinstance(device, str) else device
+        self.bbox_min = self.bbox_min.to(device)
+        self.bbox_max = self.bbox_max.to(device)
+        return self
 
     def __repr__(self) -> str:
         return (
@@ -183,7 +191,15 @@ class CreateGrid(Transform):
         # Stack into grid of shape (nx*ny*nz, 3)
         grid = torch.stack([xv.flatten(), yv.flatten(), zv.flatten()], dim=-1)
 
-        return data.with_updates({self.output_key: grid})
+        return data.update({self.output_key: grid})
+
+    def to(self, device: Union[torch.device, str]) -> "CreateGrid":
+        """Move bounding box tensors to the specified device."""
+        super().to(device)
+        device = torch.device(device) if isinstance(device, str) else device
+        self.bbox_min = self.bbox_min.to(device)
+        self.bbox_max = self.bbox_max.to(device)
+        return self
 
     def __repr__(self) -> str:
         return f"CreateGrid(output_key={self.output_key}, resolution={self.resolution})"
@@ -276,7 +292,7 @@ class KNNNeighbors(Transform):
                 neighbor_features = data[key][neighbor_indices][:, 1:]
                 updates[f"{self.output_prefix}_{key}"] = neighbor_features
 
-        return data.with_updates(updates)
+        return data.update(updates)
 
     def __repr__(self) -> str:
         return (
@@ -345,7 +361,7 @@ class CenterOfMass(Transform):
         # Ensure shape is (1, 3)
         center_of_mass = center_of_mass.unsqueeze(0)
 
-        return data.with_updates({self.output_key: center_of_mass})
+        return data.update({self.output_key: center_of_mass})
 
     def __repr__(self) -> str:
         return (

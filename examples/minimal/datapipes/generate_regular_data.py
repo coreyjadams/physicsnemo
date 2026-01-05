@@ -17,7 +17,7 @@
 """
 Script to generate synthetic data with configurable shapes and storage backends.
 
-Supports .npy, .npz, and zarr storage formats.
+Supports  .npz, and zarr storage formats.
 """
 
 import argparse
@@ -212,9 +212,6 @@ def main():
 Examples:
   # Generate 100 samples with two fields, save as .npz
   python generate_data.py -n 100 -s "velocity:64,64,64 pressure:32,32,32" -b npz -o output/
-
-  # Generate 50 samples, save as individual .npy files
-  python generate_data.py -n 50 -s "field1:100,200 field2:50,50,50" -b npy -o data/
 
   # Generate 200 samples, save as zarr
   python generate_data.py -n 200 -s "u:128,128 v:128,128" -b zarr -o zarr_data/

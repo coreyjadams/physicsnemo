@@ -129,7 +129,7 @@ class ComputeSDF(Transform):
                 if self.closest_points_key is not None:
                     updates[f"{self.closest_points_key}{suffix}"] = closest_points
 
-        return data.with_updates(updates)
+        return data.update(updates)
 
     def __repr__(self) -> str:
         return f"ComputeSDF(input_keys={self.input_keys}, output_key={self.output_key})"
@@ -205,7 +205,7 @@ class ComputeNormals(Transform):
         norm = torch.norm(normals, dim=-1, keepdim=True) + 1e-6
         normals = normals / norm
 
-        return data.with_updates({self.output_key: normals})
+        return data.update({self.output_key: normals})
 
     def __repr__(self) -> str:
         return (
@@ -249,12 +249,19 @@ class Translate(Transform):
     def __call__(self, data: TensorDict) -> TensorDict:
         """Apply translation to the sample."""
         # Get center value
-        if self.is_key:
+        if isinstance(self.center_key_or_value, str):
             if self.center_key_or_value not in data:
                 raise KeyError(f"Center key '{self.center_key_or_value}' not found")
             center = data[self.center_key_or_value]
         else:
+            if not isinstance(self.center_key_or_value, torch.Tensor):
+                raise TypeError(
+                    f"center_key_or_value should be torch.Tensor but got {type(self.center_key_or_value)}"
+                )
             center = self.center_key_or_value
+            # Move to same device as data if needed
+            if data.device is not None and center.device != data.device:
+                center = center.to(data.device)
 
         # Ensure center has shape (1, 3) or (1, D)
         if center.ndim == 1:
@@ -266,7 +273,19 @@ class Translate(Transform):
             if key in data:
                 updates[key] = data[key] - center
 
-        return data.with_updates(updates)
+        return data.update(updates)
+
+    def to(self, device: Union[torch.device, str]) -> "Translate":
+        """Move center tensor to the specified device (if not a key reference)."""
+        super().to(device)
+        if not self.is_key:
+            if not isinstance(self.center_key_or_value, torch.Tensor):
+                raise TypeError(
+                    f"center_key_or_value should be torch.Tensor but got {type(self.center_key_or_value)}"
+                )
+                device = torch.device(device) if isinstance(device, str) else device
+            self.center_key_or_value = self.center_key_or_value.to(device)
+        return self
 
     def __repr__(self) -> str:
         return (
@@ -313,8 +332,8 @@ class ReScale(Transform):
         if scale.ndim == 1:
             scale = scale.unsqueeze(0)
 
-        # Move scale to same device as data
-        if data.device is not None:
+        # Move scale to same device as data if needed
+        if data.device is not None and scale.device != data.device:
             scale = scale.to(data.device)
 
         # Apply scaling to all keys
@@ -323,7 +342,14 @@ class ReScale(Transform):
             if key in data:
                 updates[key] = data[key] / scale
 
-        return data.with_updates(updates)
+        return data.update(updates)
+
+    def to(self, device: Union[torch.device, str]) -> "ReScale":
+        """Move reference scale tensor to the specified device."""
+        super().to(device)
+        device = torch.device(device) if isinstance(device, str) else device
+        self.reference_scale = self.reference_scale.to(device)
+        return self
 
     def __repr__(self) -> str:
         return (

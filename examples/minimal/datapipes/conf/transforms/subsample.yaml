@@ -14,15 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# FieldSlice Transform Configuration
-# Select specific indices or slices from tensor dimensions
-_target_: physicsnemo.datapipes.core.transforms.FieldSlice
-slicing:
-  # Select features 0, 2, 5 from last dimension
-  features:
-    "-1": [0, 2, 5]
-  # Or use slice notation: first 2 elements of last dimension
-  # velocity:
-  #   "-1":
-  #     stop: 2
-
+# SubsamplePoints Transform Configuration
+# Subsamples point clouds to a fixed number of points
+# Useful for handling variable-size point cloud data in batched training
+_target_: physicsnemo.datapipes.core.transforms.SubsamplePoints
+input_keys:
+    - coords
+    - features
+n_points: 10000
+algorithm: uniform # Options: "uniform" or "poisson_fixed"
+weights_key: null # Optional: key for weighted sampling (e.g., "surface_areas")
