@@ -44,7 +44,7 @@ def test_iterate_batches(numpy_data_dir):
     batches = list(loader)
     assert len(batches) == 5
 
-    for batched_data, metadata_list in batches:
+    for batched_data in batches:
         assert isinstance(batched_data, TensorDict)
         assert batched_data["positions"].shape[0] == 2  # batch dim
 
@@ -54,7 +54,7 @@ def test_batch_collation(numpy_data_dir):
     dataset = dp.Dataset(reader)
     loader = dp.DataLoader(dataset, batch_size=4)
 
-    batched_data, metadata_list = next(iter(loader))
+    batched_data = next(iter(loader))
 
     # Should have batch dimension
     assert batched_data["positions"].shape == (4, 100, 3)
@@ -64,7 +64,7 @@ def test_batch_collation(numpy_data_dir):
 def test_metadata_collation(numpy_data_dir):
     reader = dp.NumpyReader(numpy_data_dir)
     dataset = dp.Dataset(reader)
-    loader = dp.DataLoader(dataset, batch_size=3)
+    loader = dp.DataLoader(dataset, batch_size=3, collate_metadata=True)
 
     batched_data, metadata_list = next(iter(loader))
 
@@ -93,7 +93,7 @@ def test_last_batch_smaller(numpy_data_dir):
     loader = dp.DataLoader(dataset, batch_size=3, drop_last=False)
 
     batches = list(loader)
-    last_batched_data, last_metadata_list = batches[-1]
+    last_batched_data = batches[-1]
 
     # 10 % 3 = 1, so last batch should have 1 sample
     assert last_batched_data["positions"].shape[0] == 1
@@ -110,7 +110,7 @@ def test_shuffle_changes_order(numpy_data_dir):
 
     # Collect indices from multiple epochs
     torch.manual_seed(42)
-    loader = dp.DataLoader(dataset, batch_size=2, shuffle=True)
+    loader = dp.DataLoader(dataset, batch_size=2, shuffle=True, collate_metadata=True)
 
     indices_epoch1 = []
     for batched_data, metadata_list in loader:
@@ -130,7 +130,7 @@ def test_shuffle_changes_order(numpy_data_dir):
 def test_no_shuffle_preserves_order(numpy_data_dir):
     reader = dp.NumpyReader(numpy_data_dir)
     dataset = dp.Dataset(reader)
-    loader = dp.DataLoader(dataset, batch_size=2, shuffle=False)
+    loader = dp.DataLoader(dataset, batch_size=2, shuffle=False, collate_metadata=True)
 
     indices = []
     for batched_data, metadata_list in loader:
@@ -170,7 +170,7 @@ def test_prefetch_enabled(numpy_data_dir):
     batches = list(loader)
     assert len(batches) == 5
 
-    for batched_data, metadata_list in batches:
+    for batched_data in batches:
         assert batched_data["positions"].shape[0] == 2
 
 
@@ -189,7 +189,7 @@ def test_prefetch_with_streams(numpy_data_dir):
     batches = list(loader)
     assert len(batches) == 5
 
-    for batched_data, metadata_list in batches:
+    for batched_data in batches:
         assert batched_data["positions"].device.type == "cuda"
 
 
@@ -219,7 +219,7 @@ def test_default_collation(numpy_data_dir):
     dataset = dp.Dataset(reader)
     loader = dp.DataLoader(dataset, batch_size=3)
 
-    batched_data, metadata_list = next(iter(loader))
+    batched_data = next(iter(loader))
 
     # Default collation stacks tensors
     assert batched_data["positions"].shape == (3, 100, 3)
@@ -234,7 +234,7 @@ def test_concat_collation(numpy_data_dir):
         collate_fn=dp.ConcatCollator(dim=0, add_batch_idx=True),
     )
 
-    batched_data, metadata_list = next(iter(loader))
+    batched_data = next(iter(loader))
 
     # Concat collation concatenates along dim 0
     assert batched_data["positions"].shape == (300, 3)  # 3 * 100 points
@@ -251,9 +251,7 @@ def test_custom_collate_fn(numpy_data_dir):
         return samples[0]
 
     loader = dp.DataLoader(
-        dataset,
-        batch_size=3,
-        collate_fn=my_collate,
+        dataset, batch_size=3, collate_fn=my_collate, collate_metadata=True
     )
 
     result = next(iter(loader))
@@ -274,7 +272,9 @@ def test_sequential_sampler(numpy_data_dir):
     reader = dp.NumpyReader(numpy_data_dir)
     dataset = dp.Dataset(reader)
     sampler = SequentialSampler(dataset)
-    loader = dp.DataLoader(dataset, batch_size=2, sampler=sampler)
+    loader = dp.DataLoader(
+        dataset, batch_size=2, sampler=sampler, collate_metadata=True
+    )
 
     indices = []
     for batched_data, metadata_list in loader:
@@ -291,7 +291,9 @@ def test_random_sampler(numpy_data_dir):
 
     torch.manual_seed(123)
     sampler = RandomSampler(dataset)
-    loader = dp.DataLoader(dataset, batch_size=2, sampler=sampler)
+    loader = dp.DataLoader(
+        dataset, batch_size=2, sampler=sampler, collate_metadata=True
+    )
 
     indices = []
     for batched_data, metadata_list in loader:
@@ -310,7 +312,9 @@ def test_subset_sampler(numpy_data_dir):
     # Only use indices 0, 2, 4, 6, 8
     indices = [0, 2, 4, 6, 8]
     sampler = SubsetRandomSampler(indices)
-    loader = dp.DataLoader(dataset, batch_size=2, sampler=sampler)
+    loader = dp.DataLoader(
+        dataset, batch_size=2, sampler=sampler, collate_metadata=True
+    )
 
     seen_indices = []
     for batched_data, metadata_list in loader:
@@ -354,7 +358,7 @@ def test_training_loop_simulation(numpy_data_dir):
         loader.set_epoch(epoch)
 
         total_samples = 0
-        for batched_data, metadata_list in loader:
+        for batched_data in loader:
             batch_size = batched_data["positions"].shape[0]
             total_samples += batch_size
 
@@ -387,7 +391,7 @@ def test_gpu_training_loop(numpy_data_dir):
         num_streams=4,
     )
 
-    for batched_data, metadata_list in loader:
+    for batched_data in loader:
         assert batched_data["positions"].device.type == "cuda"
 
         # Simulate forward pass

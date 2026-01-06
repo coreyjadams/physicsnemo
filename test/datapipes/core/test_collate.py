@@ -28,8 +28,8 @@ import physicsnemo.datapipes.core as dp
 
 
 def test_default_collate_basic(batch_of_samples):
-    collator = dp.DefaultCollator()
-    batched_data, metadata_list = collator(batch_of_samples)
+    collator = dp.DefaultCollator(collate_metadata=False)
+    batched_data = collator(batch_of_samples)
 
     # 4 samples, each with shape (10, 3) -> (4, 10, 3)
     assert batched_data["x"].shape == (4, 10, 3)
@@ -37,7 +37,7 @@ def test_default_collate_basic(batch_of_samples):
 
 
 def test_default_collate_metadata(batch_of_samples):
-    collator = dp.DefaultCollator()
+    collator = dp.DefaultCollator(collate_metadata=True)
     batched_data, metadata_list = collator(batch_of_samples)
 
     # Metadata should be collected into lists
@@ -80,8 +80,8 @@ def test_default_collate_mismatched_shapes_raises():
 
 
 def test_default_collate_specific_keys(batch_of_samples):
-    collator = dp.DefaultCollator(keys=["x"])
-    batched_data, metadata_list = collator(batch_of_samples)
+    collator = dp.DefaultCollator(keys=["x"], collate_metadata=False)
+    batched_data = collator(batch_of_samples)
 
     assert "x" in batched_data
     assert "y" not in batched_data
@@ -92,8 +92,8 @@ def test_default_collate_different_stack_dim():
         (TensorDict({"x": torch.randn(3, 10)}), {}),
         (TensorDict({"x": torch.randn(3, 10)}), {}),
     ]
-    collator = dp.DefaultCollator(stack_dim=1)
-    batched_data, metadata_list = collator(samples)
+    collator = dp.DefaultCollator(stack_dim=1, collate_metadata=False)
+    batched_data = collator(samples)
 
     # Stack along dim 1: (3, 10) -> (3, 2, 10)
     assert batched_data["x"].shape == (3, 2, 10)
@@ -105,9 +105,7 @@ def test_default_collate_disable_metadata():
         (TensorDict({"x": torch.randn(10)}), {"idx": 1}),
     ]
     collator = dp.DefaultCollator(collate_metadata=False)
-    batched_data, metadata_list = collator(samples)
-
-    assert metadata_list == []
+    _ = collator(samples)
 
 
 # ============================================================================
@@ -117,7 +115,7 @@ def test_default_collate_disable_metadata():
 
 def test_concat_collate_ragged(ragged_samples):
     collator = dp.ConcatCollator(dim=0, add_batch_idx=True)
-    batched_data, metadata_list = collator(ragged_samples)
+    batched_data = collator(ragged_samples)
 
     # 100 + 150 + 80 = 330 points
     assert batched_data["points"].shape == (330, 3)
@@ -126,7 +124,7 @@ def test_concat_collate_ragged(ragged_samples):
 
 def test_concat_batch_idx_values(ragged_samples):
     collator = dp.ConcatCollator(dim=0, add_batch_idx=True)
-    batched_data, metadata_list = collator(ragged_samples)
+    batched_data = collator(ragged_samples)
 
     # First 100 should be 0, next 150 should be 1, last 80 should be 2
     assert (batched_data["batch_idx"][:100] == 0).all()
@@ -136,7 +134,7 @@ def test_concat_batch_idx_values(ragged_samples):
 
 def test_concat_collate_no_batch_idx(ragged_samples):
     collator = dp.ConcatCollator(dim=0, add_batch_idx=False)
-    batched_data, metadata_list = collator(ragged_samples)
+    batched_data = collator(ragged_samples)
 
     assert "batch_idx" not in batched_data
 
@@ -147,14 +145,14 @@ def test_concat_collate_custom_batch_idx_key(ragged_samples):
         add_batch_idx=True,
         batch_idx_key="sample_id",
     )
-    batched_data, metadata_list = collator(ragged_samples)
+    batched_data = collator(ragged_samples)
 
     assert "sample_id" in batched_data
     assert "batch_idx" not in batched_data
 
 
 def test_concat_collate_metadata(ragged_samples):
-    collator = dp.ConcatCollator(dim=0)
+    collator = dp.ConcatCollator(dim=0, collate_metadata=True)
     batched_data, metadata_list = collator(ragged_samples)
 
     assert len(metadata_list) == 3
@@ -178,7 +176,7 @@ def test_function_collator():
         # Just sum all tensors
         data_list = [data for data, _ in samples]
         total = sum(d["x"].sum() for d in data_list)
-        return TensorDict({"total": total.unsqueeze(0)}), []
+        return TensorDict({"total": total.unsqueeze(0)})
 
     samples = [
         (TensorDict({"x": torch.ones(10)}), {}),
@@ -186,7 +184,8 @@ def test_function_collator():
     ]
 
     collator = dp.FunctionCollator(my_collate)
-    batched_data, metadata_list = collator(samples)
+    batched_data = collator(samples)
+    print(type(batched_data))
 
     # 10*1 + 10*2 = 30
     assert batched_data["total"].item() == 30.0
@@ -198,15 +197,13 @@ def test_function_collator():
 
 
 def test_default_collate_function(batch_of_samples):
-    batched_data, metadata_list = dp.default_collate(batch_of_samples)
+    batched_data = dp.default_collate(batch_of_samples)
 
     assert batched_data["x"].shape == (4, 10, 3)
 
 
 def test_concat_collate_function(ragged_samples):
-    batched_data, metadata_list = dp.concat_collate(
-        ragged_samples, dim=0, add_batch_idx=True
-    )
+    batched_data = dp.concat_collate(ragged_samples, dim=0, add_batch_idx=True)
 
     assert batched_data["points"].shape == (330, 3)
     assert "batch_idx" in batched_data

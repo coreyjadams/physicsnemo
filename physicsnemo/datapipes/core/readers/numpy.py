@@ -249,7 +249,7 @@ class NumpyReader(Reader):
                     # Directory mode: load full array
                     arr = arr[:]
 
-                data[field] = torch.from_numpy(arr)
+                data[field] = torch.from_numpy(np.array(arr))
 
             elif field in self.default_values:
                 data[field] = self.default_values[field].clone()
