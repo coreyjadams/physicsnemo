@@ -244,7 +244,6 @@ def section_1_knn_transform():
     print(f"Graph structure:")
     print(f"  Nodes: {n_nodes}")
     print(f"  Edges / node: {n_edges}")
-    print(f"  Avg degree: {n_edges / n_nodes:.1f}")
     print()
 
     reader.close()

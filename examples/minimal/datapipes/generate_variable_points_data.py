@@ -295,7 +295,7 @@ Examples:
   python generate_variable_points_data.py -n 100 -s "velocity:3 pressure:1" -b npz -o output/
 
   # Generate 50 samples with 10k-50k points
-  python generate_variable_points_data.py -n 50 -s "coords:3 features:8" --min-points 10000 --max-points 50000 -b npy
+  python generate_variable_points_data.py -n 50 -s "coords:3 features:8" --min-points 10000 --max-points 50000 -b zarr
 
   # Generate point cloud data with normals
   python generate_variable_points_data.py -n 200 -s "xyz:3 normal:3 color:3" -b zarr -o pointcloud_data/

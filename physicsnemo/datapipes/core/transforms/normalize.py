@@ -282,28 +282,12 @@ class Normalize(Transform):
                 mean = self._means[key]
                 std = self._stds[key]
 
-                # Ensure stats are on the same device as the tensor
-                if mean.device != tensor.device:
-                    mean = mean.to(tensor.device, non_blocking=True)
-                    self._means[key] = mean
-                if std.device != tensor.device:
-                    std = std.to(tensor.device, non_blocking=True)
-                    self._stds[key] = std
-
                 # Normalize: (x - mean) / std
                 updates[key] = (tensor - mean) / (std + self.eps)
 
             else:  # min_max
                 min_val = self._mins[key]
                 max_val = self._maxs[key]
-
-                # Ensure stats are on the same device as the tensor
-                if min_val.device != tensor.device:
-                    min_val = min_val.to(tensor.device, non_blocking=True)
-                    self._mins[key] = min_val
-                if max_val.device != tensor.device:
-                    max_val = max_val.to(tensor.device, non_blocking=True)
-                    self._maxs[key] = max_val
 
                 # Normalize to [-1, 1]: (x - center) / half_range
                 center = (max_val + min_val) / 2.0
@@ -354,21 +338,11 @@ class Normalize(Transform):
                 mean = self._means[key]
                 std = self._stds[key]
 
-                if mean.device != tensor.device:
-                    mean = mean.to(tensor.device, non_blocking=True)
-                if std.device != tensor.device:
-                    std = std.to(tensor.device, non_blocking=True)
-
                 updates[key] = tensor * (std + self.eps) + mean
 
             else:  # min_max
                 min_val = self._mins[key]
                 max_val = self._maxs[key]
-
-                if min_val.device != tensor.device:
-                    min_val = min_val.to(tensor.device, non_blocking=True)
-                if max_val.device != tensor.device:
-                    max_val = max_val.to(tensor.device, non_blocking=True)
 
                 center = (max_val + min_val) / 2.0
                 half_range = (max_val - min_val) / 2.0

@@ -50,7 +50,7 @@ class BoundingBoxFilter(Transform):
         ...     bbox_max=torch.tensor([1.0, 1.0, 1.0]),
         ...     dependent_keys=["volume_fields", "sdf_nodes"]
         ... )
-        >>> sample = Sample({
+        >>> sample = TensorDict({
         ...     "volume_mesh_centers": torch.randn(10000, 3) * 2,  # Some outside bbox
         ...     "volume_fields": torch.randn(10000, 4)
         ... })
@@ -142,7 +142,7 @@ class CreateGrid(Transform):
         ...     bbox_min=torch.tensor([-1.0, -1.0, -1.0]),
         ...     bbox_max=torch.tensor([1.0, 1.0, 1.0])
         ... )
-        >>> sample = Sample({})
+        >>> sample = TensorDict({})
         >>> result = transform(sample)
         >>> print(result["grid"].shape)
         torch.Size([262144, 3])  # 64*64*64 = 262144
@@ -222,7 +222,7 @@ class KNNNeighbors(Transform):
         ...     output_prefix="surface_neighbors",
         ...     extract_keys=["surface_normals", "surface_areas"]
         ... )
-        >>> sample = Sample({
+        >>> sample = TensorDict({
         ...     "surface_mesh_centers": torch.randn(10000, 3),
         ...     "surface_mesh_centers_subsampled": torch.randn(1000, 3),
         ...     "surface_normals": torch.randn(10000, 3),

@@ -53,7 +53,7 @@ class DataLoader:
     - Familiar torch DataLoader interface
 
     Example:
-        >>> from datapipe import DataLoader, Dataset, HDF5Reader, ToDevice, Compose
+        >>> from physicsnemo.datapipes import DataLoader, Dataset, HDF5Reader, ToDevice, Compose
         >>>
         >>> dataset = Dataset(
         ...     HDF5Reader("data.h5"),

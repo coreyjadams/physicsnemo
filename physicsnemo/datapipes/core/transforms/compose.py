@@ -20,7 +20,7 @@ Compose - Chain multiple transforms into a single transform.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import torch
 from tensordict import TensorDict
@@ -90,7 +90,7 @@ class Compose(Transform):
         """Return number of transforms."""
         return len(self.transforms)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Transform]:
         """Iterate over transforms."""
         return iter(self.transforms)
 

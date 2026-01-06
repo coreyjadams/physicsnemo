@@ -74,7 +74,7 @@ class Dataset:
         >>> sample_0 = dataset[0]  # Uses prefetched result
 
     Example:
-        >>> from datapipe import Dataset, HDF5Reader, Normalize, ToDevice, Compose
+        >>> from physicsnemo.datapipes import Dataset, HDF5Reader, Normalize, ToDevice, Compose
         >>>
         >>> reader = HDF5Reader("data.h5", fields=["pressure", "velocity"])
         >>> transforms = Compose([

@@ -289,7 +289,7 @@ def section_3_subsampling():
         algorithm="uniform",  # or "poisson_fixed" for very large data
     )
     # Note: the subsampling will assume a consistent leading dimension for all
-    # it's input keys: so, it will generate an index of shape [n_points] and slice
+    # its input keys: so, it will generate an index of shape [n_points] and slice
     # all input_keys in the same way.
 
     print(f"Transform: {subsample}")

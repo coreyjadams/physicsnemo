@@ -235,7 +235,7 @@ def test_prefetch_batch_with_streams(numpy_data_dir):
     reader = dp.NumpyReader(numpy_data_dir, pin_memory=True)
     dataset = dp.Dataset(
         reader,
-        device="cuda",
+        device="cuda:0",
     )
 
     streams = [torch.cuda.Stream() for _ in range(4)]

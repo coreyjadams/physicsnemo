@@ -22,12 +22,12 @@ available via multiprocessing or when offloading to compiled libraries or GPU ke
 For this reason, many data loaders leverage multiprocessing for data concurrency:
 load images in separate processes, and collate a batch on the main thread.
 For simplicity, with a GPU-first paradigm, the physicsnemo datapipe focuses on GPU
-concurrency via ascynchronous execution and stream-based parallelism.  IO is coordinated
+concurrency via asynchronous execution and stream-based parallelism.  IO is coordinated
 in multiple threads, instead of multiple processes, and streams enable multiple
 preprocessing pipelines to execute concurrently on the GPU.
 
 3. **Unambiguous Configuration and Serialization** - Datapipes can be a particularly
-frustrating component in reproducability of AI results - the preprocessing, sampling,
+frustrating component in reproducibility of AI results - the preprocessing, sampling,
 batching and other parameters can be hard to infer from training scripts.  Here,
 we make a deliberate design choice to enable datapipe configuration serialization
 as a first-class citizen.  PhysicsNeMo Datapipes can be built directly in Python,
@@ -78,7 +78,7 @@ The PhysicsNeMo datapipe consists of the following components:
 - The `dataset` object, which contains a `reader`, orchestrates threads that preload
   data **examples** from disk and move it to GPU.  On the GPU, a `dataset` can apply a
   series of transformations to each **example**.  Each example is stored in `tensordict`
-  format.  The dataset will also track metadata, for understand where each **example**
+  format.  The dataset will also track metadata, for understanding where each **example**
   came from (index, filepath, etc.).
 
 - A `transform` is a callable class that accepts a tensordict as input, and returns

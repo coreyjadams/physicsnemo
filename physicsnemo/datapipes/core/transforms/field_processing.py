@@ -117,7 +117,7 @@ class BroadcastGlobalFeatures(Transform):
         fx = torch.stack(features, dim=-1)
 
         # Broadcast to match number of points
-        fx = fx.broadcast_to(n_points, -1)
+        fx = fx.broadcast_to(n_points, fx.shape[-1])
 
         return data.update({self.output_key: fx})
 

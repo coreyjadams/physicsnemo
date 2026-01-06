@@ -123,8 +123,8 @@ def test_subsample_points_weighted():
         weights_key="surface_areas",
     )
 
-    # Create sample wit
-    # h areas (larger areas should be sampled more)
+    # Create sample with
+    # areas (larger areas should be sampled more)
     sample = TensorDict(
         {
             "surface_coords": torch.randn(1000, 3),

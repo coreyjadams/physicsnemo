@@ -51,7 +51,6 @@ Configuration Files
 """
 
 import hydra
-import torch
 from omegaconf import DictConfig, OmegaConf
 
 from physicsnemo.datapipes.core import DataLoader

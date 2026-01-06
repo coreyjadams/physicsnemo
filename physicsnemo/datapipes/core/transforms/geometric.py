@@ -50,7 +50,7 @@ class ComputeSDF(Transform):
         ...     mesh_faces_key="stl_faces",
         ...     closest_points_key="closest_points"
         ... )
-        >>> sample = Sample({
+        >>> sample = Tensordict({
         ...     "volume_mesh_centers": torch.randn(10000, 3),
         ...     "stl_coordinates": torch.randn(5000, 3),
         ...     "stl_faces": torch.randint(0, 5000, (10000,))
@@ -283,7 +283,7 @@ class Translate(Transform):
                 raise TypeError(
                     f"center_key_or_value should be torch.Tensor but got {type(self.center_key_or_value)}"
                 )
-                device = torch.device(device) if isinstance(device, str) else device
+            device = torch.device(device) if isinstance(device, str) else device
             self.center_key_or_value = self.center_key_or_value.to(device)
         return self
 
@@ -302,7 +302,7 @@ class ReScale(Transform):
     scale invariant.
 
     Example:
-        >>> transform = ScaleInvariance(
+        >>> transform = ReScale(
         ...     input_keys=["volume_mesh_centers", "geometry_coordinates"],
         ...     reference_scale=torch.tensor([[1.0, 1.0, 1.0]])
         ... )

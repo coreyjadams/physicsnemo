@@ -514,6 +514,126 @@ def test_normalize_mean_std_missing_stds_raises():
 # Downsample transform - NOT YET IMPLEMENTED
 # ============================================================================
 
+
+def test_subsample_basic():
+    sample = TensorDict({"points": torch.randn(1000, 3)})
+    ds = dp.SubsamplePoints(input_keys=["points"], n_points=100)
+
+    result = ds(sample)
+    assert result["points"].shape == (100, 3)
+
+
+def test_subsample_multiple_fields():
+    sample = TensorDict(
+        {
+            "positions": torch.randn(500, 3),
+            "features": torch.randn(500, 8),
+        }
+    )
+    ds = dp.SubsamplePoints(input_keys=["positions", "features"], n_points=100)
+
+    result = ds(sample)
+    assert result["positions"].shape == (100, 3)
+    assert result["features"].shape == (100, 8)
+
+
+def test_subsample_preserves_other_fields():
+    sample = TensorDict(
+        {
+            "points": torch.randn(500, 3),
+            "label": torch.tensor([1]),
+        }
+    )
+    ds = dp.SubsamplePoints(input_keys=["points"], n_points=100)
+
+    result = ds(sample)
+    assert result["points"].shape == (100, 3)
+    torch.testing.assert_close(result["label"], torch.tensor([1]))
+
+
+def test_subsample_no_op_when_smaller():
+    sample = TensorDict({"x": torch.randn(50, 3)})
+    ds = dp.SubsamplePoints(input_keys=["x"], n_points=100)
+
+    result = ds(sample)
+    # Should return original since 50 < 100
+    assert result["x"].shape == (50, 3)
+
+
+def test_subsample_inconsistent_sizes_raises():
+    sample = TensorDict(
+        {
+            "a": torch.randn(100, 3),
+            "b": torch.randn(200, 3),  # Different size!
+        }
+    )
+    ds = dp.SubsamplePoints(input_keys=["a", "b"], n_points=50)
+
+    with pytest.raises(ValueError, match="same first dimension"):
+        ds(sample)
+
+
+def test_subsample_missing_key_raises():
+    sample = TensorDict({"x": torch.randn(100, 3)})
+    ds = dp.SubsamplePoints(input_keys=["y"], n_points=50)
+
+    with pytest.raises(KeyError):
+        ds(sample)
+
+
+def test_subsample_weighted():
+    sample = TensorDict(
+        {
+            "points": torch.randn(1000, 3),
+            "weights": torch.rand(1000),
+        }
+    )
+    ds = dp.SubsamplePoints(input_keys=["points"], n_points=100, weights_key="weights")
+
+    result = ds(sample)
+    assert result["points"].shape == (100, 3)
+
+
+def test_subsample_weighted_missing_weights_raises():
+    sample = TensorDict({"points": torch.randn(1000, 3)})
+    ds = dp.SubsamplePoints(
+        input_keys=["points"], n_points=100, weights_key="missing_weights"
+    )
+
+    with pytest.raises(KeyError, match="missing_weights"):
+        ds(sample)
+
+
+def test_subsample_poisson_algorithm():
+    sample = TensorDict({"points": torch.randn(1000, 3)})
+    ds = dp.SubsamplePoints(
+        input_keys=["points"], n_points=100, algorithm="poisson_fixed"
+    )
+
+    result = ds(sample)
+    assert result["points"].shape == (100, 3)
+
+
+def test_subsample_uniform_algorithm():
+    sample = TensorDict({"points": torch.randn(1000, 3)})
+    ds = dp.SubsamplePoints(input_keys=["points"], n_points=100, algorithm="uniform")
+
+    result = ds(sample)
+    assert result["points"].shape == (100, 3)
+
+
+def test_subsample_repr():
+    ds = dp.SubsamplePoints(input_keys=["x"], n_points=100)
+    assert "SubsamplePoints" in repr(ds)
+    assert "100" in repr(ds)
+
+
+def test_subsample_repr_with_weights():
+    ds = dp.SubsamplePoints(input_keys=["x"], n_points=100, weights_key="areas")
+    assert "SubsamplePoints" in repr(ds)
+    assert "weights_key=areas" in repr(ds)
+
+
 # TODO: Implement Downsample transform
 # def test_downsample_basic():
 #     sample = Sample({"points": torch.randn(1000, 3)})
@@ -613,53 +733,6 @@ def test_normalize_mean_std_missing_stds_raises():
 
 
 # ============================================================================
-# ToDevice transform - NOT YET IMPLEMENTED
-# ============================================================================
-
-# TODO: Implement ToDevice transform
-# def test_to_device_cpu():
-#     sample = Sample({"x": torch.randn(10)})
-#     to_cpu = dp.ToDevice("cpu")
-#
-#     result = to_cpu(sample)
-#     assert result["x"].device == torch.device("cpu")
-#
-#
-# @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-# def test_to_device_cuda():
-#     sample = Sample({"x": torch.randn(10)})
-#     to_cuda = dp.ToDevice("cuda")
-#
-#     result = to_cuda(sample)
-#     assert result["x"].device.type == "cuda"
-#
-#
-# def test_to_device_specific_fields():
-#     sample = Sample(
-#         {
-#             "x": torch.randn(10),
-#             "y": torch.randn(10),
-#         }
-#     )
-#     to_cpu = dp.ToDevice("cpu", input_keys=["x"])
-#
-#     result = to_cpu(sample)
-#     # Both should be on CPU (they started there)
-#     assert result["x"].device == torch.device("cpu")
-#     assert result["y"].device == torch.device("cpu")
-#
-#
-# def test_cuda_helper():
-#     to_cuda = dp.cuda()
-#     assert to_cuda.device == torch.device("cuda")
-#
-#
-# def test_cpu_helper():
-#     to_cpu = dp.cpu()
-#     assert to_cpu.device == torch.device("cpu")
-
-
-# ============================================================================
 # Compose transform
 # ============================================================================
 
@@ -673,19 +746,6 @@ def test_compose_single_transform():
 
     result = pipeline(sample)
     torch.testing.assert_close(result["x"], torch.tensor([0.0]), atol=1e-6, rtol=1e-6)
-
-
-# def test_compose_multiple_transforms():
-#     sample = Sample({"x": torch.randn(1000, 3)})
-#     pipeline = dp.Compose(
-#         [
-#             dp.Downsample(input_keys=["x"], n=100),
-#             # After downsample, should have 100 points
-#         ]
-#     )
-#
-#     result = pipeline(sample)
-#     assert result["x"].shape == (100, 3)
 
 
 def test_compose_order_matters():

@@ -297,7 +297,6 @@ def section_4_dataloader_basics(dataset):
     # Iterate over batches
     print("Iterating over batches:")
     for batch_idx, batch_data in enumerate(dataloader):
-        print(f"Batch_data[1]: {batch_data[1]}")
         print(f"\nBatch {batch_idx}:")
         print(f"  Batch data type: {type(batch_data)}")
 

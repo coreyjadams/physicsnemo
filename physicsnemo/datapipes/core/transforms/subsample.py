@@ -144,7 +144,7 @@ class SubsamplePoints(Transform):
         ...     n_points=10000,
         ...     algorithm="poisson_fixed"
         ... )
-        >>> sample = Sample({
+        >>> sample = TensorDict({
         ...     "volume_mesh_centers": torch.randn(100000, 3),
         ...     "volume_fields": torch.randn(100000, 5)
         ... })

@@ -268,8 +268,9 @@ class TensorStoreZarrReader(Reader):
         fields_to_load = self.fields
         fields_from_arrays = set(fields_to_load) - set(attributes.keys())
 
-        # Check for missing required fields
-        available = set(self._discover_fields(group_path))
+        # Check for missing required fields using cached available fields
+        # (discovered once during __init__ from the first group)
+        available = set(self._available_fields)
         required_fields = fields_from_arrays - set(self.default_values.keys())
         missing_fields = required_fields - available
         if missing_fields:

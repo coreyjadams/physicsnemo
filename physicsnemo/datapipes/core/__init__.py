@@ -34,7 +34,7 @@ Example:
     ...     reader=dp.HDF5Reader("data.h5", fields=["pressure", "velocity"]),
     ...     transforms=[
     ...         dp.Normalize(input_keys=["pressure"], means={"pressure": 0.0}, stds={"pressure": 1.0}),
-    ...         dp.Downsample(input_keys=["pressure", "velocity"], n=10000),
+    ...         dp.SubsamplePoints(input_keys=["pressure", "velocity"], n=10000),
     ...     ],
     ...     device="cuda",  # Automatic GPU transfer!
     ... )

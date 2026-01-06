@@ -197,7 +197,6 @@ def test_zarr_get_sample(zarr_data_dir):
 
 
 def test_zarr_single_group_mode(zarr_single_group):
-    print(zarr_single_group)
     reader = dp.ZarrReader(zarr_single_group)
 
     assert len(reader) == 30
