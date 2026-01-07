@@ -87,7 +87,7 @@ class Transform(ABC):
         return self
 
     @property
-    def device(self) -> Optional[torch.device]:
+    def device(self) -> torch.device | None:
         """The device this transform operates on."""
         return self._device
 
