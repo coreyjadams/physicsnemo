@@ -60,7 +60,7 @@ class HDF5Reader(Reader):
 
     def __init__(
         self,
-        path: Union[str, Path],
+        path: Path | str,
         *,
         fields: Optional[list[str]] = None,
         file_pattern: str = "*.h5",
