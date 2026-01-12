@@ -225,9 +225,6 @@ def _resolve_component(name: str) -> str:
     raise KeyError(f"Component '{name}' not found in registry. Available: {available}.")
 
 
-_resolvers_registered = False
-
-
 def register_resolvers() -> None:
     """
     Register OmegaConf resolvers for datapipe components.
@@ -235,7 +232,9 @@ def register_resolvers() -> None:
     This enables short names in Hydra YAML configs using the ``${dp:...}`` syntax.
     Call this function before using Hydra's ``instantiate()`` or loading configs.
 
-    The resolver looks up components in COMPONENT_REGISTRY.
+    The resolver looks up components in COMPONENT_REGISTRY dynamically at resolve
+    time, so custom components registered after this function is called will still
+    be available.
 
     Example:
         >>> from physicsnemo.datapipes.core.registry import register_resolvers
@@ -257,12 +256,8 @@ def register_resolvers() -> None:
               n_points: 50000
 
     Note:
-        This function is idempotent - calling it multiple times has no effect
-        after the first call.
+        This function can be called multiple times safely. The resolver dynamically
+        looks up components from COMPONENT_REGISTRY, so custom transforms registered
+        after this call will still be resolvable.
     """
-    global _resolvers_registered
-    if _resolvers_registered:
-        return
-
-    OmegaConf.register_new_resolver("dp", _resolve_component, replace=False)
-    _resolvers_registered = True
+    OmegaConf.register_new_resolver("dp", _resolve_component, replace=True)
