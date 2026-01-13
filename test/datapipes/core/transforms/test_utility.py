@@ -20,7 +20,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from physicsnemo.datapipes.core.transforms import ConstantField, Purge, Rename, ZeroLike
+from physicsnemo.datapipes.core.transforms import ConstantField, Purge, Rename
 
 
 class TestRename:
@@ -484,71 +484,3 @@ class TestConstantField:
         assert "output_key" in repr_str
         assert "fill_value" in repr_str
         assert "output_dim" in repr_str
-
-
-class TestZeroLike:
-    """Tests for the ZeroLike transform (backwards compatibility)."""
-
-    def test_creates_zeros(self):
-        """Test that ZeroLike creates zeros."""
-        data = TensorDict({"positions": torch.randn(100, 3)})
-
-        transform = ZeroLike(reference_key="positions", output_key="sdf")
-        result = transform(data)
-
-        assert "sdf" in result.keys()
-        assert result["sdf"].shape == (100, 1)
-        assert torch.all(result["sdf"] == 0.0)
-
-    def test_custom_output_dim(self):
-        """Test custom output dimension."""
-        data = TensorDict({"positions": torch.randn(100, 3)})
-
-        transform = ZeroLike(reference_key="positions", output_key="sdf", output_dim=3)
-        result = transform(data)
-
-        assert result["sdf"].shape == (100, 3)
-        assert torch.all(result["sdf"] == 0.0)
-
-    def test_default_output_dim_none(self):
-        """Test that output_dim=None defaults to 1."""
-        data = TensorDict({"positions": torch.randn(100, 3)})
-
-        transform = ZeroLike(
-            reference_key="positions", output_key="sdf", output_dim=None
-        )
-        result = transform(data)
-
-        assert result["sdf"].shape == (100, 1)
-
-    def test_inherits_dtype_from_reference(self):
-        """Test that output tensor inherits dtype from reference."""
-        data = TensorDict({"positions": torch.randn(100, 3, dtype=torch.float64)})
-
-        transform = ZeroLike(reference_key="positions", output_key="sdf")
-        result = transform(data)
-
-        assert result["sdf"].dtype == torch.float64
-
-    def test_missing_reference_key_raises(self):
-        """Test that missing reference key raises KeyError."""
-        data = TensorDict({"other": torch.randn(10, 3)})
-
-        transform = ZeroLike(reference_key="missing", output_key="sdf")
-
-        with pytest.raises(KeyError, match="missing"):
-            transform(data)
-
-    def test_is_subclass_of_constant_field(self):
-        """Test that ZeroLike is a subclass of ConstantField."""
-        assert issubclass(ZeroLike, ConstantField)
-
-    def test_extra_repr(self):
-        """Test extra_repr output (should not include fill_value)."""
-        transform = ZeroLike(reference_key="pos", output_key="sdf", output_dim=2)
-        repr_str = transform.extra_repr()
-
-        assert "reference_key" in repr_str
-        assert "output_key" in repr_str
-        assert "output_dim" in repr_str
-        # ZeroLike doesn't need to show fill_value since it's always 0
