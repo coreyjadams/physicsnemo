@@ -106,8 +106,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # Needed for testmon to compare changes
 
     - uses: actions/setup-python@v5
       with:
@@ -178,6 +176,17 @@ jobs:
         key: uv-env-py${{ matrix.python-version }}-latest
         fail-on-cache-miss: true
 
+    - name: Restore testmon database from cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          .testmondata
+          .testmondata-shm
+          .testmondata-wal
+        key: testmon-${{ matrix.os }}-py${{ matrix.python-version }}-latest
+        restore-keys: |
+          testmon-${{ matrix.os }}-py${{ matrix.python-version }}-
+
     - name: Download nightly coverage baseline
       uses: dawidd6/action-download-artifact@v3
       with:
@@ -187,9 +196,10 @@ jobs:
         if_no_artifact_found: warn
       continue-on-error: true
 
-    - name: Run core tests for coverage report
+    - name: Run core tests for coverage report (testmon-selected)
       run: |
-        uv run coverage run --rcfile='test/coverage.pytest.rc' -m pytest --ignore-glob="*docs*" --ignore-glob="*examples*"
+        # Use testmon to only run tests affected by changes, with coverage
+        uv run coverage run --rcfile='test/coverage.pytest.rc' -m pytest --testmon --ignore-glob="*docs*" --ignore-glob="*examples*"
 
     - name: Run doc tests (testmon not supported for doctests)
       run: |
