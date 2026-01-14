@@ -64,7 +64,7 @@ jobs:
       uses: actions/cache/restore@v4
       with:
         path: .venv
-        key: uv-env-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+        key: uv-env-py${{ matrix.python-version }}-latest
 
     - name: Install package with uv
       if: steps.cache-uv-restore.outputs.cache-hit != 'true'
@@ -81,7 +81,7 @@ jobs:
     - name: Delete old environment cache
       if: steps.cache-uv-restore.outputs.cache-hit != 'true'
       run: |
-        gh cache delete "uv-env-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}" || true
+        gh cache delete "uv-env-py${{ matrix.python-version }}-latest" || true
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -90,7 +90,7 @@ jobs:
       uses: actions/cache/save@v4
       with:
         path: .venv
-        key: uv-env-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+        key: uv-env-py${{ matrix.python-version }}-latest
 
   # Stage 2: Run testmon tests and cache the database
   testmon:
@@ -123,7 +123,7 @@ jobs:
       uses: actions/cache/restore@v4
       with:
         path: .venv
-        key: uv-env-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+        key: uv-env-py${{ matrix.python-version }}-latest
         fail-on-cache-miss: true
 
     - name: Run core tests (collect all for testmon)
@@ -177,7 +177,7 @@ jobs:
       uses: actions/cache/restore@v4
       with:
         path: .venv
-        key: uv-env-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+        key: uv-env-py${{ matrix.python-version }}-latest
         fail-on-cache-miss: true
 
     - name: Run core tests for coverage report
