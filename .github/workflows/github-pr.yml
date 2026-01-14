@@ -71,7 +71,7 @@ jobs:
       if: steps.cache-uv-restore.outputs.cache-hit != 'true'
       run: |
         # Install core dependencies and development group
-        UV_PREVIEW=1 uv sync --group dev --preview-features extra-build-dependencies
+        uv sync --group dev --preview-features extra-build-dependencies
 
     - name: Free disk space before caching
       if: steps.cache-uv-restore.outputs.cache-hit != 'true'
@@ -191,9 +191,7 @@ jobs:
       id: cache-coverage-restore
       uses: actions/cache/restore@v4
       with:
-        path: |
-          .coverage-baseline/.coverage
-          .coverage-baseline/coverage.xml
+        path: .coverage*
         key: coverage-${{ matrix.os }}-py${{ matrix.python-version }}-latest
 
     - name: Run core tests for coverage report (testmon-selected)
@@ -207,17 +205,12 @@ jobs:
 
     - name: Merge coverage reports
       run: |
-        # Combine PR coverage files first
-        uv run coverage combine
+        # List all coverage files being combined
+        echo "Coverage files to combine:"
+        ls -la .coverage* 2>/dev/null || echo "No coverage files found"
 
-        # If nightly baseline exists, combine it with PR coverage for complete report
-        if [ -f .coverage-baseline/.coverage ]; then
-          echo "Combining with nightly coverage baseline..."
-          # Rename PR combined coverage
-          mv .coverage .coverage.pr
-          # Combine baseline and PR coverage
-          uv run coverage combine .coverage-baseline/.coverage .coverage.pr
-        fi
+        # Combine all .coverage* files
+        uv run coverage combine
 
         uv run coverage report --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*" --fail-under=45
         uv run coverage html
