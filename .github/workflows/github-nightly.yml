@@ -67,9 +67,12 @@ jobs:
 
     - name: Run core tests (collect all for testmon)
       run: |
-        # Use --testmon-forceselect to force running ALL tests while collecting dependency data
-        # This ensures full coverage AND populates the testmon database for PR workflows
-        uv run coverage run --rcfile='test/coverage.pytest.rc' -m pytest --testmon-forceselect --ignore-glob="*docs*" --ignore-glob="*examples*"
+        # This populates the testmon database for PR workflows
+        uv run python -m pytest --testmon --ignore-glob="*docs*" --ignore-glob="*examples*"
+
+    - name: Rerun core tests for coverage report
+      run: |
+        uv run coverage run --rcfile='test/coverage.pytest.rc' -m pytest --ignore-glob="*docs*" --ignore-glob="*examples*"
 
     - name: Run doc tests (testmon not supported for doctests)
       run: |
