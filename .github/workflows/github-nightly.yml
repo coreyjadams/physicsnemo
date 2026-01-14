@@ -63,9 +63,7 @@ jobs:
       id: cache-uv-restore
       uses: actions/cache/restore@v4
       with:
-        path: |
-          .venv
-          ~/.cache/uv
+        path: .venv
         key: uv-env-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
 
     - name: Install package with uv
@@ -73,6 +71,12 @@ jobs:
       run: |
         # Install core dependencies and development group
         UV_PREVIEW=1 uv sync --group dev --preview-features extra-build-dependencies
+
+    - name: Free disk space before caching
+      if: steps.cache-uv-restore.outputs.cache-hit != 'true'
+      run: |
+        rm -rf ~/.cache/uv
+        df -h
 
     - name: Delete old environment cache
       if: steps.cache-uv-restore.outputs.cache-hit != 'true'
@@ -85,9 +89,7 @@ jobs:
       if: steps.cache-uv-restore.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
-        path: |
-          .venv
-          ~/.cache/uv
+        path: .venv
         key: uv-env-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
 
   # Stage 2: Run testmon tests and cache the database
@@ -120,9 +122,7 @@ jobs:
     - name: Restore environment from cache
       uses: actions/cache/restore@v4
       with:
-        path: |
-          .venv
-          ~/.cache/uv
+        path: .venv
         key: uv-env-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
         fail-on-cache-miss: true
 
@@ -176,9 +176,7 @@ jobs:
     - name: Restore environment from cache
       uses: actions/cache/restore@v4
       with:
-        path: |
-          .venv
-          ~/.cache/uv
+        path: .venv
         key: uv-env-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
         fail-on-cache-miss: true
 
