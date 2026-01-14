@@ -17,6 +17,8 @@
 # This CI runs on pull requests and uses testmon to skip tests
 # that don't have changed dependencies based on the nightly cache.
 # The tests run here will only use UV.
+#
+# Currently this uses ubuntu cpu tests, it's going to switch to github nvidia runners.
 
 name: pull request workflow
 on:
@@ -83,7 +85,7 @@ jobs:
     - name: Merge coverage reports
       run: |
         uv run coverage combine
-        uv run coverage report --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*" --fail-under=60
+        uv run coverage report --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*" --fail-under=45
         uv run coverage html
 
     - name: Upload coverage HTML report

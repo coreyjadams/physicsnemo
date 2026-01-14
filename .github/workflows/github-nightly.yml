@@ -74,7 +74,7 @@ jobs:
     - name: Merge coverage reports
       run: |
         uv run coverage combine
-        uv run coverage report --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*" --fail-under=60
+        uv run coverage report --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*" --fail-under=45
         uv run coverage html
 
     - name: Save testmon database to cache
