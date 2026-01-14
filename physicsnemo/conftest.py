@@ -31,10 +31,11 @@ Usage:
 """
 
 import importlib
+import logging
 import os
 
 import pytest
-import logging
+
 
 def pytest_ignore_collect(collection_path, config):
     """
@@ -103,7 +104,6 @@ def pytest_ignore_collect(collection_path, config):
         logging.getLogger(__name__).debug(
             f"Unexpected exception while checking imports for {collection_path}: {e}"
         )
-
 
     # Return None to let pytest's default collection handle this file
     return None
