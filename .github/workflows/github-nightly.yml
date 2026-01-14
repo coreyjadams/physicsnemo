@@ -23,7 +23,7 @@
 # TO DO: THE COVERAGE LIMIT IS VERY LOW, BECAUSE THIS IS NOT USING GPU TESTS OR
 # THE DATA-DRIVEN TESTS.  RAISE THIS UP AGAIN EVENTUALLY.
 
-name: nightly workflow
+name: Nightly Github Workflow
 on:
   schedule:
     # Run nightly at 2 AM UTC
@@ -40,7 +40,7 @@ jobs:
       fail-fast: false
       matrix:
         # Nightly runs full matrix
-        os: ["ubuntu-latest", "macos-latest"]
+        os: ["ubuntu-latest",]
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:

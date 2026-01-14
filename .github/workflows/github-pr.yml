@@ -20,7 +20,7 @@
 #
 # Currently this uses ubuntu cpu tests, it's going to switch to github nvidia runners.
 
-name: pull request workflow
+name: Pull Request Github CI
 on:
   pull_request:
     branches:
@@ -29,6 +29,9 @@ on:
   push:
     branches:
       - "pull-request/[0-9]+"
+  workflow_dispatch:
+    # Allow manual triggering for debugging the CI.
+
 
 
 jobs:
