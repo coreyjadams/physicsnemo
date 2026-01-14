@@ -34,7 +34,7 @@ import importlib
 import os
 
 import pytest
-
+import logging
 
 def pytest_ignore_collect(collection_path, config):
     """
@@ -46,7 +46,8 @@ def pytest_ignore_collect(collection_path, config):
     this hook catches that and skips the file instead of failing collection.
 
     This allows running `pytest --doctest-modules` without having all optional
-    dependencies installed.
+    dependencies installed.  It's not really meant for permanent use, instead
+    this is a shim until we have full CI container support / env support.
     """
     # Only check .py files
     if collection_path.suffix != ".py":
@@ -96,9 +97,13 @@ def pytest_ignore_collect(collection_path, config):
     except ImportError:
         # Module has missing dependencies - skip doctest collection for this file
         return True
-    except Exception:
+    except Exception as e:
         # Other errors (syntax, etc.) - let pytest handle normally
-        pass
+        # Log at debug level for troubleshooting
+        logging.getLogger(__name__).debug(
+            f"Unexpected exception while checking imports for {collection_path}: {e}"
+        )
+
 
     # Return None to let pytest's default collection handle this file
     return None
@@ -175,4 +180,8 @@ def pytest_runtest_makereport(item, call):
             report.outcome = "skipped"
             # longrepr for skipped tests must be a tuple of (filename, lineno, reason)
             # The reason should start with "Skipped: " for pytest to parse it correctly
-            report.longrepr = (str(item.fspath), item.dtest.lineno, f"Skipped: {skip_reason}")
+            report.longrepr = (
+                str(item.fspath),
+                item.dtest.lineno,
+                f"Skipped: {skip_reason}",
+            )
