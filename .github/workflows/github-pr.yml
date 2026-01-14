@@ -187,14 +187,14 @@ jobs:
         restore-keys: |
           testmon-${{ matrix.os }}-py${{ matrix.python-version }}-
 
-    - name: Download nightly coverage baseline
-      uses: dawidd6/action-download-artifact@v3
+    - name: Restore nightly coverage baseline from cache
+      id: cache-coverage-restore
+      uses: actions/cache/restore@v4
       with:
-        workflow: github-nightly.yml
-        name: coverage-data-${{ matrix.os }}-py${{ matrix.python-version }}
-        path: .coverage-baseline
-        if_no_artifact_found: warn
-      continue-on-error: true
+        path: |
+          .coverage-baseline/.coverage
+          .coverage-baseline/coverage.xml
+        key: coverage-${{ matrix.os }}-py${{ matrix.python-version }}-latest
 
     - name: Run core tests for coverage report (testmon-selected)
       run: |
