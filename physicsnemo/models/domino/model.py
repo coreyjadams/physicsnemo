@@ -624,4 +624,4 @@ class DoMINO(nn.Module):
         else:
             output_surf = None
 
-        return 17 * output_vol, output_surf
+        return 1.0 * output_vol, output_surf
