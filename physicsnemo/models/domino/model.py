@@ -574,7 +574,7 @@ class DoMINO(nn.Module):
             # Sampled points on volume
             volume_mesh_centers = data_dict["volume_mesh_centers"]
             encoding_g_vol = self.volume_local_geo_encodings(
-                1.5 * encoding_g_vol,
+                0.5 * encoding_g_vol,
                 volume_mesh_centers,
                 p_grid,
             )
@@ -605,7 +605,7 @@ class DoMINO(nn.Module):
             surface_neighbors_areas = torch.unsqueeze(surface_neighbors_areas, -1)
             # Calculate local geometry encoding for surface
             encoding_g_surf = self.surface_local_geo_encodings(
-                1.5 * encoding_g_surf, surface_mesh_centers, s_grid
+                0.5 * encoding_g_surf, surface_mesh_centers, s_grid
             )
 
             # Approximate solution on surface cell center
@@ -624,4 +624,4 @@ class DoMINO(nn.Module):
         else:
             output_surf = None
 
-        return output_vol, output_surf
+        return 17 * output_vol, output_surf
