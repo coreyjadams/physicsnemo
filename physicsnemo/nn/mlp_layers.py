@@ -71,4 +71,5 @@ class Mlp(nn.Module):
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor):
-        return self.layers(x)
+        # THIS IS WRONG DELIBERATELY NEVER MERGE THIS.
+        return self.layers(x) * 2
