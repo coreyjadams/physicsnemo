@@ -79,16 +79,19 @@ jobs:
         uv run coverage report --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*" --fail-under=45
         uv run coverage html
 
+    - name: Delete old testmon cache
+      run: |
+        gh cache delete "testmon-${{ matrix.os }}-py${{ matrix.python-version }}-latest" || true
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     - name: Save testmon database to cache
       uses: actions/cache/save@v4
       with:
-        path: .testmondata
-        key: testmon-${{ matrix.os }}-py${{ matrix.python-version }}-${{ github.sha }}
-
-    - name: Save testmon database with stable key for PRs
-      uses: actions/cache/save@v4
-      with:
-        path: .testmondata
+        path: |
+          .testmondata
+          .testmondata-shm
+          .testmondata-wal
         key: testmon-${{ matrix.os }}-py${{ matrix.python-version }}-latest
 
     - name: Upload coverage HTML report
@@ -96,4 +99,4 @@ jobs:
       with:
         name: coverage-report-${{ matrix.os }}-py${{ matrix.python-version }}
         path: htmlcov/
-        retention-days: 30
+        retention-days: 7

@@ -72,7 +72,10 @@ jobs:
     - name: Restore testmon database from cache
       uses: actions/cache/restore@v4
       with:
-        path: .testmondata
+        path: |
+          .testmondata
+          .testmondata-shm
+          .testmondata-wal
         key: testmon-${{ matrix.os }}-py${{ matrix.python-version }}-latest
         restore-keys: |
           testmon-${{ matrix.os }}-py${{ matrix.python-version }}-
