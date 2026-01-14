@@ -20,6 +20,8 @@
 # testing AND a baseline dependency graph for PRs.
 
 # Currently this uses ubuntu cpu tests, it's going to switch to github nvidia runners.
+# TO DO: THE COVERAGE LIMIT IS VERY LOW, BECAUSE THIS IS NOT USING GPU TESTS OR
+# THE DATA-DRIVEN TESTS.  RAISE THIS UP AGAIN EVENTUALLY.
 
 name: nightly workflow
 on:
