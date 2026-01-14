@@ -1,0 +1,94 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This CI runs on pull requests and uses testmon to skip tests
+# that don't have changed dependencies based on the nightly cache.
+# The tests run here will only use UV.
+
+name: pull request workflow
+on:
+  pull_request:
+    branches:
+      - main
+      - "release/*"
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+
+jobs:
+  test-uv:
+    name: Test with uv (Python ${{ matrix.python-version }}, OS ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # PR runs use minimal matrix for faster feedback
+        os: ["ubuntu-latest"]
+        python-version: ["3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Needed for testmon to compare changes
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install uv
+      uses: nick-fields/retry@v3
+      # uv download can be flaky.  Wrapping in a retry:
+      with:
+        timeout_minutes: 5
+        max_attempts: 3
+        command: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Install package with uv
+      run: |
+        # Install core dependencies and development group
+        UV_PREVIEW=1 uv sync --group dev --preview-features extra-build-dependencies
+
+    - name: Restore testmon database from cache
+      uses: actions/cache/restore@v4
+      with:
+        path: .testmondata
+        key: testmon-${{ matrix.os }}-py${{ matrix.python-version }}-latest
+        restore-keys: |
+          testmon-${{ matrix.os }}-py${{ matrix.python-version }}-
+
+    - name: Run core tests (with testmon)
+      run: |
+        uv run coverage run --rcfile='test/coverage.pytest.rc' -m pytest --testmon --ignore-glob="*docs*" --ignore-glob="*examples*"
+
+    - name: Run doc tests (testmon not supported for doctests)
+      run: |
+        uv run coverage run --rcfile='test/coverage.docstring.rc' -m pytest --doctest-modules physicsnemo/ --ignore-glob="*internal*" --ignore-glob="*experimental*"
+
+    - name: Merge coverage reports
+      run: |
+        uv run coverage combine
+        uv run coverage report --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*" --fail-under=60
+        uv run coverage html
+
+    - name: Upload coverage HTML report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report-${{ matrix.os }}-py${{ matrix.python-version }}
+        path: htmlcov/
+        retention-days: 7
