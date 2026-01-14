@@ -80,6 +80,15 @@ jobs:
         restore-keys: |
           testmon-${{ matrix.os }}-py${{ matrix.python-version }}-
 
+    - name: Download nightly coverage baseline
+      uses: dawidd6/action-download-artifact@v3
+      with:
+        workflow: github-nightly.yml
+        name: coverage-data-${{ matrix.os }}-py${{ matrix.python-version }}
+        path: .coverage-baseline
+        if_no_artifact_found: warn
+      continue-on-error: true
+
     - name: Run core tests (with testmon)
       run: |
         uv run coverage run --rcfile='test/coverage.pytest.rc' -m pytest --testmon --ignore-glob="*docs*" --ignore-glob="*examples*"
@@ -90,9 +99,21 @@ jobs:
 
     - name: Merge coverage reports
       run: |
+        # Combine PR coverage files first
         uv run coverage combine
+
+        # If nightly baseline exists, combine it with PR coverage for complete report
+        if [ -f .coverage-baseline/.coverage ]; then
+          echo "Combining with nightly coverage baseline..."
+          # Rename PR combined coverage
+          mv .coverage .coverage.pr
+          # Combine baseline and PR coverage
+          uv run coverage combine .coverage-baseline/.coverage .coverage.pr
+        fi
+
         uv run coverage report --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*" --fail-under=45
         uv run coverage html
+        uv run coverage xml -o coverage.xml
 
     - name: Upload coverage HTML report
       uses: actions/upload-artifact@v4

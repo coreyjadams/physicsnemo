@@ -67,9 +67,9 @@ jobs:
 
     - name: Run core tests (collect all for testmon)
       run: |
-        # Use --testmon to collect dependency data for the database
-        # All tests will run since there's no prior database, and dependencies will be recorded
-        uv run coverage run --rcfile='test/coverage.pytest.rc' -m pytest --testmon --ignore-glob="*docs*" --ignore-glob="*examples*"
+        # Use --testmon-forceselect to force running ALL tests while collecting dependency data
+        # This ensures full coverage AND populates the testmon database for PR workflows
+        uv run coverage run --rcfile='test/coverage.pytest.rc' -m pytest --testmon-forceselect --ignore-glob="*docs*" --ignore-glob="*examples*"
 
     - name: Run doc tests (testmon not supported for doctests)
       run: |
@@ -80,6 +80,8 @@ jobs:
         uv run coverage combine
         uv run coverage report --show-missing --omit="*test*" --omit="*internal*" --omit="*experimental*" --fail-under=45
         uv run coverage html
+        # Also create an XML report for potential CI integrations
+        uv run coverage xml -o coverage.xml
 
     - name: Delete old testmon cache
       run: |
@@ -102,3 +104,12 @@ jobs:
         name: coverage-report-${{ matrix.os }}-py${{ matrix.python-version }}
         path: htmlcov/
         retention-days: 7
+
+    - name: Upload combined coverage data
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-data-${{ matrix.os }}-py${{ matrix.python-version }}
+        path: |
+          .coverage
+          coverage.xml
+        retention-days: 30
