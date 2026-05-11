@@ -27,8 +27,14 @@ name: highlift_volume
 train_datadir: ${dataset_paths.highlift_aero_ml}
 
 # Freestream conditions — slug-inch-second-Rankine unit system
+# The freestream *direction* (and hence angle of attack) varies per case
+# and is read from the DomainMesh's `global_data.inlet_velocity` (a unit
+# vector in the streamwise-lift XY plane: cases place AoA as
+# `(cos AoA, sin AoA, 0)`, with Z = span).  Only the constant magnitude
+# is configured here; the per-sample `U_inf` vector is assembled by the
+# `ComputeFreestreamVector` transform below.
 metadata:
-  U_inf: [2672.95, 0.0, 186.92]   # 2679.505 in/s at AoA=4°
+  U_inf_mag: 2679.505              # 2679.505 in/s (constant across AoAs)
   p_inf: 176.352                   # 14.696 psi × 12 → slug/(in·s²)
   rho_inf: 1.3756e-6               # 0.002377 slug/ft³ → slug/in³
   T_inf: 518.67                    # [°R]
@@ -40,6 +46,7 @@ pipeline:
     path: ${train_datadir}
     pattern: "**/*.pdmsh"
     subsample_n_points: ${sampling_resolution}
+    subsample_n_cells: ${sampling_resolution}
     extra_boundaries:
       stl_geometry:
         pattern: "*.stl.pmsh"
@@ -54,6 +61,12 @@ pipeline:
   #       low: [-1.0, -1.0, 0.0]
   #       high: [1.0, 1.0, 0.0]
   transforms:
+    # Assemble the per-case freestream vector (U_inf = U_inf_mag *
+    # inlet_velocity) into global_data.U_inf.  inlet_velocity is a
+    # per-case unit direction (cos AoA, sin AoA, 0) loaded from the
+    # DomainMesh's global_data; U_inf_mag (scalar) comes from the YAML
+    # `metadata` block above.
+    - _target_: ${dp:ComputeFreestreamVector}
     # - _target_: ${dp:CenterMesh}
     #   use_area_weighting: false
     # - _target_: ${dp:NonDimensionalizeByMetadata}

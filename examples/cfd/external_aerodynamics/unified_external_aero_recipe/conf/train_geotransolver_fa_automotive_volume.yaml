@@ -74,8 +74,20 @@ model:
 # -- Dataset -----------------------------------------------------------------
 dataset:
   name: drivaer_ml_volume
+<<<<<<< Updated upstream
   sampling_resolution: 100000
   metrics: [l2, l1]
+=======
+  sampling_resolution: 300000   # override SubsampleMesh n_cells/n_points in all dataset configs
+  targets:
+    velocity: vector
+    pressure: scalar
+    nut: scalar
+  nondim_types:
+    velocity: velocity
+    nut: identity
+  metrics: [l2, l1, mae]
+>>>>>>> Stashed changes
 
 # -- Training ----------------------------------------------------------------
 training:

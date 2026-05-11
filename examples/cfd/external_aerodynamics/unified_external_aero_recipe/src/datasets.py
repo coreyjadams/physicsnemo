@@ -60,6 +60,7 @@ from physicsnemo.mesh import DomainMesh, Mesh
 
 import nondim  # noqa: F401  (registers NonDimensionalizeByMetadata)
 import sdf  # noqa: F401  (registers ComputeSDFFromBoundary, DropBoundary)
+<<<<<<< Updated upstream
 from metrics import MetricName
 from utils import FieldType
 
@@ -68,6 +69,9 @@ from utils import FieldType
 ### logging pipeline as the recipe's ``PythonLogger``, so it shows up in
 ### whatever handlers the training script has configured.
 _LOGGER = logging.getLogger("training.datasets")
+=======
+import freestream  # noqa: F401  (registers MeshReaderWithGlobalData, ComputeFreestreamVector)
+>>>>>>> Stashed changes
 
 
 def load_dataset_config(yaml_path: str | Path) -> DictConfig:
