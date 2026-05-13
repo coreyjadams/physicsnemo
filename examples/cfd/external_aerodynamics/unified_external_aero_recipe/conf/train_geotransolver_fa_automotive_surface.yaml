@@ -75,16 +75,11 @@ model:
 # -- Dataset -----------------------------------------------------------------
 dataset:
   name: drivaer_ml_surface
-<<<<<<< Updated upstream
-  sampling_resolution: 200000
-  metrics: [l2]
-=======
   sampling_resolution: 300000   # override SubsampleMesh n_cells/n_points in all dataset configs
   targets:
     pressure: scalar
     wss: vector
   metrics: [l2, l1, mae]
->>>>>>> Stashed changes
 
 # -- Training ----------------------------------------------------------------
 training:

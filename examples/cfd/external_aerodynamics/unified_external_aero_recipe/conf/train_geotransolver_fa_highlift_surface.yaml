@@ -76,10 +76,6 @@ model:
 # -- Dataset -----------------------------------------------------------------
 dataset:
   name: highlift_surface
-<<<<<<< Updated upstream
-  sampling_resolution: 100000
-  metrics: [l2]
-=======
   sampling_resolution: 500000
   targets:
     pressure: scalar
@@ -95,7 +91,6 @@ dataset:
     velocity: velocity
     tau_wall: stress
   metrics: [l1, l2, mae]
->>>>>>> Stashed changes
 
 # -- Training ----------------------------------------------------------------
 training:
@@ -121,15 +116,9 @@ training:
 dataloader:
   prefetch_factor: 1
   num_streams: 1
-<<<<<<< Updated upstream
-  use_streams: false     # ball query is not stream-safe
-  num_workers: 4
-  pin_memory: true
-=======
   use_streams: false      # ball query is not stream-safe
   num_workers: 1
   pin_memory: false
->>>>>>> Stashed changes
 
 # -- Logging -----------------------------------------------------------------
 logging:

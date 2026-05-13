@@ -21,35 +21,25 @@
 # (derived from vertex-projected point_data during conversion).
 # Model inputs use cell centroids and face normals; topology (triangles)
 # is preserved for normal computation and cell-based subsampling.
+# global_data: the boundary tensordict's own global_data is empty; the
+# per-case freestream conditions (U_inf, p_inf, rho_inf, T_inf, L_ref)
+# live on the parent DomainMesh's _tensordict/global_data, so we use
+# MeshReaderWithGlobalData to merge them onto each boundary Mesh at load
+# time. Units are slug-inch-second-Rankine.
 # Splits are controlled by manifest.json + train_split/val_split in the training config.
 
 name: highlift_surface
 
 train_datadir: ${dataset_paths.highlift_aero_ml}
 
-# Freestream conditions — slug-inch-second-Rankine unit system
-# The freestream *direction* (and hence angle of attack) varies per case
-# and is read from the parent DomainMesh's `global_data.inlet_velocity`
-# (a unit vector in the streamwise-lift XY plane: cases place AoA as
-# `(cos AoA, sin AoA, 0)`, with Z = span).  Only the constant magnitude
-# is configured here; the per-sample `U_inf` vector is assembled by the
-# `ComputeFreestreamVector` transform below.
-metadata:
-  U_inf_mag: 2679.505              # 2679.505 in/s (constant across AoAs)
-  p_inf: 176.352                   # 14.696 psi × 12 → slug/(in·s²)
-  rho_inf: 1.3756e-6               # 0.002377 slug/ft³ → slug/in³
-  T_inf: 518.67                    # [°R]
-  L_ref: 1156.75                    # [in] — span
-
 pipeline:
   reader:
-    # Surface boundary tensordicts have an empty `global_data`, so we
-    # explicitly pull `inlet_velocity` (and any other case-level fields)
-    # in from the parent DomainMesh's `_tensordict/global_data`.
     _target_: ${dp:MeshReaderWithGlobalData}
     path: ${train_datadir}
-    pattern: "geo_LHC*/*.pdmsh/_tensordict/boundaries/boundary"
+    pattern: "geo_LHC*/*.pdmsh/_tensordict/boundaries/vehicle"
     subsample_n_cells: ${sampling_resolution}
+    # Walk up two levels from the boundary tensordict to the parent
+    # DomainMesh's global_data and merge its keys onto each sample.
     merge_global_data_from: "../../global_data"
   augmentations:
     - _target_: ${dp:RandomRotateMesh}
@@ -63,15 +53,6 @@ pipeline:
         low: [-1.0, -1.0, 0.0]
         high: [1.0, 1.0, 0.0]
   transforms:
-    # Assemble the per-case freestream vector before CenterMesh so that
-    # downstream augmentations (RandomRotateMesh, transform_global_data:
-    # true) rotate U_inf with the geometry, and so NonDimensionalizeBy-
-    # Metadata sees a vector U_inf in global_data.
-    #   inlet_velocity (shape (3,), per case, unit length, in-plane XY)
-    #     comes from the parent DomainMesh's global_data via
-    #     MeshReaderWithGlobalData.
-    #   U_inf_mag (scalar) is injected from the YAML `metadata` block.
-    - _target_: ${dp:ComputeFreestreamVector}
     - _target_: ${dp:CenterMesh}
       use_area_weighting: false
     - _target_: ${dp:ComputeSurfaceNormals}
