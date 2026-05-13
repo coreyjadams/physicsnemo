@@ -57,7 +57,7 @@ model:
   out_dim: 9              # pressure (1) + temperature (1) + density (1) + velocity (3) + tau_wall (3)
   geometry_dim: 3         # point coordinates
   global_dim: 3           # freestream velocity U_inf (3)
-  n_layers: 20
+  n_layers: 12
   n_hidden: 256
   dropout: 0.0
   n_head: 8
@@ -67,30 +67,17 @@ model:
   use_te: false           # GALE_FA does not support TE
   plus: false
   attention_type: "GALE_FA"
-  include_local_features: true
+  include_local_features: false
   radii: [0.1, 0.5, 2.0]
   neighbors_in_radius: [16, 32, 64]
   n_hidden_local: 32
-  state_mixing_mode: "concat_project"  # "weighted" (default) or "concat_project"
+  state_mixing_mode: "weighted"  # "weighted" (default) or "concat_project"
 
 # -- Dataset -----------------------------------------------------------------
 dataset:
   name: highlift_surface
-  sampling_resolution: 500000
-  targets:
-    pressure: scalar
-    temperature: scalar
-    density: scalar
-    velocity: vector
-    tau_wall: vector
-  # Explicit nondim type per output field for physical-space metric inversion.
-  nondim_types:
-    pressure: pressure
-    temperature: temperature
-    density: density
-    velocity: velocity
-    tau_wall: stress
-  metrics: [l1, l2, mae]
+  sampling_resolution: 100000
+  metrics: [l2]
 
 # -- Training ----------------------------------------------------------------
 training:
@@ -102,23 +89,23 @@ training:
   scheduler_update_mode: "epoch"
 
   optimizer:
-    lr: 1.0e-3
+    lr: 3.0e-3
     weight_decay: 1.0e-4
     betas: [0.9, 0.999]
     eps: 1.0e-8
 
   scheduler:
     _target_: torch.optim.lr_scheduler.StepLR
-    step_size: 200
+    step_size: 100
     gamma: 0.1
 
 # -- DataLoader / Dataset Performance Tuning --------------------------------
 dataloader:
   prefetch_factor: 1
   num_streams: 1
-  use_streams: false      # ball query is not stream-safe
+  use_streams: false     # ball query is not stream-safe
   num_workers: 1
-  pin_memory: false
+  pin_memory: true
 
 # -- Logging -----------------------------------------------------------------
 logging:
@@ -138,5 +125,5 @@ logging:
 data:
   highlift:
     config: conf/dataset/highlift_surface.yaml
-    train_split: full_train
-    val_split: full_val
+    train_split: single_aoa_4_train
+    val_split: single_aoa_4_val
