@@ -648,7 +648,7 @@ def perform_halo_collective(
 
     elif method == "a2a":
         # This has to be funcol collectives, below, to be
-        # conmpatible with torc.compile.
+        # compatible with torch.compile.
         #
         # Symmetric-halo assumption: what I receive from neighbor R has the
         # same numel as what I send to R (true for uniform halo sizes used
