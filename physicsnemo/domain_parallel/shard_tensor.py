@@ -26,9 +26,8 @@ from typing import Callable, Sequence, cast
 
 import torch
 import torch.distributed as dist
-from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
-from torch.distributed.tensor import DTensor, distribute_module
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import (
     TensorMeta,
 )
@@ -1409,42 +1408,6 @@ class ShardTensor(torch.Tensor):
             return torch.Tensor.backward(self, *args, **kwargs)
 
         return self.to_local().backward(*args, **kwargs)
-
-
-### TODO
-### Do we still need this?
-### I think we do not - CJA
-
-
-class FSDPOutputTensorAdapter(nn.Module):
-    """Wrap a module and convert ShardTensor outputs to torch.Tensor."""
-
-    def __init__(self, module: nn.Module) -> None:
-        super().__init__()
-        self.module = module
-
-    def forward(self, *args, **kwargs):
-        out = self.module(*args, **kwargs)
-        return out.to_local() if isinstance(out, ShardTensor) else out
-
-
-def wrap_for_fsdp(module: nn.Module) -> nn.Module:
-    """Return a module wrapper that exposes tensor outputs for FSDP hooks."""
-    return FSDPOutputTensorAdapter(module)
-
-
-def distribute_over_domain_for_fsdp(
-    module: nn.Module,
-    device_mesh: DeviceMesh,
-    partition_fn: (Callable[[str, nn.Module, DeviceMesh], None] | None) = None,
-) -> nn.Module:
-    """Distribute a module over a domain mesh and adapt outputs for FSDP."""
-    distributed_module = distribute_module(
-        module,
-        device_mesh=device_mesh,
-        partition_fn=partition_fn,
-    )
-    return wrap_for_fsdp(distributed_module)
 
 
 def scatter_tensor(
