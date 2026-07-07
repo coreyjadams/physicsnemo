@@ -180,7 +180,7 @@ class _ShardTensorToDTensor(torch.autograd.Function):
         # unchanged, so the cached shard shapes stay valid.
         if grad_placements != tuple(cached_spec.placements):
             cached_spec = dataclasses.replace(cached_spec, placements=grad_placements)
-        return (_dtensor_to_shard_tensor(grad_output, ctx.shard_tensor_spec),)
+        return (_dtensor_to_shard_tensor(grad_output, cached_spec),)
 
 
 # ============================================================================
