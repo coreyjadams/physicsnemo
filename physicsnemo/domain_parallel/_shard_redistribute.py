@@ -308,7 +308,7 @@ def _to_new_shard_dim(
         dist.all_to_all(recv_shape_tensors, send_shapes, group=group)
 
         # Turn the recv_shapes back into plain int shape lists.
-        recv_shapes = [r.tolist() for r in recv_shapes]
+        recv_shapes = [r.tolist() for r in recv_shape_tensors]
 
     # Create the buffers for recv:
     recv_buffers = [

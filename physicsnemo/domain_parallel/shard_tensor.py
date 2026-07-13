@@ -594,7 +594,7 @@ class _FromTorchTensor(torch.autograd.Function):
     @staticmethod
     def setup_context(ctx, inputs, output) -> None:
         r"""Save the source mesh and placements for the backward redistribute."""
-        _local_input, device_mesh, placements, _sharding_shapes = inputs
+        _local_input, device_mesh, placements, _sharding_shapes, _global_shape = inputs
         ctx.previous_placement = placements
         ctx.previous_mesh = device_mesh
 
