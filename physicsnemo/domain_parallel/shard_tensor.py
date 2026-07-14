@@ -930,9 +930,22 @@ class ShardTensor(torch.Tensor):
             _local_shape=local_tensor.shape,
             _sharding_shapes=sharding_shapes,
         )
+        # Do NOT force ``local_tensor.requires_grad_(requires_grad)`` on the
+        # reconstructed inner. The wrapper's ``requires_grad`` is set below via
+        # ``__new__`` -> ``_make_wrapper_subclass(requires_grad=...)``. Forcing
+        # the inner makes the reconstructed local's ``requires_grad`` disagree
+        # with the real tensor's for the (normal) detached-local op-result case
+        # (``wrapper.requires_grad=True`` from a ``grad_fn`` but
+        # ``_local_tensor.requires_grad=False``): under Dynamo re-faking across a
+        # graph break, ``assert_metadata_eq`` then trips on the inner
+        # (``False != True``). Stock DTensor never forces the inner -- it keeps
+        # the local's own flag and sets ``requires_grad`` on the wrapper only --
+        # which is why DTensor survives the identical op-result /
+        # ``to_local``-after-graph-break path that a tensor-subclass forward
+        # hits. Match DTensor: pass ``local_tensor`` through unchanged.
         return ShardTensor.__new__(
             ShardTensor,
-            local_tensor=local_tensor.requires_grad_(requires_grad),
+            local_tensor=local_tensor,
             spec=unflatten_spec,
             requires_grad=requires_grad,
         )
@@ -989,80 +1002,127 @@ class ShardTensor(torch.Tensor):
         """Runtime hook: redistribute ``self`` to match the recorded tangent's
         placements and ``_sharding_shapes`` (preserves uneven layouts).
 
-        Returns ``None`` when ``expected_type`` differs (DTensor convention).
+        Unlike stock DTensor -- which returns ``None`` whenever ``expected_type``
+        differs (refuse cross-type) -- this hook is subclass-friendly. A
+        ``ShardTensor`` subclass may produce forward *outputs* of the subclass
+        type while many backward *tangents* are constructed as this *base* type
+        (e.g. ``_ToTorchTensor.backward``). AOTAutograd records
+        ``expected_type=<subclass>`` from the output, then asks the base-typed
+        tangent to coerce *up* to it; returning ``None`` there makes *every*
+        op's backward raise "guessed its metadata incorrectly". Instead we:
+        (1) accept a subclass's nested ``(base_ctx, subclass_ctx)`` flatten
+        context as well as the base's flat ``(spec, requires_grad)``;
+        (2) treat ``{}`` and ``None`` ``_sharding_shapes`` as equal (an
+        op-result re-wrap carries ``{}``, a fresh spec carries ``None`` -- both
+        mean "no explicit per-rank shapes"); (3) reconcile placements / sharding
+        as before; and (4) when a differing ``expected_type`` that is itself a
+        ``ShardTensor`` subclass is requested, rebuild via *that* type's own
+        ``__tensor_unflatten__`` (which reclasses and reattaches its metadata)
+        rather than returning ``None``. For a genuinely foreign ``expected_type``
+        (a plain tensor / ``DTensor``) the DTensor ``None`` convention is kept.
         """
-        if expected_type is not None:
+        # Accept the subclass's nested ``(base_ctx, subclass_ctx)`` context or
+        # the base's flat ``(spec, requires_grad)`` context.
+        base_ctx = (
+            flatten_spec[0] if isinstance(flatten_spec[0], tuple) else flatten_spec
+        )
+        (spec, _requires_grad) = base_ctx
+
+        def _norm_sharding_shapes(sharding_shapes: object) -> object:
+            # ``{}`` (op-result re-wrap) and ``None`` (fresh spec) both mean
+            # "no explicit per-rank sharding shapes" -- treat them as equal so we
+            # don't redistribute over a spurious difference.
+            return sharding_shapes or None
+
+        if self._spec.placements == spec.placements and _norm_sharding_shapes(
+            self._spec._sharding_shapes
+        ) == _norm_sharding_shapes(spec._sharding_shapes):
+            coerced: "ShardTensor" = self
+        else:
+            # Tangent (grad-direction) convention, matching
+            # ShardRedistribute.backward's spec normalization: a Partial label on
+            # a tangent marks replicate-valued data, NOT a pending reduction. Any
+            # Partial <-> Replicate mismatch here is a free relabel -- move data
+            # with Partial normalized to Replicate on both sides, then stamp the
+            # recorded placements verbatim (AOT requires the returned tangent's
+            # metadata to match the recorded spec exactly).
+            def _normalize(placements: tuple) -> tuple:
+                return tuple(
+                    Replicate() if isinstance(p, Partial) else p for p in placements
+                )
+
+            current_spec = self._spec
+            if any(isinstance(p, Partial) for p in current_spec.placements):
+                current_spec = dataclasses.replace(
+                    current_spec, placements=_normalize(current_spec.placements)
+                )
+            normalized_target_placements = _normalize(spec.placements)
+
+            # Bypass ``self.redistribute()`` so we can thread the recorded
+            # per-tensor-dim shard sizes through to the local redistribute (the
+            # public API drops them).
+            target_sharding_shapes_by_tensor_dim: dict[int, list[int]] = {}
+            if spec._sharding_shapes is not None:
+                for mesh_dim, placement in enumerate(spec.placements):
+                    if (
+                        isinstance(placement, Shard)
+                        and mesh_dim in spec._sharding_shapes
+                    ):
+                        shard_shapes = spec._sharding_shapes[mesh_dim]
+                        target_sharding_shapes_by_tensor_dim[placement.dim] = [
+                            s[placement.dim] for s in shard_shapes
+                        ]
+
+            move_spec = ShardTensorSpec(
+                mesh=self.device_mesh,
+                placements=normalized_target_placements,
+                tensor_meta=self._spec.tensor_meta,
+                _sharding_shapes=spec._sharding_shapes,
+            )
+            new_local = redistribute_local_shard_tensor(
+                self._local_tensor,
+                current_spec,
+                move_spec,
+                async_op=False,
+                target_sharding_shapes=target_sharding_shapes_by_tensor_dim,
+            )
+
+            # Final stamp: the recorded placements exactly as AOT expects them,
+            # including any Partial labels (a relabel of the moved data).
+            target_spec = ShardTensorSpec(
+                mesh=self.device_mesh,
+                placements=spec.placements,
+                tensor_meta=self._spec.tensor_meta,
+                _sharding_shapes=spec._sharding_shapes,
+            )
+            target_spec._local_shape = new_local.shape
+
+            coerced = ShardTensor(
+                new_local.contiguous(),
+                target_spec,
+                requires_grad=self.requires_grad,
+            )
+
+        if expected_type is not None and expected_type is not type(coerced):
+            # Cross-type: if the expected type is a ``ShardTensor`` subclass,
+            # rebuild via ITS own unflatten (handles ``__class__`` reclass +
+            # reattaching subclass metadata from the nested subclass context).
+            # This is what lets a subclass whose forward outputs are the subclass
+            # type accept a base-typed backward tangent without AOTAutograd
+            # raising "guessed its metadata incorrectly". For a genuinely foreign
+            # type (e.g. a plain ``torch.Tensor`` or ``DTensor``) we cannot do
+            # that -- preserve the DTensor convention and decline the coercion.
+            if isinstance(expected_type, type) and issubclass(
+                expected_type, ShardTensor
+            ):
+                return expected_type.__tensor_unflatten__(
+                    {"_local_tensor": coerced._local_tensor},
+                    flatten_spec,
+                    tuple(coerced.shape),
+                    coerced.stride(),
+                )
             return None
-
-        (spec, _requires_grad) = flatten_spec
-
-        if (
-            self._spec.placements == spec.placements
-            and self._spec._sharding_shapes == spec._sharding_shapes
-        ):
-            return self
-
-        # Tangent (grad-direction) convention, matching ShardRedistribute.backward's
-        # spec normalization and _ShardTensorToDTensor.backward's relabel: a
-        # Partial label on a tangent marks replicate-valued data, NOT a pending
-        # reduction. Any Partial <-> Replicate mismatch here must therefore be
-        # a free relabel. Redistributing it for real would all-reduce an
-        # already-full tangent (x mesh_size) or partition it (/ mesh_size).
-        # So: move data with Partial normalized to Replicate on both sides,
-        # then stamp the recorded placements verbatim (AOT requires the
-        # returned tangent's metadata to match the recorded spec exactly).
-        def _normalize(placements: tuple) -> tuple:
-            return tuple(
-                Replicate() if isinstance(p, Partial) else p for p in placements
-            )
-
-        current_spec = self._spec
-        if any(isinstance(p, Partial) for p in current_spec.placements):
-            current_spec = dataclasses.replace(
-                current_spec, placements=_normalize(current_spec.placements)
-            )
-        normalized_target_placements = _normalize(spec.placements)
-
-        # Bypass ``self.redistribute()`` so we can thread the recorded per-tensor-dim
-        # shard sizes through to the local redistribute (the public API drops them).
-        target_sharding_shapes_by_tensor_dim: dict[int, list[int]] = {}
-        if spec._sharding_shapes is not None:
-            for mesh_dim, placement in enumerate(spec.placements):
-                if isinstance(placement, Shard) and mesh_dim in spec._sharding_shapes:
-                    shard_shapes = spec._sharding_shapes[mesh_dim]
-                    target_sharding_shapes_by_tensor_dim[placement.dim] = [
-                        s[placement.dim] for s in shard_shapes
-                    ]
-
-        move_spec = ShardTensorSpec(
-            mesh=self.device_mesh,
-            placements=normalized_target_placements,
-            tensor_meta=self._spec.tensor_meta,
-            _sharding_shapes=spec._sharding_shapes,
-        )
-        new_local = redistribute_local_shard_tensor(
-            self._local_tensor,
-            current_spec,
-            move_spec,
-            async_op=False,
-            target_sharding_shapes=target_sharding_shapes_by_tensor_dim,
-        )
-
-        # Final stamp: the recorded placements exactly as AOT expects them,
-        # including any Partial labels (a relabel of the moved data).
-        target_spec = ShardTensorSpec(
-            mesh=self.device_mesh,
-            placements=spec.placements,
-            tensor_meta=self._spec.tensor_meta,
-            _sharding_shapes=spec._sharding_shapes,
-        )
-        target_spec._local_shape = new_local.shape
-
-        return ShardTensor(
-            new_local.contiguous(),
-            target_spec,
-            requires_grad=self.requires_grad,
-        )
+        return coerced
 
     # -- Autograd property overrides -------------------------------------------
     # The C-level requires_grad is authoritative for autograd engine

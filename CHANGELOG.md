@@ -365,6 +365,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `training.field_weights={pressure: 1.0, wss: 100.0}`, which was redundant
   with `NormalizeMeshFields` normalization and starved the pressure field
   of gradient signal (~2x worse converged pressure L2 at equal WSS L2).
+- `ShardTensor` now survives `torch.compile` / AOTAutograd for tensor-subclass
+  users: `__tensor_unflatten__` no longer forces `requires_grad` on the
+  reconstructed inner (matching DTensor, so the inner/wrapper flags cannot
+  disagree and trip `assert_metadata_eq` under a Dynamo graph-break re-fake),
+  and `__coerce_same_metadata_as_tangent__` is subclass-friendly — it accepts a
+  subclass's nested flatten context, treats empty and `None` sharding-shape maps
+  as equal, and rebuilds a differing `ShardTensor`-subclass tangent via that
+  type's own `__tensor_unflatten__` instead of returning `None` (the plain-tensor
+  / `DTensor` cross-type `None` convention is preserved).
 - Datapipe contiguous-block subsampling now wraps cyclically, giving boundary
   and interior elements equal inclusion probability.
 - Cell-subsampled GLOBE inputs now retain their effective integration measure,

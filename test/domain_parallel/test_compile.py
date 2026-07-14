@@ -98,7 +98,9 @@ def test_coerce_same_placements_unknown_shapes_1d(distributed_mesh):
 
 
 def run_coerce_expected_type_returns_none(mesh):
-    # Mismatched expected_type must short-circuit to None (DTensor convention).
+    # A *foreign* expected_type (a plain tensor / DTensor, i.e. not a ShardTensor
+    # subclass) must short-circuit to None -- the DTensor cross-type convention,
+    # which the subclass-friendly path below deliberately preserves.
     st = shard_tensor_factory(mesh, uneven=True)
     out = st.__coerce_same_metadata_as_tangent__(
         (st._spec, False), expected_type=torch.Tensor
@@ -110,6 +112,129 @@ def run_coerce_expected_type_returns_none(mesh):
 @pytest.mark.timeout(120)
 def test_coerce_expected_type_returns_none_1d(distributed_mesh):
     run_coerce_expected_type_returns_none(distributed_mesh)
+
+
+class _MarkerShardTensor(ShardTensor):
+    """A minimal ``ShardTensor`` subclass used to exercise the subclass-friendly
+    cross-type tangent-coercion path. It adds no new inner tensors or metadata;
+    its own ``__tensor_unflatten__`` just reclasses a base reconstruction so the
+    result carries the subclass type (as a real subclass with per-instance
+    routing metadata would)."""
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, flatten_spec, outer_size, outer_stride):
+        st = ShardTensor.__tensor_unflatten__(
+            inner_tensors, flatten_spec, outer_size, outer_stride
+        )
+        st.__class__ = _MarkerShardTensor
+        return st
+
+
+def run_coerce_accepts_nested_flatten_context(mesh):
+    # A ShardTensor subclass emits a nested ``(base_ctx, subclass_ctx)`` flatten
+    # context. The coerce hook must unwrap it to the base ``(spec, requires_grad)``
+    # and behave exactly as it does for the base's flat context.
+    st = shard_tensor_factory(mesh, uneven=True)
+    recorded_spec = st._spec
+    expected_local_shape = tuple(st._local_tensor.shape)
+    expected_full = st.full_tensor().clone()
+
+    nested_ctx = ((recorded_spec, False), ("subclass-metadata-placeholder",))
+    coerced = st.__coerce_same_metadata_as_tangent__(nested_ctx)
+
+    assert isinstance(coerced, ShardTensor)
+    assert coerced._spec.placements == recorded_spec.placements
+    assert tuple(coerced._local_tensor.shape) == expected_local_shape
+    assert torch.allclose(coerced.full_tensor(), expected_full)
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(120)
+def test_coerce_accepts_nested_flatten_context_1d(distributed_mesh):
+    run_coerce_accepts_nested_flatten_context(distributed_mesh)
+
+
+def run_coerce_empty_and_none_sharding_shapes_equal(mesh):
+    # ``{}`` (an op-result re-wrap) and ``None`` (a fresh spec) both mean "no
+    # explicit per-rank sharding shapes". With identical placements the hook must
+    # treat them as equal and short-circuit to ``self`` -- no redistribute.
+    st = shard_tensor_factory(mesh, uneven=True)
+
+    spec_empty = ShardTensorSpec(
+        mesh=st._spec.mesh,
+        placements=st._spec.placements,
+        tensor_meta=st._spec.tensor_meta,
+        _sharding_shapes={},
+    )
+    st_empty = ShardTensor(st._local_tensor, spec_empty, requires_grad=False)
+
+    recorded_spec_none = ShardTensorSpec(
+        mesh=st._spec.mesh,
+        placements=st._spec.placements,
+        tensor_meta=st._spec.tensor_meta,
+        _sharding_shapes=None,
+    )
+
+    coerced = st_empty.__coerce_same_metadata_as_tangent__((recorded_spec_none, False))
+    assert coerced is st_empty
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(120)
+def test_coerce_empty_and_none_sharding_shapes_equal_1d(distributed_mesh):
+    run_coerce_empty_and_none_sharding_shapes_equal(distributed_mesh)
+
+
+def run_coerce_expected_subclass_rebuilds(mesh):
+    # A differing expected_type that *is* a ShardTensor subclass must be rebuilt
+    # via that subclass's own ``__tensor_unflatten__`` (reclass + reattach), not
+    # dropped to None -- this is what lets a subclass accept a base-typed tangent.
+    st = shard_tensor_factory(mesh, uneven=True)
+    expected_full = st.full_tensor().clone()
+
+    out = st.__coerce_same_metadata_as_tangent__(
+        (st._spec, False), expected_type=_MarkerShardTensor
+    )
+
+    assert isinstance(out, _MarkerShardTensor)
+    assert out._spec.placements == st._spec.placements
+    assert torch.allclose(out.full_tensor(), expected_full)
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(120)
+def test_coerce_expected_subclass_rebuilds_1d(distributed_mesh):
+    run_coerce_expected_subclass_rebuilds(distributed_mesh)
+
+
+def run_unflatten_does_not_force_inner_requires_grad(mesh):
+    # ``__tensor_unflatten__`` must NOT force ``requires_grad`` on the inner. For
+    # the normal detached-local op-result case the wrapper carries requires_grad
+    # (from a grad_fn) while the inner does not; forcing the inner makes them
+    # disagree and trips ``assert_metadata_eq`` under Dynamo re-fake across a
+    # graph break. Match DTensor: the inner keeps its own flag unchanged.
+    st = shard_tensor_factory(mesh, uneven=False)
+    local = st._local_tensor.detach()
+    assert local.requires_grad is False
+
+    _inner_names, ctx = st.__tensor_flatten__()
+    spec, _ = ctx
+
+    rebuilt = ShardTensor.__tensor_unflatten__(
+        {"_local_tensor": local}, (spec, True), st.shape, st.stride()
+    )
+
+    # Wrapper honors the requested requires_grad; the inner is left untouched
+    # (still False) and the passed-in local is not mutated in place.
+    assert rebuilt.requires_grad is True
+    assert rebuilt._local_tensor.requires_grad is False
+    assert local.requires_grad is False
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(120)
+def test_unflatten_does_not_force_inner_requires_grad_1d(distributed_mesh):
+    run_unflatten_does_not_force_inner_requires_grad(distributed_mesh)
 
 
 def _sum_squares(x):
