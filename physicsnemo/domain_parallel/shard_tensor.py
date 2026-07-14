@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import hashlib
+import logging
 import threading
 import warnings
 from collections.abc import Iterable, Mapping
@@ -52,6 +53,8 @@ from physicsnemo.domain_parallel._shard_tensor_spec import (
 )
 
 aten = torch.ops.aten
+
+logger = logging.getLogger(__name__)
 
 
 class TensorPromotionMode(enum.Enum):
@@ -937,9 +940,7 @@ class ShardTensor(torch.Tensor):
         """
         cached = getattr(self, cache_attr, None)
         if cached is None:
-            cached = torch.zeros(
-                0, dtype=torch.int64, device=self._local_tensor.device
-            )
+            cached = torch.zeros(0, dtype=torch.int64, device=self._local_tensor.device)
             setattr(self, cache_attr, cached)
         return cached
 
@@ -1038,7 +1039,9 @@ class ShardTensor(torch.Tensor):
         return inner_names, (base_ctx, subclass_ctx)
 
     @classmethod
-    def __tensor_unflatten__(cls, inner_tensors, flatten_spec, outer_size, outer_stride):
+    def __tensor_unflatten__(
+        cls, inner_tensors, flatten_spec, outer_size, outer_stride
+    ):
         # Accept a subclass's nested ``(base_ctx, subclass_ctx)`` or the base's
         # flat ``(spec, requires_grad)`` context.
         if isinstance(flatten_spec[0], tuple):
@@ -1304,6 +1307,17 @@ class ShardTensor(torch.Tensor):
                     tuple(coerced.shape),
                     coerced.stride(),
                 )
+            # Coerce DOWN to a plain ``torch.Tensor`` when the boundary is fully
+            # replicated (local == global, so returning the local view is
+            # lossless). This is the mirror of the up/across cases: AOTAutograd
+            # may ask a ShardTensor output to produce a plain-tensor tangent, and
+            # returning ``None`` there would raise "guessed its metadata
+            # incorrectly". For any other (non-replicated, or non-plain) foreign
+            # type the DTensor ``None`` convention holds.
+            if expected_type is torch.Tensor and all(
+                isinstance(p, Replicate) for p in coerced._spec.placements
+            ):
+                return coerced._local_tensor
             return None
         return coerced
 
@@ -1853,3 +1867,88 @@ def scatter_tensor(
         st = st.detach().requires_grad_(True)
 
     return st
+
+
+def install_aot_plain_tangent_coercion() -> None:
+    r"""Patch ``AOTDispatchAutograd.process_runtime_tangent`` so a *plain* runtime
+    backward tangent is rebuilt into a :class:`ShardTensor` when the compiled
+    graph traced a ShardTensor tangent at that position.
+
+    AOTAutograd can coerce a runtime *subclass* tangent to its traced metadata
+    (via :meth:`ShardTensor.__coerce_same_metadata_as_tangent__`), but has no
+    hook for a runtime *plain* ``torch.Tensor`` where the graph traced a subclass
+    tangent -- so it raises ``...guessed its metadata incorrectly``. That happens
+    when a ShardTensor boundary tensor crosses a Dynamo graph break: AOT
+    materializes the boundary cotangent as a plain tensor while the upstream
+    subgraph traced a ShardTensor tangent. The plain cotangent is value-correct
+    when the boundary placement is ``Replicate`` (local == global), so rebuilding
+    the subclass from it plus the traced ``SubclassCreationMeta`` (via
+    ``__tensor_unflatten__``) is lossless.
+
+    This is a general AOTAutograd expressiveness gap (no plain->subclass tangent
+    hook), not a ShardTensor one -- ideally PyTorch grows a first-class inverse
+    hook and this shim is deleted. It is scoped to ShardTensor: other subclasses
+    and plain-where-plain tangents fall through untouched. Idempotent; import or
+    rebuild failures degrade gracefully to the stock behavior. Declared inner
+    slots beyond ``_local_tensor`` (see :attr:`ShardTensor._extra_inner_tensors`)
+    are filled with zero-length ``int64`` sentinels, matching the flatten
+    contract.
+    """
+    try:
+        from torch._functorch._aot_autograd.runtime_wrappers import (
+            AOTDispatchAutograd,
+        )
+        from torch._functorch._aot_autograd.schemas import SubclassCreationMeta
+        from torch.utils._python_dispatch import is_traceable_wrapper_subclass
+    except Exception:  # pragma: no cover - torch internals moved / unavailable
+        logger.debug(
+            "AOT plain-tangent coercion shim not installed (import failed)",
+            exc_info=True,
+        )
+        return
+
+    _orig = AOTDispatchAutograd.process_runtime_tangent
+    if getattr(_orig, "_shardtensor_plain_tangent_shim", False):
+        return
+
+    def _process_runtime_tangent(x, meta, *args, **kwargs):
+        # ``*args`` / ``**kwargs`` forward any extra params the stock method
+        # takes across torch versions (e.g. ``tangent_idx`` added in torch 2.12);
+        # the coercion only touches ``(x, meta)``.
+        subclass_type = getattr(meta, "original_subclass_type", None)
+        if (
+            isinstance(x, torch.Tensor)
+            and not is_traceable_wrapper_subclass(x)
+            and isinstance(meta, SubclassCreationMeta)
+            and isinstance(subclass_type, type)
+            and issubclass(subclass_type, ShardTensor)
+            and "_local_tensor" in getattr(meta, "attrs", ())
+        ):
+            try:
+                inner = {
+                    name: (
+                        x
+                        if name == "_local_tensor"
+                        else torch.zeros(0, dtype=torch.int64, device=x.device)
+                    )
+                    for name in meta.attrs
+                }
+                x = subclass_type.__tensor_unflatten__(
+                    inner, meta.meta, meta.outer_size, meta.outer_stride
+                )
+            except Exception:  # pragma: no cover - fall through to stock error
+                logger.debug(
+                    "plain->ShardTensor runtime-tangent rebuild failed",
+                    exc_info=True,
+                )
+        return _orig(x, meta, *args, **kwargs)
+
+    _process_runtime_tangent._shardtensor_plain_tangent_shim = True
+    AOTDispatchAutograd.process_runtime_tangent = staticmethod(_process_runtime_tangent)
+
+
+# Install on import so ShardTensor survives a compiled backward whose cotangent
+# is materialized as a plain tensor across a Dynamo graph break. The shim is
+# scoped to ShardTensor and degrades gracefully, so it is inert for every other
+# compilation in the process.
+install_aot_plain_tangent_coercion()

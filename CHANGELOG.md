@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result back to the subclass. Lets a subclass route per-field metadata across
   ops without overriding `__torch_function__`. Skipped under `torch.compile`;
   empty by default (no overhead, base behavior unchanged).
+- Adds `domain_parallel.shard_tensor.install_aot_plain_tangent_coercion` (run on
+  import): patches AOTAutograd's `process_runtime_tangent` so a compiled
+  ShardTensor output whose backward cotangent is materialized as a *plain*
+  tensor across a Dynamo graph break is rebuilt into a ShardTensor from the
+  traced `SubclassCreationMeta` (lossless for a `Replicate` boundary) instead of
+  raising "guessed its metadata incorrectly". Scoped to ShardTensor and degrades
+  gracefully; a general AOTAutograd gap pending an upstream PyTorch hook.
+  `ShardTensor.__coerce_same_metadata_as_tangent__` now also coerces *down* to a
+  plain `torch.Tensor` for a replicated boundary.
 - Adds `integrate_moment` and `Mesh.integrate_moment` for measure-weighted
   outer-product moments. Mesh integration APIs now accept `nan_policy`.
 - Adds per-cell measure weights that are preserved through cell subsampling
