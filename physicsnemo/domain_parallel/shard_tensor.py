@@ -731,6 +731,22 @@ class ShardTensor(torch.Tensor):
     # alongside a ShardTensor in an intercepted op (see TensorPromotionMode).
     _promotion_mode: TensorPromotionMode = TensorPromotionMode.SILENT
 
+    # -- Subclass extension points (compile-safe subclassing) -----------------
+    # A ShardTensor subclass may need to carry extra, always-present inner
+    # tensors (beyond ``_local_tensor``) through Dynamo flatten/unflatten +
+    # AOTAutograd -- e.g. per-step routing metadata that must appear as a graph
+    # input rather than a baked trace-time constant. Keeping the inner-tensor
+    # count uniform across the forward trace and every backward tangent is what
+    # avoids AOT's ``len(meta.attrs) == len(runtime_subclass_keys)`` assert.
+    #
+    # Declaring the attribute names here lets the base ``__tensor_flatten__`` /
+    # ``__tensor_unflatten__`` include them automatically, so a subclass does not
+    # re-implement the flatten protocol. Each name must resolve (via attribute or
+    # property) to a tensor on every instance; use ``_stable_inner_sentinel`` for
+    # a per-instance placeholder when the slot is logically unset. Empty by
+    # default -- base ShardTensor behavior is unchanged.
+    _extra_inner_tensors: tuple[str, ...] = ()
+
     @classmethod
     def patches_enabled(cls) -> bool:
         r"""Check whether patches are enabled for this class.
@@ -868,12 +884,91 @@ class ShardTensor(torch.Tensor):
         """Return the placement strategy for each mesh dimension."""
         return self._spec.placements
 
-    def __tensor_flatten__(self):
-        return ["_local_tensor"], (self._spec, self.requires_grad)
+    # -- Subclass extension hooks ---------------------------------------------
+    # These let a subclass carry extra flatten context (nested alongside the
+    # base ``(spec, requires_grad)``) without re-implementing the flatten
+    # protocol. Both default to no-ops, so base ShardTensor is unchanged.
 
-    @staticmethod
-    def __tensor_unflatten__(inner_tensors, flatten_spec, outer_size, outer_stride):
-        spec, requires_grad = flatten_spec
+    def __subclass_flatten_context__(self) -> object | None:
+        r"""Hook: extra per-instance metadata a subclass wants carried through
+        Dynamo flatten/unflatten.
+
+        The returned value (if not ``None``) is nested by
+        :meth:`__tensor_flatten__` as ``(base_ctx, subclass_ctx)`` and handed
+        back to :meth:`__subclass_unflatten__` on reconstruction. It must be a
+        graph-constant for a given compiled region (routing tensors/objects with
+        no value-equality belong here, not shape/placement info -- see
+        :meth:`__metadata_guard__`). Default ``None``: the base emits its flat
+        ``(spec, requires_grad)`` context.
+        """
+        return None
+
+    def __subclass_unflatten__(self, subclass_ctx: object) -> None:
+        r"""Hook: reattach the metadata produced by
+        :meth:`__subclass_flatten_context__` onto a freshly reconstructed
+        instance. Default no-op.
+        """
+        return None
+
+    def _stable_inner_sentinel(self, cache_attr: str) -> torch.Tensor:
+        r"""Return a per-instance-cached zero-length ``int64`` sentinel tensor for
+        an extra inner slot that is logically unset.
+
+        AOTAutograd flattens an input subclass several times and asserts the
+        inner tensors are the *same object* across calls, so the sentinel is
+        cached on ``cache_attr`` (which the subclass must be able to store). It
+        is minted in ``_local_tensor``'s device / fake context so it participates
+        in tracing correctly (a shared real sentinel would mix fake and real
+        inner tensors under ``FakeTensorMode``).
+        """
+        cached = getattr(self, cache_attr, None)
+        if cached is None:
+            cached = torch.zeros(
+                0, dtype=torch.int64, device=self._local_tensor.device
+            )
+            setattr(self, cache_attr, cached)
+        return cached
+
+    @classmethod
+    def __metadata_guard__(cls, orig: object, other: object) -> bool:
+        r"""Dynamo tensor-subclass metadata guard.
+
+        ``orig`` / ``other`` are the contexts :meth:`__tensor_flatten__` emits --
+        either the base flat ``(spec, requires_grad)`` or a subclass's nested
+        ``((spec, requires_grad), subclass_ctx)``. Guard only on
+        ``(spec, requires_grad)``: any subclass context is deliberately ignored,
+        because it may hold tensors/objects without value-equality (the default
+        ``==``-against-deepcopy guard would then always fail and block compile),
+        and genuine shape/placement changes are already caught by
+        ``ShardTensorSpec`` equality plus Dynamo's own size guards. Mirrors
+        DTensor's ``__metadata_guard__``.
+        """
+        try:
+            orig_base = orig[0] if isinstance(orig[0], tuple) else orig
+            other_base = other[0] if isinstance(other[0], tuple) else other
+            (orig_spec, orig_rg) = orig_base
+            (other_spec, other_rg) = other_base
+        except (TypeError, ValueError):
+            return bool(orig == other)
+        return bool(orig_rg == other_rg) and bool(orig_spec == other_spec)
+
+    def __tensor_flatten__(self):
+        inner_names = ["_local_tensor", *self._extra_inner_tensors]
+        base_ctx = (self._spec, self.requires_grad)
+        subclass_ctx = self.__subclass_flatten_context__()
+        if subclass_ctx is None:
+            return inner_names, base_ctx
+        return inner_names, (base_ctx, subclass_ctx)
+
+    @classmethod
+    def __tensor_unflatten__(cls, inner_tensors, flatten_spec, outer_size, outer_stride):
+        # Accept a subclass's nested ``(base_ctx, subclass_ctx)`` or the base's
+        # flat ``(spec, requires_grad)`` context.
+        if isinstance(flatten_spec[0], tuple):
+            base_ctx, subclass_ctx = flatten_spec
+        else:
+            base_ctx, subclass_ctx = flatten_spec, None
+        spec, requires_grad = base_ctx
         local_tensor = inner_tensors["_local_tensor"]
         unflatten_meta = TensorMeta(
             shape=outer_size,
@@ -943,12 +1038,23 @@ class ShardTensor(torch.Tensor):
         # which is why DTensor survives the identical op-result /
         # ``to_local``-after-graph-break path that a tensor-subclass forward
         # hits. Match DTensor: pass ``local_tensor`` through unchanged.
-        return ShardTensor.__new__(
-            ShardTensor,
+        #
+        # Build the concrete (possibly subclass) type via ``cls`` so a subclass
+        # is reconstructed as itself -- no ``__class__`` reassignment needed.
+        out = cls.__new__(
+            cls,
             local_tensor=local_tensor,
             spec=unflatten_spec,
             requires_grad=requires_grad,
         )
+        # Reattach any declared extra inner tensors, then let the subclass
+        # reattach its own context. Both are no-ops for base ShardTensor.
+        for name in cls._extra_inner_tensors:
+            if name in inner_tensors:
+                setattr(out, name, inner_tensors[name])
+        if subclass_ctx is not None:
+            out.__subclass_unflatten__(subclass_ctx)
+        return out
 
     def _stable_hash_for_caching(self) -> str:
         r"""Return a cross-process stable hash for the AOT autograd cache.

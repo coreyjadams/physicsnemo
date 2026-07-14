@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a boundary, so that external-flow "box minus obstacle" domains work
   directly), for any implicit function (signed-distance functions, level
   sets, or neural fields).
+- Adds compile-safe subclassing extension points to `domain_parallel.ShardTensor`:
+  a `_extra_inner_tensors` declaration (extra always-present inner tensors carried
+  through Dynamo flatten/unflatten + AOTAutograd), `__subclass_flatten_context__` /
+  `__subclass_unflatten__` hooks for a nested flatten context, a
+  `_stable_inner_sentinel` helper, and a DTensor-style `__metadata_guard__` that
+  guards only on `(spec, requires_grad)`. A subclass can now carry extra inner
+  tensors and opaque per-instance metadata through `torch.compile` without
+  re-implementing the flatten protocol. Defaults leave base behavior unchanged.
 - Adds `integrate_moment` and `Mesh.integrate_moment` for measure-weighted
   outer-product moments. Mesh integration APIs now accept `nan_policy`.
 - Adds per-cell measure weights that are preserved through cell subsampling
