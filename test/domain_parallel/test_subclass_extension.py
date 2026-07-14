@@ -143,8 +143,74 @@ def test_metadata_guard_ignores_subclass_context_1d(distributed_mesh):
     run_metadata_guard_ignores_subclass_context(distributed_mesh)
 
 
+class _RoutedShardTensor(ShardTensor):
+    """Subclass that declares routing metadata to ride onto op outputs."""
+
+    _subclass_propagated_attrs = ("_route",)
+    _route = None
+
+
+def run_metadata_propagates_onto_op_results(mesh):
+    st = shard_tensor_factory(mesh, uneven=True)
+    routed = _RoutedShardTensor.__new__(
+        _RoutedShardTensor,
+        local_tensor=st._local_tensor,
+        spec=st._spec,
+        requires_grad=False,
+    )
+    routed._route = "policyX"
+
+    # A base-typed autowrap result is re-classed to the subclass and the routing
+    # attr is copied from the input.
+    out = routed * 2.0
+    assert isinstance(out, _RoutedShardTensor)
+    assert out._route == "policyX"
+
+    # Routing keeps riding along a chained op.
+    out2 = out + 1.0
+    assert isinstance(out2, _RoutedShardTensor)
+    assert out2._route == "policyX"
+
+    # A plain base ShardTensor (no declared propagated attrs) is untouched: its
+    # op results stay the base type. This guards the "no overhead / no behavior
+    # change for base" property.
+    base_out = st * 2.0
+    assert type(base_out) is ShardTensor
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(120)
+def test_metadata_propagates_onto_op_results_1d(distributed_mesh):
+    run_metadata_propagates_onto_op_results(distributed_mesh)
+
+
 def _sum_squares(x):
     return (x**2).sum()
+
+
+def run_compile_with_propagated_attrs_does_not_error(mesh):
+    # A subclass declaring propagated attrs must still compile (propagation is
+    # skipped under compile; metadata would travel via the flatten context).
+    st = shard_tensor_factory(mesh, uneven=True)
+    routed = _RoutedShardTensor.__new__(
+        _RoutedShardTensor,
+        local_tensor=st._local_tensor,
+        spec=st._spec,
+        requires_grad=False,
+    )
+    routed._route = "policyX"
+    x = routed.detach().requires_grad_(True)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(_sum_squares, fullgraph=True, backend="aot_eager")
+    loss = compiled(x)
+    loss.backward()
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(180)
+def test_compile_with_propagated_attrs_does_not_error_1d(distributed_mesh):
+    run_compile_with_propagated_attrs_does_not_error(distributed_mesh)
 
 
 def run_compile_subclass_survives(mesh):

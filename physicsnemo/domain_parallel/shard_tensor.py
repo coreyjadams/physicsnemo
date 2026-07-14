@@ -747,6 +747,20 @@ class ShardTensor(torch.Tensor):
     # default -- base ShardTensor behavior is unchanged.
     _extra_inner_tensors: tuple[str, ...] = ()
 
+    # Instance-attribute names a subclass wants copied from an op's input onto
+    # its (eager) op-result outputs -- per-field routing metadata that must ride
+    # along results. When non-empty, base ``__torch_function__`` copies these and
+    # re-classes a base-typed autowrap result back to the subclass type. The
+    # subclass MUST NOT declare ``__slots__`` (the ``__class__`` reassignment
+    # needs an identical instance layout -- a ``__dict__``-bearing subclass
+    # qualifies, a ``__slots__`` one does not). The FIRST name doubles as the
+    # "already-propagated" sentinel: a result whose first attr is ``None`` (its
+    # class default) receives a fresh copy. Propagation is skipped under
+    # ``torch.compile`` (there the metadata rides via the flatten context /
+    # ``_extra_inner_tensors`` instead). Empty by default -- no overhead, base
+    # behavior unchanged.
+    _subclass_propagated_attrs: tuple[str, ...] = ()
+
     @classmethod
     def patches_enabled(cls) -> bool:
         r"""Check whether patches are enabled for this class.
@@ -951,6 +965,69 @@ class ShardTensor(torch.Tensor):
         except (TypeError, ValueError):
             return bool(orig == other)
         return bool(orig_rg == other_rg) and bool(orig_spec == other_spec)
+
+    @classmethod
+    def _find_metadata_source(cls, args, kwargs) -> "ShardTensor | None":
+        r"""Return the input instance whose subclass metadata should ride onto op
+        outputs: the first ``cls``-typed argument already carrying routing (its
+        sentinel attr is set), else the first ``cls``-typed argument. Walks
+        (shallow) tuples / lists in the positional and keyword arguments."""
+        sentinel = cls._subclass_propagated_attrs[0]
+        fallback = None
+
+        def _scan(vals):
+            nonlocal fallback
+            for v in vals:
+                if isinstance(v, cls):
+                    if fallback is None:
+                        fallback = v
+                    if getattr(v, sentinel, None) is not None:
+                        return v
+                elif isinstance(v, (tuple, list)):
+                    found = _scan(v)
+                    if found is not None:
+                        return found
+            return None
+
+        found = _scan(args)
+        if found is None and kwargs:
+            found = _scan(kwargs.values())
+        return found if found is not None else fallback
+
+    @classmethod
+    def _propagate_subclass_metadata(cls, result: object, source: "ShardTensor"):
+        r"""Copy ``cls._subclass_propagated_attrs`` from ``source`` onto any
+        ShardTensor in ``result`` that doesn't already carry them, re-classing a
+        base-typed autowrap result back to ``cls`` first. Walks tuples / lists.
+        No-op when the subclass declares no propagated attrs."""
+        attrs = cls._subclass_propagated_attrs
+        if not attrs:
+            return result
+        sentinel = attrs[0]
+
+        def _apply(t: object) -> None:
+            if not isinstance(t, ShardTensor):
+                return
+            if type(t) is not cls:
+                # Re-class a base autowrap result up to the subclass. Requires an
+                # identical instance layout (see ``_subclass_propagated_attrs``);
+                # a layout mismatch or unrelated type is skipped, not forced.
+                if not issubclass(cls, type(t)):
+                    return
+                try:
+                    t.__class__ = cls
+                except TypeError:
+                    return
+            if getattr(t, sentinel, None) is None:
+                for attr in attrs:
+                    setattr(t, attr, getattr(source, attr))
+
+        if isinstance(result, ShardTensor):
+            _apply(result)
+        elif isinstance(result, (tuple, list)):
+            for r in result:
+                _apply(r)
+        return result
 
     def __tensor_flatten__(self):
         inner_names = ["_local_tensor", *self._extra_inner_tensors]
@@ -1387,10 +1464,18 @@ class ShardTensor(torch.Tensor):
             with torch._C.DisableTorchFunctionSubclass():
                 return func(*args, **kwargs)
         if func in cls._function_registry and cls._enable_shard_patches:
-            return cls._function_registry[func](func, types, args, kwargs)
-        if str(func) in cls._named_function_registry and cls._enable_shard_patches:
-            return cls._named_function_registry[str(func)](func, types, args, kwargs)
-        res = _torch_function_fallback_via_dtensor(func, args, kwargs)
+            res = cls._function_registry[func](func, types, args, kwargs)
+        elif str(func) in cls._named_function_registry and cls._enable_shard_patches:
+            res = cls._named_function_registry[str(func)](func, types, args, kwargs)
+        else:
+            res = _torch_function_fallback_via_dtensor(func, args, kwargs)
+        # Ride subclass routing metadata onto op outputs (eager only -- under
+        # compile it travels via the flatten context / _extra_inner_tensors).
+        # No-op for base ShardTensor (_subclass_propagated_attrs is empty).
+        if cls._subclass_propagated_attrs and not torch.compiler.is_compiling():
+            source = cls._find_metadata_source(args, kwargs)
+            if source is not None:
+                cls._propagate_subclass_metadata(res, source)
         return res
 
     @classmethod

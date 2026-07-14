@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guards only on `(spec, requires_grad)`. A subclass can now carry extra inner
   tensors and opaque per-instance metadata through `torch.compile` without
   re-implementing the flatten protocol. Defaults leave base behavior unchanged.
+- Adds `ShardTensor._subclass_propagated_attrs`: a subclass may declare
+  instance-attribute names that base `__torch_function__` copies from an op's
+  input onto its (eager) op-result outputs, re-classing a base-typed autowrap
+  result back to the subclass. Lets a subclass route per-field metadata across
+  ops without overriding `__torch_function__`. Skipped under `torch.compile`;
+  empty by default (no overhead, base behavior unchanged).
 - Adds `integrate_moment` and `Mesh.integrate_moment` for measure-weighted
   outer-product moments. Mesh integration APIs now accept `nan_policy`.
 - Adds per-cell measure weights that are preserved through cell subsampling
