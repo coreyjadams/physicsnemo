@@ -404,3 +404,103 @@ def run_coerce_replicate_to_partial_relabels(mesh):
 @pytest.mark.timeout(120)
 def test_coerce_replicate_to_partial_relabels_1d(distributed_mesh):
     run_coerce_replicate_to_partial_relabels(distributed_mesh)
+
+
+# ---------------------------------------------------------------------------
+# to_local() differentiability under torch.compile.
+#
+# ShardTensor overrides ``__torch_function__``; its eager fallback converts to
+# DTensor via ``autograd.Function``\s that AOTAutograd traces *through*, severing
+# the primal gradient and silently dropping the compiled backward. The
+# ``__torch_function__`` compile-passthrough (routing unpatched ops to
+# ``__torch_dispatch__`` like DTensor) restores it. These tests would produce a
+# zero / missing gradient before that fix.
+# ---------------------------------------------------------------------------
+def _to_local_sq_sum(x):
+    return (x.to_local() ** 2).sum()
+
+
+def _to_local_plain_math(x):
+    return (x.to_local() * x.to_local()).sum()
+
+
+def _op_result_to_local(x):
+    # Forces an intermediate op-result ShardTensor before to_local().
+    return ((x * 2.0 + x).to_local() ** 2).sum()
+
+
+# Plain-``torch`` references (no ShardTensor) for the same computations, applied
+# directly to a rank's local tensor. These give an INDEPENDENT ground truth for
+# the gradient: because ``to_local()`` returns the local shard and the ops are
+# elementwise, the sharded gradient w.r.t. the local input must equal the plain
+# autograd gradient of the same expression on that local tensor. (Comparing only
+# against ShardTensor's own eager path would validate compiled==eager but not
+# that either is correct.)
+def _ref_sq_sum(local):
+    return (local**2).sum()
+
+
+def _ref_plain_math(local):
+    return (local * local).sum()
+
+
+def _ref_op_result(local):
+    return ((local * 2.0 + local) ** 2).sum()
+
+
+def run_to_local_grad_under_compile(mesh, fn, ref_fn, backend):
+    placements = [Shard(0)] + [Replicate()] * (mesh.ndim - 1)
+
+    base = shard_tensor_factory(mesh, uneven=True).full_tensor().detach()
+
+    # Independent ground truth: plain-torch autograd on the local tensor.
+    lr = base.clone().requires_grad_(True)
+    grad_ref = torch.autograd.grad(ref_fn(lr), lr)[0]
+
+    # ShardTensor eager path.
+    le = base.clone().requires_grad_(True)
+    ste = ShardTensor.from_local(le, mesh, placements)
+    grad_eager = torch.autograd.grad(fn(ste), le)[0]
+
+    # ShardTensor under torch.compile.
+    torch._dynamo.reset()
+    lc = base.clone().requires_grad_(True)
+    stc = ShardTensor.from_local(lc, mesh, placements)
+    compiled = torch.compile(fn, fullgraph=True, backend=backend)
+    grad_compiled = torch.autograd.grad(compiled(stc), lc)[0]
+
+    assert grad_compiled is not None, "compiled backward dropped the gradient"
+    assert grad_compiled.abs().sum() > 0, "compiled gradient is zero"
+
+    # Eager must match the independent reference (guards the reference itself),
+    # and the compiled gradient must match both -- i.e. be numerically correct,
+    # not merely nonzero or merely equal to a possibly-wrong eager value.
+    torch.testing.assert_close(grad_eager, grad_ref, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(grad_compiled, grad_ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+@pytest.mark.parametrize(
+    "fn,ref_fn",
+    [
+        (_to_local_sq_sum, _ref_sq_sum),
+        (_to_local_plain_math, _ref_plain_math),
+        (_op_result_to_local, _ref_op_result),
+    ],
+    ids=["leaf", "plain_math", "op_result"],
+)
+def test_to_local_grad_under_compile_1d(distributed_mesh, fn, ref_fn, backend):
+    run_to_local_grad_under_compile(distributed_mesh, fn, ref_fn, backend)
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize(
+    "fn,ref_fn",
+    [(_to_local_sq_sum, _ref_sq_sum), (_op_result_to_local, _ref_op_result)],
+    ids=["leaf", "op_result"],
+)
+def test_to_local_grad_under_compile_2d(distributed_mesh_2d, fn, ref_fn):
+    run_to_local_grad_under_compile(distributed_mesh_2d, fn, ref_fn, "aot_eager")

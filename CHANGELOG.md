@@ -397,6 +397,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as equal, and rebuilds a differing `ShardTensor`-subclass tangent via that
   type's own `__tensor_unflatten__` instead of returning `None` (the plain-tensor
   / `DTensor` cross-type `None` convention is preserved).
+- `ShardTensor.to_local()` (and op-result forwards feeding it) is now
+  differentiable under `torch.compile` / AOTAutograd. Previously the compiled
+  backward was silently dropped (zero / missing gradient): ShardTensor's
+  `__torch_function__` eager fallback converts to `DTensor` through
+  `autograd.Function`s that AOTAutograd traces *through*, severing the primal's
+  gradient connection during the joint trace. Under tracing, unpatched ops now
+  pass through to `__torch_dispatch__` (mirroring `DTensor`, which defines no
+  `__torch_function__`), keeping the graph differentiable while eager behavior
+  and registered shard patches are unchanged.
 - Datapipe contiguous-block subsampling now wraps cyclically, giving boundary
   and interior elements equal inclusion probability.
 - Cell-subsampled GLOBE inputs now retain their effective integration measure,

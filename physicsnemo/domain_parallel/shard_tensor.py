@@ -28,6 +28,7 @@ from typing import Callable, Sequence, cast
 
 import torch
 import torch.distributed as dist
+from torch._subclasses.fake_tensor import is_fake
 from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import (
@@ -637,6 +638,22 @@ class _FromTorchTensor(torch.autograd.Function):
             grad_output = grad_output.redistribute(grad_output._spec.mesh, target)
 
         return grad_output.to_local(), None, None, None, None
+
+
+def _is_tracing(args: object, kwargs: object = None) -> bool:
+    r"""Return True when any tensor in ``args``/``kwargs`` is a fake tensor, i.e.
+    we are inside a ``torch.compile`` / AOTAutograd trace.
+
+    ``torch.compiler.is_compiling()`` is unreliable here: ``__torch_function__``
+    runs eagerly on the fake operands during tracing (not in an inlined Dynamo
+    frame), so it reads ``False``. Detecting a ``FakeTensor`` operand is the
+    robust signal, and it correctly stays ``False`` for the real-tensor eager
+    path (including construction happening outside the compiled region).
+    """
+    for leaf in torch.utils._pytree.tree_leaves((args, kwargs)):
+        if isinstance(leaf, torch.Tensor) and is_fake(leaf):
+            return True
+    return False
 
 
 class ShardTensor(torch.Tensor):
@@ -1481,6 +1498,15 @@ class ShardTensor(torch.Tensor):
             res = cls._function_registry[func](func, types, args, kwargs)
         elif str(func) in cls._named_function_registry and cls._enable_shard_patches:
             res = cls._named_function_registry[str(func)](func, types, args, kwargs)
+        elif _is_tracing(args, kwargs):
+            # Under torch.compile / AOTAutograd tracing, route unpatched ops
+            # straight to ``__torch_dispatch__`` (like DTensor, which has no
+            # ``__torch_function__``). The eager fallback converts to DTensor via
+            # ``_ShardTensorToDTensor`` autograd.Functions; Passing through here 
+            # lets the aten-level ``__torch_dispatch__`` (which AOT handles correctly)
+            # own the op and keeps the graph differentiable.
+            with torch._C.DisableTorchFunctionSubclass():
+                return func(*args, **kwargs)
         else:
             res = _torch_function_fallback_via_dtensor(func, args, kwargs)
         # Ride subclass routing metadata onto op outputs (eager only -- under
