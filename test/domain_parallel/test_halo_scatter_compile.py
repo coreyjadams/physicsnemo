@@ -23,6 +23,8 @@ harness (``torchrun`` + ``distributed_mesh``); the correction needs at least two
 ranks to have any halo, so single-rank runs are skipped.
 """
 
+import os
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -252,3 +254,88 @@ def test_halo_shard_tensor_scatter_add_1d(distributed_mesh, backend):
     if distributed_mesh.size() < 2:
         pytest.skip("halo correction needs >= 2 ranks")
     run_halo_shard_tensor_scatter_add(distributed_mesh, backend)
+
+
+def _force_halo_backend(name):
+    if name is None:
+        os.environ.pop("PHYSICSNEMO_HALO_BACKEND", None)
+    else:
+        os.environ["PHYSICSNEMO_HALO_BACKEND"] = name
+
+
+def _symm_mem_capable(mesh):
+    r"""True when the symmetric-memory backend can serve this mesh (CUDA, >=2 ranks,
+    and a workspace rendezvous succeeds). Collective: every rank runs it, so all
+    return the same verdict on homogeneous hardware."""
+    if not torch.cuda.is_available() or mesh.size() < 2:
+        return False
+    try:
+        import torch.distributed._symmetric_memory as sm
+
+        with torch.cuda.device(DistributedManager().device):
+            sm.get_symm_mem_workspace(mesh.get_group().group_name, 1024)
+        return True
+    except Exception:
+        return False
+
+
+def run_symm_mem_equivalence(mesh, backend, n_owned=6, lend=2, feat=4):
+    r"""The symm-mem transport must match the funcol oracle bitwise (fwd+bwd), eager
+    and compiled -- pins the self-adjoint / linear-map equivalence across backends."""
+    device = DistributedManager().device
+    group = mesh.get_group()
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+
+    n_owned, n_padded, send_indices, send_sizes = _ring_routing(
+        rank, world_size, n_owned, lend
+    )
+    routing = pack_halo_routing(
+        send_indices, send_sizes, n_owned, rank, world_size, device=device
+    )
+    torch.manual_seed(100 + rank)
+    padded0 = torch.randn(n_padded, feat, dtype=torch.float64, device=device)
+
+    def fn(p, r):
+        return halo_scatter_correct(p, r, group=mesh)
+
+    # funcol oracle (eager fwd+bwd).
+    _force_halo_backend("funcol")
+    pf = padded0.clone().requires_grad_(True)
+    ref_fwd = fn(pf, routing)
+    (ref_grad,) = torch.autograd.grad(ref_fwd.sum(), pf)
+
+    # symm-mem, eager: identical arithmetic (float64 accumulate), only the transport
+    # differs, so equality is exact.
+    _force_halo_backend("symm_mem")
+    try:
+        ps = padded0.clone().requires_grad_(True)
+        sm_fwd = fn(ps, routing)
+        (sm_grad,) = torch.autograd.grad(sm_fwd.sum(), ps)
+    finally:
+        _force_halo_backend(None)
+    torch.testing.assert_close(sm_fwd, ref_fwd, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(sm_grad, ref_grad, rtol=1e-12, atol=1e-12)
+
+    # symm-mem, compiled (the op body reads the backend env at runtime, so it survives
+    # tracing): must lower and match the oracle.
+    _force_halo_backend("symm_mem")
+    try:
+        torch._dynamo.reset()
+        pc = padded0.clone().requires_grad_(True)
+        cf = torch.compile(fn, backend=backend, fullgraph=True)
+        out_c = cf(pc, routing)
+        (grad_c,) = torch.autograd.grad(out_c.sum(), pc)
+    finally:
+        _force_halo_backend(None)
+    torch.testing.assert_close(out_c, ref_fwd, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(grad_c, ref_grad, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_halo_scatter_symm_mem_equivalence_1d(distributed_mesh, backend):
+    if not _symm_mem_capable(distributed_mesh):
+        pytest.skip("symmetric memory (>=2 P2P/NVSHMEM GPUs) not available")
+    run_symm_mem_equivalence(distributed_mesh, backend)

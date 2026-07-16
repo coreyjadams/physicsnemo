@@ -125,13 +125,8 @@ def funcol_all_to_all_v_rows(
 # Backend seam: a transport owns the whole reverse/forward exchange, because the
 # data-movement structure -- not just the collective call -- is transport-specific.
 # The funcol backend builds dense destination-ordered buffers and loops over the
-# whole group (what ``all_to_all_single`` needs); a one-sided backend would instead
-# loop over neighbours only and pull each with ``get_buffer``.
-
-_SYMM_MEM_UNIMPLEMENTED = (
-    "The symmetric-memory halo transport is not implemented yet; set "
-    "PHYSICSNEMO_HALO_BACKEND=funcol (the default)."
-)
+# whole group (what ``all_to_all_single`` needs); the symmetric-memory backend stages
+# into a symmetric workspace and pulls each neighbour block with ``get_buffer``.
 
 
 class _HaloBackend(Protocol):
@@ -217,21 +212,139 @@ class _FuncolHaloBackend:
         return torch.cat([owned, ghost_new], dim=0)
 
 
+def _symm_group_name(group: object) -> str:
+    r"""Resolve *group* to a c10d group-name string usable with
+    ``get_symm_mem_workspace`` (unlike :func:`_halo_group_name`, ``None`` resolves to
+    the *named* default world group, not ``""``)."""
+    if group is None:
+        return dist.distributed_c10d._get_default_group().group_name
+    if isinstance(group, str):
+        return group
+    if isinstance(group, DeviceMesh):
+        return group._dim_group_names[0]
+    return group.group_name
+
+
+def _global_max_staged_rows(send_sizes: list[list[int]], world_size: int) -> int:
+    r"""Rows the symmetric workspace must hold on every rank: the group-wide max over
+    ranks of ``max(ghost rows, lent rows)``. Identical on all ranks (all hold the full
+    ``send_sizes``), so the symmetric allocation stays uniform."""
+    m = 0
+    for r in range(world_size):
+        ghost = sum(int(send_sizes[i][r]) for i in range(world_size))
+        lent = sum(int(send_sizes[r][j]) for j in range(world_size))
+        m = max(m, ghost, lent)
+    return m
+
+
+def _require_symm_mem(tensor: torch.Tensor):
+    r"""Return the ``_symmetric_memory`` module, or raise a clear error when the
+    symmetric-memory backend cannot serve *tensor* (CPU, or torch without it)."""
+    if not tensor.is_cuda:
+        raise RuntimeError(
+            "the symmetric-memory halo backend requires CUDA tensors; "
+            "set PHYSICSNEMO_HALO_BACKEND=funcol for CPU/gloo."
+        )
+    try:
+        import torch.distributed._symmetric_memory as symm_mem
+    except Exception as exc:  # pragma: no cover - torch build without symm-mem
+        raise RuntimeError(
+            "torch.distributed._symmetric_memory is unavailable; "
+            "set PHYSICSNEMO_HALO_BACKEND=funcol."
+        ) from exc
+    return symm_mem
+
+
 class _SymmMemHaloBackend:
-    r"""Symmetric-memory (NVSHMEM/IPC) one-sided transport, exchanging with
-    neighbours only. Placeholder: not implemented yet."""
+    r"""Symmetric-memory one-sided transport (NVSHMEM device-initiated across nodes,
+    CUDA-IPC ``get_buffer`` within a node).
+
+    Each rank stages its exchange block into a symmetric workspace, then *pulls* each
+    neighbour's block with ``get_buffer`` -- only real ghost/lent data moves, and only
+    to/from neighbours (a ``barrier`` fences the staging). Numerically identical to
+    :class:`_FuncolHaloBackend` (the correctness oracle); the region offsets mirror
+    that backend's dense destination-ordered layout.
+    """
 
     name = "symm_mem"
+
+    @staticmethod
+    def _row_numel(feat_shape: tuple[int, ...]) -> int:
+        n = 1
+        for d in feat_shape:
+            n *= int(d)
+        return n
 
     def reverse(
         self, padded, n_owned, send_indices, send_sizes, rank, world_size, group
     ):
-        r"""Not implemented; the symmetric-memory transport is a future backend."""
-        raise NotImplementedError(_SYMM_MEM_UNIMPLEMENTED)
+        r"""Fold ghost rows back into owners via a one-sided reverse exchange."""
+        symm_mem = _require_symm_mem(padded)
+        feat = tuple(padded.shape[1:])
+        row_numel = self._row_numel(feat)
+        dtype = padded.dtype
+        group_name = _symm_group_name(group)
+        max_rows = _global_max_staged_rows(send_sizes, world_size)
+
+        acc_dtype = torch.float64 if dtype == torch.float32 else dtype
+        owned = padded[:n_owned].to(acc_dtype)
+        with torch.cuda.device(padded.device):
+            handle = symm_mem.get_symm_mem_workspace(
+                group_name, max(1, max_rows * row_numel * padded.element_size())
+            )
+            # Stage this rank's whole ghost region ([from_0 | from_1 | ...]); the
+            # block borrowed from owner o already sits at o's pull offset.
+            ghost = padded[n_owned:].contiguous()
+            n_ghost = ghost.shape[0]
+            if n_ghost:
+                handle.get_buffer(rank, (n_ghost, *feat), dtype).copy_(ghost)
+            handle.barrier()
+            # Pull, from each peer j this rank lent to, the contributions j staged for
+            # this rank's lent rows, and fold them into those owners.
+            for j in range(world_size):
+                n = int(send_sizes[rank][j])
+                if n == 0:
+                    continue
+                off = sum(int(send_sizes[d][j]) for d in range(rank)) * row_numel
+                recv = handle.get_buffer(j, (n, *feat), dtype, storage_offset=off)
+                owned = owned.index_add(0, send_indices[j], recv.to(acc_dtype))
+            handle.barrier()
+        return owned.to(dtype)
 
     def forward(self, owned, send_indices, send_sizes, rank, world_size, group):
-        r"""Not implemented; the symmetric-memory transport is a future backend."""
-        raise NotImplementedError(_SYMM_MEM_UNIMPLEMENTED)
+        r"""Refresh ghost rows from the corrected owners via a one-sided exchange."""
+        symm_mem = _require_symm_mem(owned)
+        feat = tuple(owned.shape[1:])
+        row_numel = self._row_numel(feat)
+        dtype = owned.dtype
+        group_name = _symm_group_name(group)
+        max_rows = _global_max_staged_rows(send_sizes, world_size)
+
+        with torch.cuda.device(owned.device):
+            handle = symm_mem.get_symm_mem_workspace(
+                group_name, max(1, max_rows * row_numel * owned.element_size())
+            )
+            # Stage the rows lent to each peer, destination-ordered.
+            send_rows = torch.cat(
+                [owned.index_select(0, send_indices[j]) for j in range(world_size)],
+                dim=0,
+            )
+            if send_rows.shape[0]:
+                handle.get_buffer(rank, tuple(send_rows.shape), dtype).copy_(send_rows)
+            handle.barrier()
+            # Pull each refreshed ghost block from its owner, in source-rank order.
+            ghost_blocks = []
+            for i in range(world_size):
+                n = int(send_sizes[i][rank])
+                if n == 0:
+                    continue
+                off = sum(int(send_sizes[i][d]) for d in range(rank)) * row_numel
+                gb = handle.get_buffer(i, (n, *feat), dtype, storage_offset=off)
+                ghost_blocks.append(gb.clone())  # copy out before the fence
+            handle.barrier()
+        if not ghost_blocks:
+            return owned
+        return torch.cat([owned, torch.cat(ghost_blocks, dim=0)], dim=0)
 
 
 _FUNCOL_BACKEND = _FuncolHaloBackend()
@@ -239,9 +352,22 @@ _SYMM_MEM_BACKEND = _SymmMemHaloBackend()
 
 
 def _symm_mem_usable(group: object) -> bool:
-    r"""Whether the symmetric-memory transport can serve *group*. Always ``False``
-    while that backend is unimplemented, so ``funcol`` is chosen unless forced."""
-    return False
+    r"""Whether the symmetric-memory transport is auto-selectable for *group*.
+
+    Conservative: auto-selects only when device-initiated NVSHMEM is present (the safe
+    multi-node path). Intra-node CUDA-IPC is reachable via
+    ``PHYSICSNEMO_HALO_BACKEND=symm_mem`` -- its capability cannot be probed here
+    without a side-effecting collective. ``funcol`` (no requirement) always remains a
+    working fallback.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import torch.distributed._symmetric_memory as symm_mem
+
+        return bool(symm_mem.is_nvshmem_available())
+    except Exception:  # pragma: no cover - torch build without symm-mem
+        return False
 
 
 def select_halo_backend(group: object = None) -> _HaloBackend:
