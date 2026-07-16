@@ -1411,6 +1411,21 @@ class ShardTensor(torch.Tensor):
             return torch.Tensor.grad_fn.__get__(self)
 
     @property  # type: ignore[override]
+    def grad_dtype(self):  # type: ignore[override]
+        """dtype this tensor's gradient takes (newer PyTorch).
+
+        Returns the local tensor's dtype -- the default, and the only case
+        ShardTensor supports. Overriding shields the read from
+        ``__torch_function__``: the C-level ``grad_dtype`` getset descriptor
+        otherwise re-enters it and falls back via
+        :func:`_torch_function_fallback_via_dtensor`, which builds a *non-leaf*
+        DTensor whose ``grad_dtype`` getter raises "grad_dtype can only be
+        accessed on leaf tensors" (hit during Dynamo fake conversion, which reads
+        ``grad_dtype != dtype``). Mirrors ``.grad_fn`` / ``.is_leaf`` / ``.grad``.
+        """
+        return self._local_tensor.dtype
+
+    @property  # type: ignore[override]
     def grad(self) -> "ShardTensor | None":  # type: ignore[override]
         """Return the accumulated gradient, wrapped as a :class:`ShardTensor`.
 
@@ -1502,7 +1517,7 @@ class ShardTensor(torch.Tensor):
             # Under torch.compile / AOTAutograd tracing, route unpatched ops
             # straight to ``__torch_dispatch__`` (like DTensor, which has no
             # ``__torch_function__``). The eager fallback converts to DTensor via
-            # ``_ShardTensorToDTensor`` autograd.Functions; Passing through here 
+            # ``_ShardTensorToDTensor`` autograd.Functions; Passing through here
             # lets the aten-level ``__torch_dispatch__`` (which AOT handles correctly)
             # own the op and keeps the graph differentiable.
             with torch._C.DisableTorchFunctionSubclass():

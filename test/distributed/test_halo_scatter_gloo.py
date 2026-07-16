@@ -438,7 +438,7 @@ def test_halo_shard_tensor_scatter_add_2ranks(backend: str) -> None:
 
 def test_select_halo_backend_env_override(monkeypatch) -> None:
     """Backend selection: funcol by default, honours the env override, and forcing
-    the (unimplemented) symm-mem backend surfaces a clear error at first use."""
+    the symm-mem backend on a CPU tensor surfaces a clear error at first use."""
     from physicsnemo.domain_parallel.shard_utils import halo_scatter as hs
 
     monkeypatch.delenv("PHYSICSNEMO_HALO_BACKEND", raising=False)
@@ -450,7 +450,8 @@ def test_select_halo_backend_env_override(monkeypatch) -> None:
     monkeypatch.setenv("PHYSICSNEMO_HALO_BACKEND", "symm_mem")
     be = hs.select_halo_backend()
     assert be.name == "symm_mem"
-    with pytest.raises(NotImplementedError):
+    # CPU tensor -> the symm-mem backend refuses with a clear error (points at funcol).
+    with pytest.raises(RuntimeError, match="funcol"):
         be.reverse(torch.zeros(1, 1), 1, [], [[0]], 0, 1, None)
 
     monkeypatch.setenv("PHYSICSNEMO_HALO_BACKEND", "bogus")
