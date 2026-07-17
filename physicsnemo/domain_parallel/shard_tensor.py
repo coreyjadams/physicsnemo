@@ -1359,10 +1359,19 @@ class ShardTensor(torch.Tensor):
 
     @requires_grad.setter
     def requires_grad(self, value: bool) -> None:
-        """Set ``requires_grad`` on both the wrapper and the local tensor."""
+        """Set ``requires_grad`` on both the wrapper and the local tensor.
+
+        Only a *leaf* local can have its flag set: a non-leaf's ``requires_grad``
+        is implied by its ``grad_fn`` and assigning to it raises "you can only
+        change requires_grad flags of leaf variables". This is hit under Dynamo
+        meta-tensor conversion (``meta_utils`` copies ``requires_grad`` onto a
+        freshly reconstructed, non-leaf local) on newer PyTorch, so guard it --
+        mirrors the ``.is_leaf`` / ``.grad_fn`` / ``.grad_dtype`` shielding.
+        """
         with torch._C.DisableTorchFunctionSubclass():
             torch.Tensor.requires_grad.__set__(self, value)
-        self._local_tensor.requires_grad = value
+        if self._local_tensor.is_leaf:
+            self._local_tensor.requires_grad = value
 
     def requires_grad_(self, requires_grad: bool = True) -> "ShardTensor":
         """Set ``requires_grad`` in-place on both the wrapper and local tensor.
