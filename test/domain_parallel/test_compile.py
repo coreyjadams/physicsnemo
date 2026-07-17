@@ -26,9 +26,10 @@ silently dropped (defaulting back to even chunking).
 
 import pytest
 import torch
-from torch.distributed.tensor.placement_types import Replicate
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from physicsnemo.domain_parallel import ShardTensor
+from physicsnemo.distributed import DistributedManager
+from physicsnemo.domain_parallel import ShardTensor, scatter_tensor
 from physicsnemo.domain_parallel._shard_tensor_spec import ShardTensorSpec
 from test.domain_parallel.test_redistribute import shard_tensor_factory
 
@@ -137,3 +138,68 @@ def test_compile_backward_uneven_shard_1d(distributed_mesh):
 @pytest.mark.timeout(180)
 def test_compile_backward_uneven_shard_2d(distributed_mesh_2d):
     run_compile_backward_uneven_shard(distributed_mesh_2d)
+
+
+# --- Regression: grads for ShardTensor *inputs* of a compiled region ---------
+#
+# AOTAutograd's joint trace computes grad_inputs by calling
+# ``torch.autograd.grad`` on the wrapped subclass primals, with no
+# DisableTorchFunctionSubclass guard. ShardTensor's ``__torch_function__``
+# used to route that call through the DTensor fallback, which re-issued the
+# graph query on freshly converted tensors (not in the graph); with
+# ``allow_unused=True`` this silently produced all-None grads at trace time,
+# so ``grad_input_metas`` was stamped plain and every compiled region
+# returned plain-tensor gradients for its ShardTensor inputs -- crashing the
+# first eager backward upstream that touched ``._local_tensor``.
+# ``torch.autograd.grad`` is now in ``_autograd_passthrough_functions``.
+
+_DIM = 64
+
+
+def run_compiled_grad_input_stays_shard_tensor(mesh, partial_input):
+    # Eager producer -> compiled consumer. The gradient the compiled region
+    # returns for its ShardTensor input must arrive at the eager producer's
+    # backward as a ShardTensor, with the same values as a fully-eager run.
+    dm = DistributedManager()
+    device = dm.device
+    torch.manual_seed(7)
+
+    x_full = torch.randn(1, 32, _DIM, device=device)
+    x = scatter_tensor(x_full, 0, mesh, (Shard(1),))
+    w0 = torch.randn(_DIM, _DIM, device=device, requires_grad=True)
+    consumer = torch.nn.Linear(_DIM, _DIM).to(device)
+
+    def run_once(consumer_fn):
+        m = torch.nn.functional.linear(x, w0)
+        if partial_input:
+            # Mean over the sharded dim: Partial placement from the eager
+            # custom reduction op -- the configuration that crashed first.
+            m = m.mean(dim=(1,))
+        grad_types = []
+        m.register_hook(lambda g: grad_types.append(type(g)))
+        consumer_fn(m).sum().backward()
+        grad, w0.grad = w0.grad, None
+        return grad, grad_types
+
+    eager_grad, eager_types = run_once(consumer)
+    assert issubclass(eager_types[0], ShardTensor)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        consumer, fullgraph=True, backend="aot_eager", dynamic=False
+    )
+    # Second iteration exercises the cached compiled backward path.
+    for _ in range(2):
+        compiled_grad, compiled_types = run_once(compiled)
+        assert compiled_types and issubclass(compiled_types[0], ShardTensor), (
+            f"compiled region delivered grad of type {compiled_types} "
+            "for its ShardTensor input"
+        )
+        torch.testing.assert_close(compiled_grad, eager_grad)
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("partial_input", [False, True])
+def test_compiled_grad_input_stays_shard_tensor_1d(distributed_mesh, partial_input):
+    run_compiled_grad_input_stays_shard_tensor(distributed_mesh, partial_input)

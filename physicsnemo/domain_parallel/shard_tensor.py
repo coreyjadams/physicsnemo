@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import hashlib
 import threading
 import warnings
 from collections.abc import Iterable, Mapping
@@ -706,17 +707,22 @@ class ShardTensor(torch.Tensor):
     # ShardTensor.register_named_function_handler("module.function_name.default", handler)
     _named_function_registry: dict[str, Callable] = {}
 
-    # Tensor methods that bind a callback or flag to *this* tensor's own
-    # autograd node. They must run on the ShardTensor instance itself rather
-    # than route through the DTensor fallback: the fallback binds them to a
-    # temporary DTensor that is discarded, so the hook/flag would never fire.
-    # Handled as a passthrough in __torch_function__.
+    # Functions tied to autograd-graph *identity*: they bind a hook/flag to
+    # this exact tensor's autograd node, or query gradients for these exact
+    # tensor objects. The DTensor fallback would run them on freshly
+    # converted copies: hooks would bind to discarded temporaries, and
+    # ``torch.autograd.grad`` would query tensors that aren't in the graph
+    # (silently None under ``allow_unused=True``). AOTAutograd's joint trace
+    # makes exactly that grad call on the subclass primals, so intercepting
+    # it made compiled regions return plain-tensor gradients for ShardTensor
+    # inputs. __torch_function__ runs these directly on the real tensors.
     _autograd_passthrough_functions: frozenset = frozenset(
         fn
         for fn in (
             getattr(torch.Tensor, "register_hook", None),
             getattr(torch.Tensor, "register_post_accumulate_grad_hook", None),
             getattr(torch.Tensor, "retain_grad", None),
+            torch.autograd.grad,
         )
         if fn is not None
     )
@@ -892,7 +898,25 @@ class ShardTensor(torch.Tensor):
         # no collectives. This avoids leaving the field ``None``, which would
         # force the next ``sharding_shapes()`` call to ``_all_gather_shard_shapes``
         # (a blocking collective that is not AOT-traceable).
-        if spec._sharding_shapes is not None:
+        #
+        # Recompute likewise when the incoming shapes contain SymInts: under
+        # dynamic-shape tracing the captured spec's shard shapes were
+        # chunk-computed from a *symbolic* outer_size, and copying SymInts
+        # into a runtime spec makes it unhashable (DTensor's sharding-prop
+        # cache calls ``hash(spec)``). Re-chunking against the given
+        # outer_size is faithful -- those entries were chunk-derived to begin
+        # with -- and is concrete at runtime, symbolic during tracing.
+        def _all_concrete(shapes_by_mesh_dim):
+            return all(
+                type(dim) is int
+                for shapes in shapes_by_mesh_dim.values()
+                for shape in shapes
+                for dim in shape
+            )
+
+        if spec._sharding_shapes is not None and _all_concrete(
+            spec._sharding_shapes
+        ):
             sharding_shapes = {
                 mesh_dim: tuple(tuple(s) for s in shapes)
                 for mesh_dim, shapes in spec._sharding_shapes.items()
@@ -919,6 +943,18 @@ class ShardTensor(torch.Tensor):
             spec=unflatten_spec,
             requires_grad=requires_grad,
         )
+
+    def _stable_hash_for_caching(self) -> str:
+        r"""Return a cross-process stable hash for the AOT autograd cache.
+
+        Mirrors ``DTensor._stable_hash_for_caching`` (see the note on tensor
+        subclass stable hashing in torch's ``autograd_cache.py``). Without
+        it, PT2 falls back to pickling the spec, which is not byte-stable
+        across processes -- silent cache misses, recompiling on every warm
+        start. Local metadata only; no collectives.
+        """
+        cache_data = self._spec._stable_hash() + str(self.requires_grad)
+        return hashlib.blake2b(cache_data.encode(), digest_size=16).hexdigest()
 
     # -- AOTAutograd tangent coercion hooks ------------------------------------
     # AOTAutograd records the expected tangent metadata at trace time and

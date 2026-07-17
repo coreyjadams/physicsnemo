@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 
 import torch
@@ -108,6 +109,25 @@ class ShardTensorSpec(DTensorSpec):
         if self._hash is None:
             self._hash = self._hash_impl()
         return self._hash
+
+    def _stable_hash(self) -> str:
+        r"""Return a cross-process stable hash of this spec.
+
+        Extends ``DTensorSpec._stable_hash`` (mesh via its own stable hash,
+        plus placements, shard order, and tensor metadata) with
+        ``_sharding_shapes``, so equal placements with different uneven
+        layouts don't collide. Consumed by the AOT autograd cache through
+        ``ShardTensor._stable_hash_for_caching``.
+
+        Returns
+        -------
+        str
+            Deterministic hex digest identifying this spec.
+        """
+        stable_key = (self.mesh._stable_hash(),) + self._hash_key()[1:]
+        if self._sharding_shapes is not None:
+            stable_key = stable_key + (tuple(sorted(self._sharding_shapes.items())),)
+        return hashlib.blake2b(repr(stable_key).encode(), digest_size=16).hexdigest()
 
     def sharding_shapes(
         self, mesh_dim: int | None = None
