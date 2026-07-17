@@ -105,6 +105,9 @@ def assert_success(result, workdir):
 
 
 def require_gpus(n):
+    """
+    Simple check for GPU count
+    """
     if torch.cuda.device_count() < n:
         pytest.skip(f"requires {n} GPUs, found {torch.cuda.device_count()}")
 
@@ -173,6 +176,9 @@ CONFIGS = [
     "nproc,extra_args", [(n, a) for _, n, a in CONFIGS], ids=[c[0] for c in CONFIGS]
 )
 def test_training_script(nproc, extra_args, tmp_path):
+    """
+    Test entry point.
+    """
     require_gpus(nproc)
     result = run_example(nproc, extra_args, tmp_path)
     assert_success(result, tmp_path)
