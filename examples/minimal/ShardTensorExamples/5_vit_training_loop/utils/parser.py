@@ -55,7 +55,13 @@ def parse_args():
         help="Step size for image size progression (default: 128)",
     )
     parser.add_argument(
-        "--ddp_size", type=int, default=1, help="DDP world size (default: 1)"
+        "--ddp_size",
+        type=int,
+        default=-1,
+        help=(
+            "DDP world size. -1 (default) infers it as "
+            "world_size // domain_size"
+        ),
     )
     parser.add_argument(
         "--domain_size", type=int, default=1, help="Domain parallel size (default: 1)"
@@ -81,6 +87,25 @@ def parse_args():
         "--inference_only",
         action="store_true",
         help="Run inference benchmarks only, skip training (default: False)",
+    )
+    parser.add_argument(
+        "--fsdp",
+        action="store_true",
+        help=(
+            "Shard model parameters over the ddp mesh axis with FSDP2 "
+            "(fully_shard) instead of replicating them. With ddp_size == 1 "
+            "this is a degenerate size-1 shard: no communication, but "
+            "parameters uniformly become distributed tensors (default: False)"
+        ),
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help=(
+            "Enable torch.compile (inductor backend). With domain_size > 1 the "
+            "model is compiled regionally, leaving sharded attention eager "
+            "(default: False)"
+        ),
     )
 
     args = parser.parse_args()

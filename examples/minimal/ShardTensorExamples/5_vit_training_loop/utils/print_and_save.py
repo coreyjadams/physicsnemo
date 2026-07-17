@@ -87,10 +87,12 @@ def _result_to_row(result, args, world_size):
 def get_csv_filename(args, precision_mode):
     """Generate the CSV filename for this benchmark run."""
     os.makedirs("results", exist_ok=True)
+    compile_tag = "_compiled" if getattr(args, "compile", False) else ""
+    fsdp_tag = "_fsdp" if getattr(args, "fsdp", False) else ""
     return (
         f"results/benchmark_results_{args.batch_size}bs_{args.dimension}d"
         f"_{precision_mode}_{args.domain_size}dp_{args.ddp_size}ddp"
-        f"_{args.image_size_start}-{args.image_size_stop}px.csv"
+        f"_{args.image_size_start}-{args.image_size_stop}px{fsdp_tag}{compile_tag}.csv"
     )
 
 
