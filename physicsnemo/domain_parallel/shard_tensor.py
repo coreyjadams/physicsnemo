@@ -914,9 +914,7 @@ class ShardTensor(torch.Tensor):
                 for dim in shape
             )
 
-        if spec._sharding_shapes is not None and _all_concrete(
-            spec._sharding_shapes
-        ):
+        if spec._sharding_shapes is not None and _all_concrete(spec._sharding_shapes):
             sharding_shapes = {
                 mesh_dim: tuple(tuple(s) for s in shapes)
                 for mesh_dim, shapes in spec._sharding_shapes.items()
