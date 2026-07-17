@@ -306,16 +306,26 @@ def run_symm_mem_equivalence(mesh, backend, n_owned=6, lend=2, feat=4):
     (ref_grad,) = torch.autograd.grad(ref_fwd.sum(), pf)
 
     # symm-mem, eager: identical arithmetic (float64 accumulate), only the transport
-    # differs, so equality is exact.
+    # differs, so equality is exact. Repeat many times: the per-neighbour signal fences
+    # are the one place a mis-ordered put/wait would show up, and that race is
+    # nondeterministic -- a single pass can pass by luck.
     _force_halo_backend("symm_mem")
     try:
-        ps = padded0.clone().requires_grad_(True)
-        sm_fwd = fn(ps, routing)
-        (sm_grad,) = torch.autograd.grad(sm_fwd.sum(), ps)
+        for _ in range(50):
+            ps = padded0.clone().requires_grad_(True)
+            sm_fwd = fn(ps, routing)
+            (sm_grad,) = torch.autograd.grad(sm_fwd.sum(), ps)
+            torch.testing.assert_close(sm_fwd, ref_fwd, rtol=1e-12, atol=1e-12)
+            torch.testing.assert_close(sm_grad, ref_grad, rtol=1e-12, atol=1e-12)
     finally:
         _force_halo_backend(None)
-    torch.testing.assert_close(sm_fwd, ref_fwd, rtol=1e-12, atol=1e-12)
-    torch.testing.assert_close(sm_grad, ref_grad, rtol=1e-12, atol=1e-12)
+
+    # Auto-selection (no env override) picks symm-mem here: NVSHMEM if present, else the
+    # cached CUDA-IPC rendezvous probe succeeded. Exercises the broadened capability
+    # check, not just the forced path above.
+    from physicsnemo.domain_parallel.shard_utils.halo_scatter import select_halo_backend
+
+    assert select_halo_backend(mesh).name == "symm_mem"
 
     # symm-mem, compiled (the op body reads the backend env at runtime, so it survives
     # tracing): must lower and match the oracle.

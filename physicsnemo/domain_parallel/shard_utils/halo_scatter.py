@@ -255,15 +255,24 @@ def _require_symm_mem(tensor: torch.Tensor):
     return symm_mem
 
 
+# Signal channels for the per-neighbour readiness / completion fences. Reverse and
+# forward use disjoint channels so a straggler's reverse signal is never mistaken for a
+# forward one.
+_REV_READY, _REV_DONE, _FWD_READY, _FWD_DONE = 0, 1, 2, 3
+
+
 class _SymmMemHaloBackend:
     r"""Symmetric-memory one-sided transport (NVSHMEM device-initiated across nodes,
     CUDA-IPC ``get_buffer`` within a node).
 
     Each rank stages its exchange block into a symmetric workspace, then *pulls* each
-    neighbour's block with ``get_buffer`` -- only real ghost/lent data moves, and only
-    to/from neighbours (a ``barrier`` fences the staging). Numerically identical to
-    :class:`_FuncolHaloBackend` (the correctness oracle); the region offsets mirror
-    that backend's dense destination-ordered layout.
+    neighbour's block with ``get_buffer``. Only real ghost/lent data moves, and the
+    coordination is neighbour-local: ``put_signal`` / ``wait_signal`` fence each
+    exchange peer-to-peer (readiness before a pull, completion before a buffer is
+    reused) instead of a group-wide ``barrier``, so a rank synchronizes with
+    O(neighbours) peers rather than O(world). Numerically identical to
+    :class:`_FuncolHaloBackend` (the correctness oracle); the region offsets mirror that
+    backend's dense destination-ordered layout.
     """
 
     name = "symm_mem"
@@ -286,29 +295,38 @@ class _SymmMemHaloBackend:
         group_name = _symm_group_name(group)
         max_rows = _global_max_staged_rows(send_sizes, world_size)
 
+        # Readers pull FROM my buffer (peers I borrowed from); sources are the peers I
+        # pull from (peers I lent to). Reverse sends ghost contributions back to owners.
+        readers = [s for s in range(world_size) if int(send_sizes[s][rank]) > 0]
+        sources = [j for j in range(world_size) if int(send_sizes[rank][j]) > 0]
+
         acc_dtype = torch.float64 if dtype == torch.float32 else dtype
         owned = padded[:n_owned].to(acc_dtype)
         with torch.cuda.device(padded.device):
             handle = symm_mem.get_symm_mem_workspace(
                 group_name, max(1, max_rows * row_numel * padded.element_size())
             )
-            # Stage this rank's whole ghost region ([from_0 | from_1 | ...]); the
-            # block borrowed from owner o already sits at o's pull offset.
+            # Stage this rank's whole ghost region ([from_0 | from_1 | ...]); the block
+            # borrowed from owner o already sits at o's pull offset. Signal each reader
+            # its data is staged.
             ghost = padded[n_owned:].contiguous()
-            n_ghost = ghost.shape[0]
-            if n_ghost:
-                handle.get_buffer(rank, (n_ghost, *feat), dtype).copy_(ghost)
-            handle.barrier()
-            # Pull, from each peer j this rank lent to, the contributions j staged for
-            # this rank's lent rows, and fold them into those owners.
-            for j in range(world_size):
+            if ghost.shape[0]:
+                handle.get_buffer(rank, tuple(ghost.shape), dtype).copy_(ghost)
+            for r in readers:
+                handle.put_signal(r, channel=_REV_READY)
+            # Pull each lent-to peer's staged contributions and fold them into the rows
+            # this rank lent; signal that peer its buffer is free once the read is done.
+            for j in sources:
                 n = int(send_sizes[rank][j])
-                if n == 0:
-                    continue
                 off = sum(int(send_sizes[d][j]) for d in range(rank)) * row_numel
+                handle.wait_signal(j, channel=_REV_READY)
                 recv = handle.get_buffer(j, (n, *feat), dtype, storage_offset=off)
                 owned = owned.index_add(0, send_indices[j], recv.to(acc_dtype))
-            handle.barrier()
+                handle.put_signal(j, channel=_REV_DONE)
+            # Hold until every reader has finished pulling, so the next phase's staging
+            # cannot overwrite this buffer mid-read.
+            for r in readers:
+                handle.wait_signal(r, channel=_REV_DONE)
         return owned.to(dtype)
 
     def forward(self, owned, send_indices, send_sizes, rank, world_size, group):
@@ -320,54 +338,120 @@ class _SymmMemHaloBackend:
         group_name = _symm_group_name(group)
         max_rows = _global_max_staged_rows(send_sizes, world_size)
 
+        # Forward broadcasts owners to ghosts, so the roles swap: readers are the peers
+        # I lent to; sources are the peers I borrowed from.
+        readers = [j for j in range(world_size) if int(send_sizes[rank][j]) > 0]
+        sources = [i for i in range(world_size) if int(send_sizes[i][rank]) > 0]
+
         with torch.cuda.device(owned.device):
             handle = symm_mem.get_symm_mem_workspace(
                 group_name, max(1, max_rows * row_numel * owned.element_size())
             )
-            # Stage the rows lent to each peer, destination-ordered.
+            # Stage the rows lent to each peer, destination-ordered; signal each reader.
             send_rows = torch.cat(
                 [owned.index_select(0, send_indices[j]) for j in range(world_size)],
                 dim=0,
             )
             if send_rows.shape[0]:
                 handle.get_buffer(rank, tuple(send_rows.shape), dtype).copy_(send_rows)
-            handle.barrier()
-            # Pull each refreshed ghost block from its owner, in source-rank order.
-            ghost_blocks = []
-            for i in range(world_size):
+            for r in readers:
+                handle.put_signal(r, channel=_FWD_READY)
+            # Pull each refreshed ghost block from its owner (source-rank order); signal
+            # that owner its buffer is free once the block is copied out.
+            ghost_blocks = {}
+            for i in sources:
                 n = int(send_sizes[i][rank])
-                if n == 0:
-                    continue
                 off = sum(int(send_sizes[i][d]) for d in range(rank)) * row_numel
+                handle.wait_signal(i, channel=_FWD_READY)
                 gb = handle.get_buffer(i, (n, *feat), dtype, storage_offset=off)
-                ghost_blocks.append(gb.clone())  # copy out before the fence
-            handle.barrier()
+                ghost_blocks[i] = gb.clone()
+                handle.put_signal(i, channel=_FWD_DONE)
+            for r in readers:
+                handle.wait_signal(r, channel=_FWD_DONE)
         if not ghost_blocks:
             return owned
-        return torch.cat([owned, torch.cat(ghost_blocks, dim=0)], dim=0)
+        ghost_new = torch.cat([ghost_blocks[i] for i in sources], dim=0)
+        return torch.cat([owned, ghost_new], dim=0)
 
 
 _FUNCOL_BACKEND = _FuncolHaloBackend()
 _SYMM_MEM_BACKEND = _SymmMemHaloBackend()
 
 
+_symm_capability_cache: dict[str, bool] = {}
+
+
+def _resolve_pg(group: object):
+    r"""Resolve *group* to a ``ProcessGroup`` (or ``None`` if it cannot be), for the
+    backend check in :func:`_symm_mem_usable`."""
+    if group is None:
+        return dist.distributed_c10d._get_default_group()
+    if isinstance(group, DeviceMesh):
+        try:
+            return group.get_group() if group.ndim == 1 else group.get_group(0)
+        except Exception:
+            return None
+    if isinstance(group, str):
+        try:
+            return dist.distributed_c10d._resolve_process_group(group)
+        except Exception:
+            return None
+    return group
+
+
+def _probe_symm_mem_ipc(symm_mem, group_name: str) -> bool:
+    r"""One-time collective check that a symmetric workspace can be rendezvoused for
+    *group_name* (i.e. CUDA-IPC / P2P is available). Every rank must call this together;
+    :func:`_symm_mem_usable` caches the verdict so it happens at most once per group."""
+    try:
+        with torch.cuda.device(torch.cuda.current_device()):
+            symm_mem.get_symm_mem_workspace(group_name, 1024)
+        return True
+    except Exception:  # pragma: no cover - probed only on real multi-GPU hardware
+        return False
+
+
 def _symm_mem_usable(group: object) -> bool:
     r"""Whether the symmetric-memory transport is auto-selectable for *group*.
 
-    Conservative: auto-selects only when device-initiated NVSHMEM is present (the safe
-    multi-node path). Intra-node CUDA-IPC is reachable via
-    ``PHYSICSNEMO_HALO_BACKEND=symm_mem`` -- its capability cannot be probed here
-    without a side-effecting collective. ``funcol`` (no requirement) always remains a
-    working fallback.
+    Selects symm-mem when NVSHMEM is available (a clean, non-collective probe -- the
+    device-initiated multi-node path) or when a symmetric-workspace rendezvous succeeds
+    for *group* (the intra-node CUDA-IPC path). The rendezvous is collective and cached
+    per group; it is safe because the only distributed caller is the halo exchange
+    itself, which every rank enters together. ``funcol`` (no requirement) always remains
+    a working fallback, so a ``False`` here still lands on a correct path.
     """
     if not torch.cuda.is_available():
         return False
     try:
+        import torch.distributed as _dist
         import torch.distributed._symmetric_memory as symm_mem
-
-        return bool(symm_mem.is_nvshmem_available())
     except Exception:  # pragma: no cover - torch build without symm-mem
         return False
+    if not (_dist.is_available() and _dist.is_initialized()):
+        return False
+    # symm-mem needs a CUDA/NCCL group; skip gloo/CPU so the collective probe below is
+    # never issued on a transport that cannot serve it (which could hang, not raise).
+    pg = _resolve_pg(group)
+    if pg is None:
+        return False
+    try:
+        if "nccl" not in str(_dist.get_backend(pg)).lower():
+            return False
+    except Exception:
+        return False
+    try:
+        nvshmem = bool(symm_mem.is_nvshmem_available())
+    except Exception:  # pragma: no cover
+        nvshmem = False
+    if nvshmem:
+        return True
+    group_name = _symm_group_name(group)
+    cached = _symm_capability_cache.get(group_name)
+    if cached is None:
+        cached = _probe_symm_mem_ipc(symm_mem, group_name)
+        _symm_capability_cache[group_name] = cached
+    return cached
 
 
 def select_halo_backend(group: object = None) -> _HaloBackend:
