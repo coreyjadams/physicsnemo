@@ -58,10 +58,7 @@ def parse_args():
         "--ddp_size",
         type=int,
         default=-1,
-        help=(
-            "DDP world size. -1 (default) infers it as "
-            "world_size // domain_size"
-        ),
+        help=("DDP world size. -1 (default) infers it as world_size // domain_size"),
     )
     parser.add_argument(
         "--domain_size", type=int, default=1, help="Domain parallel size (default: 1)"
