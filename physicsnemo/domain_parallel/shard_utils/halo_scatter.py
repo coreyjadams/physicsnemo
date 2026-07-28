@@ -454,7 +454,7 @@ def _symm_mem_usable(group: object) -> bool:
     return cached
 
 
-def select_halo_backend(group: object = None) -> _HaloBackend:
+def select_halo_backend(group: object = None, is_cuda: bool = True) -> _HaloBackend:
     r"""Return the halo transport backend for *group*.
 
     Honours ``PHYSICSNEMO_HALO_BACKEND`` (``"funcol"`` | ``"symm_mem"``); otherwise
@@ -465,6 +465,13 @@ def select_halo_backend(group: object = None) -> _HaloBackend:
     ----------
     group : ProcessGroup or DeviceMesh or str or None, optional, default=None
         Collective group used for the capability check.
+    is_cuda : bool, optional, default=True
+        Whether the tensor being exchanged is on CUDA. The symmetric-memory backend is
+        CUDA-only, so auto-selection must never pick it for a CPU tensor -- otherwise a CPU
+        exchange would reach it and raise. This is *not* inferable from *group* alone: a
+        CUDA-equipped process registers a mixed backend (e.g. ``"cpu:gloo,cuda:nccl"``), whose
+        NCCL substring would otherwise let a CPU exchange pass the capability gate. So the
+        caller passes the tensor's ``is_cuda`` and CPU work always routes to ``funcol``.
 
     Returns
     -------
@@ -481,6 +488,10 @@ def select_halo_backend(group: object = None) -> _HaloBackend:
             f"PHYSICSNEMO_HALO_BACKEND={forced!r} is not a known halo backend "
             "(expected 'funcol' or 'symm_mem')."
         )
+    # CPU work can only use funcol (the symm-mem backend is CUDA-only). Guard here, before
+    # the capability probe, so no CPU exchange is ever routed to a CUDA backend.
+    if not is_cuda:
+        return _FUNCOL_BACKEND
     if _symm_mem_usable(group):
         return _SYMM_MEM_BACKEND
     return _FUNCOL_BACKEND
@@ -523,7 +534,7 @@ def halo_reverse_exchange(
     torch.Tensor
         ``(n_owned, *F)`` owned block with every borrowed contribution summed in.
     """
-    return select_halo_backend(group).reverse(
+    return select_halo_backend(group, padded.is_cuda).reverse(
         padded, n_owned, send_indices, send_sizes, rank, world_size, group
     )
 
@@ -560,7 +571,7 @@ def halo_forward_exchange(
     torch.Tensor
         ``(n_owned + n_ghost, *F)`` padded tensor with ghost rows refreshed.
     """
-    return select_halo_backend(group).forward(
+    return select_halo_backend(group, owned.is_cuda).forward(
         owned, send_indices, send_sizes, rank, world_size, group
     )
 
@@ -575,7 +586,7 @@ def _scatter_correct_dense(
     group: object,
 ) -> torch.Tensor:
     r"""``forward(reverse(padded))`` over *group* using a single selected backend."""
-    backend = select_halo_backend(group)
+    backend = select_halo_backend(group, padded.is_cuda)
     owned = backend.reverse(
         padded, n_owned, send_indices, send_sizes, rank, world_size, group
     )

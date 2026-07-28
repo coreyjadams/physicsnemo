@@ -444,6 +444,12 @@ def test_select_halo_backend_env_override(monkeypatch) -> None:
     monkeypatch.delenv("PHYSICSNEMO_HALO_BACKEND", raising=False)
     assert hs.select_halo_backend().name == "funcol"
 
+    # Regression: auto-selection must route CPU work (is_cuda=False) to funcol, never a
+    # CUDA-only backend. A CUDA process registers a mixed "cpu:gloo,cuda:nccl" backend whose
+    # NCCL substring used to let a CPU exchange pass the symm-mem capability gate and then
+    # crash on the CPU tensor; the is_cuda guard prevents that for every auto branch.
+    assert hs.select_halo_backend(is_cuda=False).name == "funcol"
+
     monkeypatch.setenv("PHYSICSNEMO_HALO_BACKEND", "funcol")
     assert hs.select_halo_backend().name == "funcol"
 
