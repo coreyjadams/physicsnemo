@@ -19,7 +19,6 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import torch
-import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import (
