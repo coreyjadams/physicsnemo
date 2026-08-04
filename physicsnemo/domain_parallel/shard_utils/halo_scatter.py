@@ -122,11 +122,8 @@ def funcol_all_to_all_v_rows(
     return flat_recv.reshape((total_recv,) + trailing)
 
 
-# Backend seam: a transport owns the whole reverse/forward exchange, because the
-# data-movement structure -- not just the collective call -- is transport-specific.
-# The funcol backend builds dense destination-ordered buffers and loops over the
-# whole group (what ``all_to_all_single`` needs); the symmetric-memory backend stages
-# into a symmetric workspace and pulls each neighbour block with ``get_buffer``.
+# Backend seam: a transport owns the whole reverse/forward exchange, since the data-movement
+# structure -- not just the collective call -- is transport-specific.
 
 
 class _HaloBackend(Protocol):
@@ -262,8 +259,7 @@ _REV_READY, _REV_DONE, _FWD_READY, _FWD_DONE = 0, 1, 2, 3
 
 
 class _SymmMemHaloBackend:
-    r"""Symmetric-memory one-sided transport (NVSHMEM device-initiated across nodes,
-    CUDA-IPC ``get_buffer`` within a node).
+    r"""Intra-node symmetric-memory one-sided transport (CUDA-IPC ``get_buffer``).
 
     Each rank stages its exchange block into a symmetric workspace, then *pulls* each
     neighbour's block with ``get_buffer``. Only real ghost/lent data moves, and the
@@ -379,6 +375,7 @@ _SYMM_MEM_BACKEND = _SymmMemHaloBackend()
 
 
 _symm_capability_cache: dict[str, bool] = {}
+_group_multinode_cache: dict[str, bool] = {}
 
 
 def _resolve_pg(group: object):
@@ -399,7 +396,7 @@ def _resolve_pg(group: object):
     return group
 
 
-def _probe_symm_mem_ipc(symm_mem, group_name: str) -> bool:
+def _check_symm_mem_ipc(symm_mem, group_name: str) -> bool:
     r"""One-time collective check that a symmetric workspace can be rendezvoused for
     *group_name* (i.e. CUDA-IPC / P2P is available). Every rank must call this together;
     :func:`_symm_mem_usable` caches the verdict so it happens at most once per group."""
@@ -407,19 +404,19 @@ def _probe_symm_mem_ipc(symm_mem, group_name: str) -> bool:
         with torch.cuda.device(torch.cuda.current_device()):
             symm_mem.get_symm_mem_workspace(group_name, 1024)
         return True
-    except Exception:  # pragma: no cover - probed only on real multi-GPU hardware
+    except Exception:  # pragma: no cover - runs only on real multi-GPU hardware
         return False
 
 
 def _symm_mem_usable(group: object) -> bool:
     r"""Whether the symmetric-memory transport is auto-selectable for *group*.
 
-    Selects symm-mem when NVSHMEM is available (a clean, non-collective probe -- the
-    device-initiated multi-node path) or when a symmetric-workspace rendezvous succeeds
-    for *group* (the intra-node CUDA-IPC path). The rendezvous is collective and cached
-    per group; it is safe because the only distributed caller is the halo exchange
-    itself, which every rank enters together. ``funcol`` (no requirement) always remains
-    a working fallback, so a ``False`` here still lands on a correct path.
+    Gated on a NCCL group plus a one-time, cached, per-group symmetric-workspace
+    rendezvous check. That check is reliable: it succeeds for an intra-node group (the
+    ``get_symm_mem_workspace`` / ``get_buffer`` path is CUDA-IPC, node-local) and fails
+    cleanly for a cross-node one (the IPC handle exchange, "send fd", cannot cross
+    nodes). ``funcol`` (no requirement) is the always-correct fallback -- including
+    cross-node.
     """
     if not torch.cuda.is_available():
         return False
@@ -430,8 +427,8 @@ def _symm_mem_usable(group: object) -> bool:
         return False
     if not (_dist.is_available() and _dist.is_initialized()):
         return False
-    # symm-mem needs a CUDA/NCCL group; skip gloo/CPU so the collective probe below is
-    # never issued on a transport that cannot serve it (which could hang, not raise).
+    # symm-mem needs an NCCL-capable group; a substring test (not exact-match) since a CUDA
+    # process registers a mixed backend like "cpu:gloo,cuda:nccl".
     pg = _resolve_pg(group)
     if pg is None:
         return False
@@ -440,38 +437,57 @@ def _symm_mem_usable(group: object) -> bool:
             return False
     except Exception:
         return False
-    try:
-        nvshmem = bool(symm_mem.is_nvshmem_available())
-    except Exception:  # pragma: no cover
-        nvshmem = False
-    if nvshmem:
-        return True
     group_name = _symm_group_name(group)
     cached = _symm_capability_cache.get(group_name)
     if cached is None:
-        cached = _probe_symm_mem_ipc(symm_mem, group_name)
+        cached = _check_symm_mem_ipc(symm_mem, group_name)
         _symm_capability_cache[group_name] = cached
+    return cached
+
+
+def _group_is_multinode(group: object) -> bool:
+    r"""Whether *group* spans more than one physical node, via a hostname all-gather (which
+    allocates no symmetric memory, unlike the intra-node capability check). Cached per group;
+    falls back to a world-size-vs-local-GPU-count heuristic if the gather cannot run."""
+    import socket
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return False
+    pg = _resolve_pg(group)
+    if pg is None:
+        return False
+    group_name = _symm_group_name(group)
+    cached = _group_multinode_cache.get(group_name)
+    if cached is None:
+        try:
+            world = dist.get_world_size(pg)
+            gathered: list[object] = [None] * world
+            dist.all_gather_object(gathered, socket.gethostname(), group=pg)
+            cached = len({str(h) for h in gathered}) > 1
+        except Exception:  # pragma: no cover - fall back to a local heuristic
+            try:
+                cached = dist.get_world_size(pg) > torch.cuda.device_count()
+            except Exception:
+                cached = False
+        _group_multinode_cache[group_name] = cached
     return cached
 
 
 def select_halo_backend(group: object = None, is_cuda: bool = True) -> _HaloBackend:
     r"""Return the halo transport backend for *group*.
 
-    Honours ``PHYSICSNEMO_HALO_BACKEND`` (``"funcol"`` | ``"symm_mem"``); otherwise
-    picks the symmetric-memory backend when usable and ``funcol`` (the fallback)
-    otherwise.
+    Honours ``PHYSICSNEMO_HALO_BACKEND`` (``"funcol"`` | ``"symm_mem"``); otherwise picks
+    the intra-node symmetric-memory backend when usable, and ``funcol`` (the always-correct
+    fallback) otherwise.
 
     Parameters
     ----------
     group : ProcessGroup or DeviceMesh or str or None, optional, default=None
         Collective group used for the capability check.
     is_cuda : bool, optional, default=True
-        Whether the tensor being exchanged is on CUDA. The symmetric-memory backend is
-        CUDA-only, so auto-selection must never pick it for a CPU tensor -- otherwise a CPU
-        exchange would reach it and raise. This is *not* inferable from *group* alone: a
-        CUDA-equipped process registers a mixed backend (e.g. ``"cpu:gloo,cuda:nccl"``), whose
-        NCCL substring would otherwise let a CPU exchange pass the capability gate. So the
-        caller passes the tensor's ``is_cuda`` and CPU work always routes to ``funcol``.
+        Whether the exchanged tensor is on CUDA. The symmetric-memory backends are CUDA-only,
+        so CPU work always routes to ``funcol``; this is passed explicitly because it is not
+        reliably inferable from *group* alone.
 
     Returns
     -------
@@ -488,11 +504,14 @@ def select_halo_backend(group: object = None, is_cuda: bool = True) -> _HaloBack
             f"PHYSICSNEMO_HALO_BACKEND={forced!r} is not a known halo backend "
             "(expected 'funcol' or 'symm_mem')."
         )
-    # CPU work can only use funcol (the symm-mem backend is CUDA-only). Guard here, before
-    # the capability probe, so no CPU exchange is ever routed to a CUDA backend.
+    # CPU work can only use funcol (the symm-mem backends are CUDA-only); guard before any
+    # capability check so no CPU exchange reaches a CUDA backend.
     if not is_cuda:
         return _FUNCOL_BACKEND
-    if _symm_mem_usable(group):
+    # Node locality selects the transport without allocating symmetric memory: only a
+    # single-node group can use the intra-node symm-mem backend; a multi-node group routes to
+    # funcol, since the CUDA-IPC symmetric workspace cannot rendezvous across nodes.
+    if not _group_is_multinode(group) and _symm_mem_usable(group):
         return _SYMM_MEM_BACKEND
     return _FUNCOL_BACKEND
 
@@ -600,6 +619,7 @@ def pack_halo_routing(
     rank: int,
     world_size: int,
     device: object = None,
+    cap: int | None = None,
 ) -> torch.Tensor:
     r"""Pack halo routing into a 1-D int64 tensor for :func:`halo_scatter_correct`.
 
@@ -622,19 +642,25 @@ def pack_halo_routing(
         Group size (sub-group size when a sub-group is used).
     device : torch.device or str or None, optional, default=None
         Device for the packed tensor.
+    cap : int or None, optional, default=None
+        If given, pad the trailing index section so the packed tensor always has the fixed
+        length ``4 + world_size**2 + world_size + cap``, keeping the routing a constant shape
+        across steps (required by a compiled ``dynamic=False`` loop). Must be ``>=`` the total
+        number of lent-row indices this rank holds; the pad is ignored on unpack.
 
     Returns
     -------
     torch.Tensor
         1-D int64 routing tensor consumed by :func:`halo_scatter_correct`, laid out
         as ``[world_size, n_owned, rank, n_flat, *send_sizes, *send_idx_lens,
-        *send_idx_flat]``.
+        *send_idx_flat]`` (with *send_idx_flat* padded to ``cap`` when *cap* is set).
 
     Notes
     -----
     Index arrays are concatenated as tensors (their lengths come from shapes), so a
     device-resident ``send_indices`` is never moved to host -- the pack is free of a
-    value-dependent device sync.
+    value-dependent device sync. The ``cap`` check uses only lengths (shapes), so it too
+    adds no sync.
     """
     idx_tensors = [
         idx.reshape(-1).to(torch.int64)
@@ -651,18 +677,38 @@ def pack_halo_routing(
         dtype=torch.int64,
         device=device,
     )
-    if not idx_tensors:
+    idx_flat = (
+        torch.cat([t.to(device) for t in idx_tensors])
+        if idx_tensors
+        else torch.zeros(0, dtype=torch.int64, device=device)
+    )
+    if cap is not None:
+        total = int(sum(lens))
+        if total > cap:
+            raise ValueError(
+                f"pack_halo_routing: cap={cap} is smaller than the number of lent-row "
+                f"indices this rank holds ({total}); set cap to the per-rank maximum."
+            )
+        if idx_flat.numel() < cap:
+            idx_flat = torch.cat(
+                [
+                    idx_flat,
+                    torch.zeros(
+                        cap - idx_flat.numel(), dtype=torch.int64, device=device
+                    ),
+                ]
+            )
+    elif not idx_tensors:
         return header
-    return torch.cat([header, torch.cat([t.to(device) for t in idx_tensors])])
+    return torch.cat([header, idx_flat])
 
 
 def _unpack_halo_routing(routing: torch.Tensor):
     r"""Inverse of :func:`pack_halo_routing` (runs eagerly inside the op).
 
-    Materializes only the small fixed header (``world_size``, ``n_owned``, ``rank``,
-    and the ``world_size^2`` counts + ``world_size`` lengths) to host -- the counts
-    are needed as ``int[]`` split sizes for the variable ``all_to_all``. The
-    (potentially large) index arrays stay on-device as views, never round-tripped.
+    Materializes only the small fixed header to host (the counts are needed as ``int[]`` split
+    sizes); the index arrays stay on-device as views. It slices the index section by the
+    per-rank lengths in the header, so any trailing padding from a ``cap`` pack is never read.
     """
     world_size, n_owned, rank, _n_flat = routing[:4].tolist()
     body_len = world_size * world_size + world_size
@@ -750,31 +796,26 @@ def halo_scatter_correct(
     return _halo_scatter_correct_op(padded, routing, _halo_group_name(group))
 
 
-# ======================================================================
-# ShardTensor scatter/index-add integration.
-#
-# A ShardTensor whose local tensor is a ``[owned | ghost]`` halo and which carries
-# the packed routing as an extra inner tensor named ``_halo_meta_packed`` (declared
-# via ``_extra_inner_tensors``) gets its ``scatter_add`` / ``index_add`` corrected
-# automatically. Correction runs as a ``__torch_function__`` handler (invoked for
-# both eager and ``torch.compile`` tracing) that scatters on the plain local, emits
-# :func:`halo_scatter_correct`, and re-wraps. It must run there rather than in
-# ``__torch_dispatch__``: a traceable wrapper subclass connects its autograd only
-# for the intercepted op itself, so a halo correction applied to inner tensors at
-# the dispatch level is dropped from the compiled backward. The routing rides as a
-# graph-input inner tensor (survives graph breaks / value changes without
-# recompiling). Tensors without routing fall through unchanged -- registering is a
-# safe opt-in.
-# ======================================================================
+# ShardTensor scatter/index-add integration. A ShardTensor carrying the packed routing as an
+# inner tensor (``_halo_meta_packed``) gets its scatter_add / index_add corrected via a
+# ``__torch_function__`` handler that scatters on the plain local, emits
+# :func:`halo_scatter_correct`, and re-wraps. The handler runs in ``__torch_function__`` rather
+# than ``__torch_dispatch__`` so the correction stays in the compiled backward. Tensors without
+# routing fall through unchanged, so registering is a safe opt-in.
 
 
 def register_halo_scatter_handlers() -> None:
-    r"""Register ``scatter_add`` / ``index_add`` halo-correction handlers on
-    ``ShardTensor`` (idempotent, opt-in).
+    r"""Register ``scatter_add`` / ``index_add`` (and the in-place ``scatter_add_`` /
+    ``index_add_``) halo-correction handlers on ``ShardTensor`` (idempotent, opt-in).
 
     Handlers apply :func:`halo_scatter_correct` only to tensors carrying a non-empty
     ``_halo_meta_packed`` routing inner tensor; all other ShardTensors fall through
     to the default behavior, so registering does not change base behavior.
+
+    For the in-place forms the correction is computed out-of-place (so its backward chains
+    cleanly), the corrected values are written back into the accumulator's local storage, and
+    the returned value is a fresh autograd-connected wrapper so ``y = agg.scatter_add_(...)``
+    differentiates through the correction.
     """
     from physicsnemo.domain_parallel.shard_tensor import (
         ShardTensor,
@@ -835,5 +876,31 @@ def register_halo_scatter_handlers() -> None:
         corrected = halo_scatter_correct(local_result, routing, group=self._spec.mesh)
         return _wrap_like(self, corrected, routing, _needs_grad(self, index, src))
 
+    # In-place ``scatter_add_`` / ``index_add_`` map to their out-of-place forms so the
+    # correction's backward chains cleanly (an in-place op on the inner tensor would be
+    # dropped from the wrapper-subclass backward).
+    _inplace_to_oop = {
+        torch.Tensor.scatter_add_: torch.Tensor.scatter_add,
+        torch.Tensor.index_add_: torch.Tensor.index_add,
+    }
+
+    def _scatter_inplace_handler(f, types, args, kwargs):
+        self = args[0]
+        routing = _routing(self)
+        if routing is None:
+            return _torch_function_fallback_via_dtensor(f, args, kwargs)
+        dim, index, src = args[1], args[2], args[3]
+        local_result = _inplace_to_oop[f](_local(self), dim, _local(index), _local(src))
+        corrected = halo_scatter_correct(local_result, routing, group=self._spec.mesh)
+        out = _wrap_like(self, corrected, routing, _needs_grad(self, index, src))
+        # Write the corrected values into this rank's local storage so a caller that reuses the
+        # accumulator sees them; the autograd path is the returned wrapper. The detached
+        # no_grad copy updates the shared storage without recording an in-place op on a leaf.
+        with torch.no_grad():
+            self._local_tensor.detach().copy_(corrected)
+        return out
+
     for func in (torch.Tensor.scatter_add, torch.Tensor.index_add):
         ShardTensor.register_function_handler(func, _scatter_handler)
+    for func in (torch.Tensor.scatter_add_, torch.Tensor.index_add_):
+        ShardTensor.register_function_handler(func, _scatter_inplace_handler)

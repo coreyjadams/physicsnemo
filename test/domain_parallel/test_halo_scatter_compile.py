@@ -305,10 +305,8 @@ def run_symm_mem_equivalence(mesh, backend, n_owned=6, lend=2, feat=4):
     ref_fwd = fn(pf, routing)
     (ref_grad,) = torch.autograd.grad(ref_fwd.sum(), pf)
 
-    # symm-mem, eager: identical arithmetic (float64 accumulate), only the transport
-    # differs, so equality is exact. Repeat many times: the per-neighbour signal fences
-    # are the one place a mis-ordered put/wait would show up, and that race is
-    # nondeterministic -- a single pass can pass by luck.
+    # symm-mem, eager: identical float64 arithmetic, only the transport differs, so equality is
+    # exact. Repeat many times to surface any nondeterministic ordering race in the fences.
     _force_halo_backend("symm_mem")
     try:
         for _ in range(50):
@@ -320,15 +318,12 @@ def run_symm_mem_equivalence(mesh, backend, n_owned=6, lend=2, feat=4):
     finally:
         _force_halo_backend(None)
 
-    # Auto-selection (no env override) picks symm-mem here: NVSHMEM if present, else the
-    # cached CUDA-IPC rendezvous probe succeeded. Exercises the broadened capability
-    # check, not just the forced path above.
+    # Auto-selection (no env override) also picks symm-mem here.
     from physicsnemo.domain_parallel.shard_utils.halo_scatter import select_halo_backend
 
     assert select_halo_backend(mesh).name == "symm_mem"
 
-    # symm-mem, compiled (the op body reads the backend env at runtime, so it survives
-    # tracing): must lower and match the oracle.
+    # symm-mem, compiled: the op body reads the backend env at runtime, so it survives tracing.
     _force_halo_backend("symm_mem")
     try:
         torch._dynamo.reset()
