@@ -46,6 +46,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gracefully; a general AOTAutograd gap pending an upstream PyTorch hook.
   `ShardTensor.__coerce_same_metadata_as_tangent__` now also coerces *down* to a
   plain `torch.Tensor` for a replicated boundary.
+- Adds `domain_parallel.shard_utils.halo_scatter`: a `torch.compile`-safe halo
+  scatter-correction primitive for `Shard(0)` ShardTensors with a borrowed-ghost
+  overlay. `halo_reverse_exchange` / `halo_forward_exchange` express the
+  fold-to-owner / refresh-ghost halves as functional collectives (AOT-traceable),
+  and `halo_scatter_correct` fuses them into a `torch.library.custom_op` that is
+  opaque to fake mode (self-adjoint registered backward) so the correction survives
+  both `aot_eager` and inductor, forward and backward. Routing is passed as a packed
+  graph-input tensor (via `pack_halo_routing`), so it survives Dynamo graph breaks
+  and per-step value changes without recompiling, and the primitive carries no
+  partitioner/spatial assumptions. `register_halo_scatter_handlers` wires the
+  correction onto `ShardTensor.scatter_add` / `index_add` via a `__torch_function__`
+  handler (invoked for both eager and compile) that scatters on the plain local,
+  emits `halo_scatter_correct`, and re-wraps through an `autograd.Function`; running
+  above `__torch_dispatch__` is what keeps the correction's backward in the compiled
+  graph, and the halo ShardTensor's local-honest (`Replicate`, global == local) spec
+  keeps that backward free of spurious cross-rank redistributes. The row
+  all-to-all-v transport is a pluggable backend (`select_halo_backend`,
+  `PHYSICSNEMO_HALO_BACKEND` override): a portable functional-collective path (the
+  always-available fallback and correctness oracle) and an intra-node symmetric-memory
+  (CUDA-IPC) one-sided path that stages into a symmetric workspace and pulls each
+  neighbour block with `get_buffer`, fencing peer-to-peer with `put_signal` /
+  `wait_signal` (O(neighbours) coordination, not a group-wide barrier). The symm-mem
+  path is auto-selected for a single-node group whose one-time (cached, per-group)
+  CUDA-IPC workspace rendezvous succeeds, and is forceable/disableable by env. All
+  entry points accept a neighbour sub-`group` (threaded through the op as its c10d
+  group name) to shrink the coordination span from `O(world)` to `O(neighbours)`.
+- Extends `domain_parallel.shard_utils.halo_scatter` with `pack_halo_routing(cap=)`
+  fixed-shape routing (for compiled `dynamic=False` runs), an in-place `scatter_add_` /
+  `index_add_` dispatch handler (correct value and gradient, eager and compiled), and
+  node-locality routing in `select_halo_backend` (a symmetric-allocation-free hostname
+  check) so a multi-node group falls back to `funcol` while a single-node group uses the
+  intra-node symmetric-memory backend.
+- Adds a `ShardTensor.grad_dtype` property override (returns the local tensor's
+  dtype). Newer PyTorch reads `grad_dtype` during Dynamo fake-tensor conversion;
+  without the override it re-enters `__torch_function__` and falls back to a
+  non-leaf DTensor whose C-level `grad_dtype` getter raises "grad_dtype can only be
+  accessed on leaf tensors", breaking compile. Mirrors the existing `grad_fn` /
+  `is_leaf` / `grad` shields.
 - Adds `integrate_moment` and `Mesh.integrate_moment` for measure-weighted
   outer-product moments. Mesh integration APIs now accept `nan_policy`.
 - Adds per-cell measure weights that are preserved through cell subsampling
