@@ -20,9 +20,22 @@ import argparse
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Benchmark HybridViT model performance"
+        description="Benchmark domain-parallel model performance"
     )
 
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="vit",
+        choices=["vit", "conv", "natten"],
+        help=(
+            "Model architecture: vit (ring attention), conv (halo "
+            "convolutions), or natten (neighborhood attention; requires the "
+            "optional natten package). All support 2D and 3D via "
+            "--dimension. See model/__init__.py to register your own "
+            "(default: vit)"
+        ),
+    )
     parser.add_argument(
         "--batch_size",
         type=int,

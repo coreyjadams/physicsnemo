@@ -17,10 +17,10 @@
 from __future__ import annotations
 
 from itertools import accumulate
+from math import prod
 from typing import cast
 
 import torch
-import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import (
@@ -85,7 +85,6 @@ def _to_replicate_tensor(
     """
     # Get the mesh for the group:
     mesh = current_spec.mesh
-    group = mesh.get_group(mesh_dim)
 
     # Ensure contiguous data for the reduction:
     local_tensor = local_tensor.contiguous()
@@ -103,14 +102,26 @@ def _to_replicate_tensor(
     for i, t in enumerate(tensor_dim_shapes):
         base_shapes[i][tensor_dim] = tensor_dim_shapes[i]
 
-    # Create a spot for the output:
-    output = [
-        torch.empty(s, device=local_tensor.device, dtype=local_tensor.dtype)
-        for s in base_shapes
-    ]
-    dist.all_gather(output, local_tensor, group=group)
+    # Gather with funcol rather than dist.all_gather so a captured graph
+    # holds a DeviceMesh reference instead of a c10d ProcessGroup
+    # ScriptObject: AOTAutograd deepcopies the backward GraphModule during
+    # caching, and ProcessGroup has no __getstate__. funcol.all_gather_tensor
+    # requires equal shapes across ranks, so pad the flattened shard to the
+    # largest shard's numel and slice per-rank afterwards.
+    numels = [prod(s) for s in base_shapes]
+    max_numel = max(numels)
+    send = local_tensor.reshape(-1)
+    if send.numel() < max_numel:
+        send = torch.nn.functional.pad(send, (0, max_numel - send.numel()))
+    gathered = funcol.all_gather_tensor(send, gather_dim=0, group=(mesh, mesh_dim))
+    if isinstance(gathered, funcol.AsyncCollectiveTensor):
+        gathered = gathered.wait()
 
-    return torch.cat(output, dim=tensor_dim).contiguous()
+    shards = [
+        gathered[i * max_numel : i * max_numel + numels[i]].view(shape)
+        for i, shape in enumerate(base_shapes)
+    ]
+    return torch.cat(shards, dim=tensor_dim).contiguous()
 
 
 def _select_slice_from_replicate(
@@ -225,7 +236,6 @@ def _to_new_shard_dim(
 
     device_mesh = target_spec.mesh
     mesh_size = device_mesh.size(mesh_dim=mesh_dim)
-    group = device_mesh.get_group(mesh_dim=mesh_dim)
 
     # To use the size hint, and preserve the original sharding, we need to insist that
     # the mesh_size and the length of size hint is equal
@@ -296,28 +306,45 @@ def _to_new_shard_dim(
 
     if recv_shapes is None:
         # Fallback: negotiate recv shapes with the sender ranks directly.
-        send_shapes = [
-            torch.tensor(c.shape, device=local_tensor.device, dtype=torch.int32)
-            for c in chunks
-        ]
-        recv_shape_tensors = [torch.empty_like(s) for s in send_shapes]
-
-        # Gather the send shape from every rank:
-        # For all to all, we _have_ to send and receive from every rank.
-        # But we can optimize the null-communication
-        dist.all_to_all(recv_shape_tensors, send_shapes, group=group)
+        # funcol (with a mesh group, not a ProcessGroup) keeps this legal
+        # inside AOT-captured backward graphs, which get deepcopied.
+        # Every per-destination shape tensor has ndim elements, so the
+        # exchange is an even all_to_all_single (None split sizes).
+        ndim = local_tensor.ndim
+        send_shape_buf = torch.cat(
+            [
+                torch.tensor(c.shape, device=local_tensor.device, dtype=torch.int64)
+                for c in chunks
+            ]
+        )
+        recv_shape_buf = funcol.all_to_all_single(
+            send_shape_buf, None, None, (device_mesh, mesh_dim)
+        )
+        if isinstance(recv_shape_buf, funcol.AsyncCollectiveTensor):
+            recv_shape_buf = recv_shape_buf.wait()
 
         # Turn the recv_shapes back into plain int shape lists.
-        recv_shapes = [r.tolist() for r in recv_shape_tensors]
+        recv_shapes = [
+            recv_shape_buf[i * ndim : (i + 1) * ndim].tolist() for i in range(mesh_size)
+        ]
 
-    # Create the buffers for recv:
+    # Exchange the data itself as one flattened all_to_all_single (funcol for
+    # the same compile/deepcopy reason as above): concatenate the flattened
+    # per-destination chunks in ascending rank order, with explicit uneven
+    # split sizes on both sides.
+    input_split_sizes = [c.numel() for c in chunks]
+    output_split_sizes = [prod(shape) for shape in recv_shapes]
+    send_buf = torch.cat([c.reshape(-1) for c in chunks])
+    recv_buf = funcol.all_to_all_single(
+        send_buf, output_split_sizes, input_split_sizes, (device_mesh, mesh_dim)
+    )
+    if isinstance(recv_buf, funcol.AsyncCollectiveTensor):
+        recv_buf = recv_buf.wait()
+
     recv_buffers = [
-        torch.empty(shape, device=local_tensor.device, dtype=local_tensor.dtype)
-        for shape in recv_shapes
+        chunk.view(shape)
+        for chunk, shape in zip(torch.split(recv_buf, output_split_sizes), recv_shapes)
     ]
-
-    # chunks is the send buffer.
-    dist.all_to_all(recv_buffers, chunks, group=group)
 
     # Take the received tensors and stack them along the target dimension:
     stacked_tensor = torch.cat(recv_buffers, dim=current_dim).contiguous()

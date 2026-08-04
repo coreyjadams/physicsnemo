@@ -14,11 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
+
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 
-from model import HybridViT
+from model import MODEL_REGISTRY
 
 from utils import (
     parse_args,
@@ -38,23 +39,25 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import fully_shard
 
 # Imports for Domain Parallelism
-from physicsnemo.domain_parallel import scatter_tensor
-from torch.distributed.tensor import DTensor, distribute_tensor
+from physicsnemo.domain_parallel import scatter_tensor, sync_module_over_mesh
+from torch.distributed.tensor import distribute_tensor
 from torch.distributed.tensor.placement_types import (
     Replicate,
     Shard,
 )
 
 
-def shard_pos_embed(model: nn.Module, domain_mesh) -> None:
-    """Shard the positional embedding across the domain mesh, in place.
+def shard_spatial_params(model: nn.Module, domain_mesh, dim_selector) -> None:
+    """Shard statically-shaped spatial parameters across the domain mesh.
 
     Only used on the FSDP2 path (``--fsdp``), where the parameters become
-    distributed tensors anyway.  The positional embedding is laid out
-    ``(1, num_patches, embed_dim)`` and the activations it is added to are
-    sequence-sharded, so here it is *split* -- not replicated -- across the
-    domain ranks.  (Without ``--fsdp`` it stays a plain replicated parameter
-    and ShardTensor auto-promotes it in the forward pass.)
+    distributed tensors anyway.  ``dim_selector`` (from the model's
+    :class:`ModelSpec`) maps a parameter name to the dim it should be split
+    along -- e.g. a positional embedding laid out ``(1, num_patches, C)`` is
+    split (not replicated) across the domain ranks to match the
+    sequence-sharded activations it is added to.  (Without ``--fsdp`` such
+    params stay plain and replicated and ShardTensor auto-promotes them in
+    the forward pass.)
 
     Note carefully: this uses plain ``DTensor`` (``distribute_tensor``), not
     ``ShardTensor``.  Parameters are statically shaped, so DTensor's even-chunk
@@ -63,55 +66,20 @@ def shard_pos_embed(model: nn.Module, domain_mesh) -> None:
     with DTensor arguments directly, so the two mix freely in the forward pass.
 
     ``distribute_tensor`` broadcasts from rank 0 of the mesh by default, so this
-    also synchronizes the embedding across the domain group.
+    also synchronizes the sharded params across the domain group.
     """
-    model.register_parameter(
-        "pos_embed",
-        nn.Parameter(
-            distribute_tensor(model.pos_embed.data, domain_mesh, [Shard(1)]),
-            requires_grad=model.pos_embed.requires_grad,
-        ),
-    )
-
-
-def broadcast_plain_params(model: nn.Module, domain_mesh) -> None:
-    """Broadcast all plain (non-DTensor) parameters over the domain group.
-
-    Every rank in a domain group holds a full replica of the non-spatial
-    weights, so they must start identical.  DDP and FSDP2 are not involved on
-    this axis (they operate on the ``ddp`` axis, or not at all), so we sync
-    explicitly from rank 0 of the domain group.
-    """
-    group = domain_mesh.get_group()
-    src = dist.get_global_rank(group, 0)
-    with torch.no_grad():
-        for param in model.parameters():
-            if isinstance(param, DTensor):
+    for module in model.modules():
+        for name, param in list(module.named_parameters(recurse=False)):
+            shard_dim = dim_selector(name)
+            if shard_dim is None:
                 continue
-            dist.broadcast(param.data, src=src, group=group)
-
-
-def compile_non_attention_blocks(model: nn.Module) -> None:
-    """Regionally compile the model, leaving sharded attention eager.
-
-    With ``domain_size > 1`` the sequence-sharded SDPA dispatches to ring
-    attention, which cannot live inside a compiled region (see
-    ``physicsnemo/domain_parallel/shard_utils/attention_patches.py``).  So we
-    compile everything around it: the patch embedding, each block's MLP and
-    norms, and the classification head.
-
-    ``dynamic=False``: every image size in the sweep runs fixed shapes, so
-    symbolic tracing buys nothing here.  It also matters for correctness
-    under FSDP2: all FSDP-managed submodules share one dynamo wrapper frame,
-    so the norm/MLP/head compilations look like one function called with
-    changing shapes, and automatic-dynamic would promote sizes to SymInts.
-    """
-    model.patch_embed = torch.compile(model.patch_embed, dynamic=False)
-    for block in model.stages:
-        block.norm1 = torch.compile(block.norm1, dynamic=False)
-        block.norm2 = torch.compile(block.norm2, dynamic=False)
-        block.mlp = torch.compile(block.mlp, dynamic=False)
-    model.head = torch.compile(model.head, dynamic=False)
+            module.register_parameter(
+                name,
+                nn.Parameter(
+                    distribute_tensor(param.data, domain_mesh, [Shard(shard_dim)]),
+                    requires_grad=param.requires_grad,
+                ),
+            )
 
 
 def main():
@@ -171,6 +139,16 @@ def main():
             "mesh exists in a single-process job."
         )
 
+    # Resolve the model choice and check its optional dependencies up front.
+    model_spec = MODEL_REGISTRY[args.model]
+    for module_name in model_spec.requires:
+        if importlib.util.find_spec(module_name) is None:
+            raise ImportError(
+                f"--model {args.model} requires the optional '{module_name}' "
+                f"package. Install it, e.g.: pip install "
+                f"nvidia-physicsnemo[cu12,{module_name}-cu12]"
+            )
+
     # Build the mesh whenever the job is distributed at all, so both axes are
     # explicit: DDP is handed the "ddp" mesh group directly (never the default
     # world group), and FSDP2 shards over that same axis.
@@ -194,6 +172,7 @@ def main():
 
     if dm.rank == 0:
         print(f"Device: {device}")
+        print(f"Model: {args.model}")
         print(f"Batch size: {args.batch_size}")
         print(f"Domain size: {args.domain_size}")
         print(f"DDP size: {args.ddp_size}")
@@ -271,7 +250,7 @@ def main():
         # The model is a completely vanilla nn.Module in every configuration.
         # ShardTensor activations auto-promote plain weights when they meet in
         # the forward pass, so no distribute_module / model surgery is needed.
-        model = HybridViT(
+        model = model_spec.build(
             img_size=full_img_size, in_channels=3, num_classes=num_classes
         )
         model = model.to(device)
@@ -279,23 +258,26 @@ def main():
         if args.domain_size > 1:
             if args.fsdp:
                 # On the FSDP2 path the parameters become distributed tensors
-                # anyway, so split the positional embedding across the domain
-                # to match the sequence-sharded activations it is added to.
-                # Without --fsdp it stays plain and replicated: ShardTensor
-                # auto-promotes it in the forward pass, which keeps every
-                # parameter a plain tensor and lets ordinary DDP manage the
-                # model.
-                shard_pos_embed(model, domain_mesh)
+                # anyway, so split the model's spatial params (e.g. positional
+                # embeddings) across the domain to match the sequence-sharded
+                # activations they meet.  Without --fsdp they stay plain and
+                # replicated: ShardTensor auto-promotes them in the forward
+                # pass, which keeps every parameter a plain tensor and lets
+                # ordinary DDP manage the model.
+                shard_spatial_params(model, domain_mesh, model_spec.spatial_param_dim)
 
-            # Sync the replicated weights across the domain group.  Neither
-            # DDP nor FSDP2 will do this for us on the domain axis.
-            broadcast_plain_params(model, domain_mesh)
+            # Sync the replicated weights (and buffers) across the domain
+            # group.  Neither DDP nor FSDP2 will do this for us on the domain
+            # axis; DTensor params (sharded above) are already synced by
+            # construction and are skipped.
+            sync_module_over_mesh(model, domain_mesh)
 
         if args.compile and args.domain_size > 1:
-            # Sharded (ring) attention can't live inside a compiled region;
-            # compile the rest of the model around it.  Do this on the
-            # underlying module, before any FSDP2 wrapping.
-            compile_non_attention_blocks(model)
+            # Sharded attention (ring SDPA, neighborhood attention) can't live
+            # inside a compiled region; each model's spec compiles the safe
+            # regions around it.  Do this on the underlying module, before any
+            # FSDP2 wrapping.
+            model_spec.compile_regions(model)
 
         if args.fsdp:
             # Opt-in parameter sharding: shard the weights over the ddp axis

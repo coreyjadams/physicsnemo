@@ -52,6 +52,7 @@ if ST_AVAILABLE:
         TensorPromotionMode,
         scatter_tensor,
     )
+    from .sync import sync_module_over_mesh
 
     def register_custom_ops():
         """Register all custom ShardTensor ops and shard-aware wrappers.
@@ -80,3 +81,4 @@ else:
     ShardTensorSpec = None
     scatter_tensor = None
     TensorPromotionMode = None
+    sync_module_over_mesh = None

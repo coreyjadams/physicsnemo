@@ -26,7 +26,8 @@ silently dropped (defaulting back to even chunking).
 
 import pytest
 import torch
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.domain_parallel import ShardTensor, scatter_tensor
@@ -203,3 +204,78 @@ def run_compiled_grad_input_stays_shard_tensor(mesh, partial_input):
 @pytest.mark.parametrize("partial_input", [False, True])
 def test_compiled_grad_input_stays_shard_tensor_1d(distributed_mesh, partial_input):
     run_compiled_grad_input_stays_shard_tensor(distributed_mesh, partial_input)
+
+
+def _partial_shard_tensor(mesh, local):
+    # Partial local shape == global shape; build through DTensor.from_local
+    # (accepts Partial directly) + communication-free spec inference.
+    dt = DTensor.from_local(local, mesh, [Partial()] * mesh.ndim, run_check=False)
+    return ShardTensor.from_dtensor(dt)
+
+
+def run_coerce_partial_to_replicate_relabels(mesh):
+    # Grad-direction convention: a Partial-labeled tangent is replicate-valued.
+    # Coercing it to a recorded Replicate spec must RELABEL, not all-reduce —
+    # a real reduction multiplies the tangent by the mesh size. Regression
+    # test for the 4x compiled-grad bug with Partial inputs.
+    dm = DistributedManager()
+    local = torch.full((8, 4), 3.0, device=dm.device)
+    st = _partial_shard_tensor(mesh, local)
+
+    recorded = ShardTensorSpec(
+        mesh=st._spec.mesh,
+        placements=tuple(Replicate() for _ in range(mesh.ndim)),
+        tensor_meta=st._spec.tensor_meta,
+        _sharding_shapes=None,
+    )
+    coerced = st.__coerce_same_metadata_as_tangent__((recorded, False))
+
+    assert isinstance(coerced, ShardTensor)
+    assert coerced._spec.placements == recorded.placements
+    assert torch.allclose(coerced._local_tensor, local), (
+        "Partial->Replicate tangent coercion changed values (all-reduced "
+        "an already-full tangent?)"
+    )
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(120)
+def test_coerce_partial_to_replicate_relabels_1d(distributed_mesh):
+    run_coerce_partial_to_replicate_relabels(distributed_mesh)
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(120)
+def test_coerce_partial_to_replicate_relabels_2d(distributed_mesh_2d):
+    run_coerce_partial_to_replicate_relabels(distributed_mesh_2d)
+
+
+def run_coerce_replicate_to_partial_relabels(mesh):
+    # Reverse direction: recorded spec says Partial, runtime tangent arrived
+    # Replicate. Must relabel (values unchanged), not partition (divide by
+    # mesh size) — the latent inverse of the 4x bug.
+    dm = DistributedManager()
+    local = torch.full((8, 4), 3.0, device=dm.device)
+    st = ShardTensor.from_local(
+        local, mesh, tuple(Replicate() for _ in range(mesh.ndim))
+    )
+
+    recorded = ShardTensorSpec(
+        mesh=st._spec.mesh,
+        placements=tuple(Partial() for _ in range(mesh.ndim)),
+        tensor_meta=st._spec.tensor_meta,
+        _sharding_shapes=None,
+    )
+    coerced = st.__coerce_same_metadata_as_tangent__((recorded, False))
+
+    assert isinstance(coerced, ShardTensor)
+    assert coerced._spec.placements == recorded.placements
+    assert torch.allclose(coerced._local_tensor, local), (
+        "Replicate->Partial tangent coercion changed values (partitioned the tangent?)"
+    )
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(120)
+def test_coerce_replicate_to_partial_relabels_1d(distributed_mesh):
+    run_coerce_replicate_to_partial_relabels(distributed_mesh)

@@ -1007,15 +1007,29 @@ class ShardTensor(torch.Tensor):
         ):
             return self
 
+        # Tangent (grad-direction) convention, matching ShardRedistribute.backward's
+        # spec normalization and _ShardTensorToDTensor.backward's relabel: a
+        # Partial label on a tangent marks replicate-valued data, NOT a pending
+        # reduction. Any Partial <-> Replicate mismatch here must therefore be
+        # a free relabel. Redistributing it for real would all-reduce an
+        # already-full tangent (x mesh_size) or partition it (/ mesh_size).
+        # So: move data with Partial normalized to Replicate on both sides,
+        # then stamp the recorded placements verbatim (AOT requires the
+        # returned tangent's metadata to match the recorded spec exactly).
+        def _normalize(placements: tuple) -> tuple:
+            return tuple(
+                Replicate() if isinstance(p, Partial) else p for p in placements
+            )
+
+        current_spec = self._spec
+        if any(isinstance(p, Partial) for p in current_spec.placements):
+            current_spec = dataclasses.replace(
+                current_spec, placements=_normalize(current_spec.placements)
+            )
+        normalized_target_placements = _normalize(spec.placements)
+
         # Bypass ``self.redistribute()`` so we can thread the recorded per-tensor-dim
         # shard sizes through to the local redistribute (the public API drops them).
-        target_spec = ShardTensorSpec(
-            mesh=self.device_mesh,
-            placements=spec.placements,
-            tensor_meta=self._spec.tensor_meta,
-            _sharding_shapes=spec._sharding_shapes,
-        )
-
         target_sharding_shapes_by_tensor_dim: dict[int, list[int]] = {}
         if spec._sharding_shapes is not None:
             for mesh_dim, placement in enumerate(spec.placements):
@@ -1025,12 +1039,27 @@ class ShardTensor(torch.Tensor):
                         s[placement.dim] for s in shard_shapes
                     ]
 
+        move_spec = ShardTensorSpec(
+            mesh=self.device_mesh,
+            placements=normalized_target_placements,
+            tensor_meta=self._spec.tensor_meta,
+            _sharding_shapes=spec._sharding_shapes,
+        )
         new_local = redistribute_local_shard_tensor(
             self._local_tensor,
-            self._spec,
-            target_spec,
+            current_spec,
+            move_spec,
             async_op=False,
             target_sharding_shapes=target_sharding_shapes_by_tensor_dim,
+        )
+
+        # Final stamp: the recorded placements exactly as AOT expects them,
+        # including any Partial labels (a relabel of the moved data).
+        target_spec = ShardTensorSpec(
+            mesh=self.device_mesh,
+            placements=spec.placements,
+            tensor_meta=self._spec.tensor_meta,
+            _sharding_shapes=spec._sharding_shapes,
         )
         target_spec._local_shape = new_local.shape
 

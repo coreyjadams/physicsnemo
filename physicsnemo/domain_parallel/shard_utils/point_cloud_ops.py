@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 import warp as wp
 from torch.distributed.tensor.placement_types import (
     Replicate,
@@ -615,11 +616,12 @@ class GradReducer(torch.autograd.Function):
         """
         spec = ctx.spec
         placement = spec.placements[0]
-        # Perform an allreduce on the gradient
+        # Perform an allreduce on the gradient. funcol rather than
+        # dist.all_reduce so an AOT-captured backward graph holds a
+        # DeviceMesh instead of a ProcessGroup ScriptObject, which cannot
+        # be deepcopied when AOTAutograd caches the backward GraphModule.
         if placement.is_replicate():
-            dist.all_reduce(
-                grad_output, op=dist.ReduceOp.SUM, group=spec.mesh.get_group(0)
-            )
+            grad_output = funcol.all_reduce(grad_output, "sum", (spec.mesh, 0))
         return grad_output, None
 
 

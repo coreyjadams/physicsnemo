@@ -27,6 +27,7 @@ Run from this directory:
 """
 
 import csv
+import importlib.util
 import os
 import subprocess
 import sys
@@ -105,6 +106,7 @@ def assert_success(result, workdir):
 
 
 def require_gpus(n):
+    """Skip the current test unless at least ``n`` CUDA devices are available."""
     if torch.cuda.device_count() < n:
         pytest.skip(f"requires {n} GPUs, found {torch.cuda.device_count()}")
 
@@ -166,6 +168,113 @@ CONFIGS = [
             "--inference_only",
         ],
     ),
+    # 3D: the transformer stack is dimension-agnostic; one domain-parallel
+    # config exercises the 3D patch embed + volumetric sharding. Smaller
+    # image size (the trailing args override FAST_ARGS - argparse last-wins).
+    (
+        "vit_3d_domain",
+        2,
+        [
+            "--dimension",
+            "3",
+            "--domain_size",
+            "2",
+            "--batch_size",
+            "1",
+            "--image_size_start",
+            "64",
+            "--image_size_stop",
+            "64",
+        ],
+    ),
+]
+
+# Alternate architectures get a compact matrix (the full wrapper/compile
+# matrix above runs on ViT; these cover each architecture's sharded-op paths:
+# halo convolutions for conv, neighborhood-attention halos for natten).
+for _m in ("conv", "natten"):
+    CONFIGS += [
+        (
+            f"{_m}_domain",
+            4,
+            ["--model", _m, "--domain_size", "4", "--batch_size", "1"],
+        ),
+        (
+            f"{_m}_ddp_x_domain",
+            4,
+            [
+                "--model",
+                _m,
+                "--ddp_size",
+                "2",
+                "--domain_size",
+                "2",
+                "--batch_size",
+                "2",
+            ],
+        ),
+        (
+            f"{_m}_fsdp_x_domain",
+            4,
+            [
+                "--model",
+                _m,
+                "--ddp_size",
+                "2",
+                "--domain_size",
+                "2",
+                "--batch_size",
+                "2",
+                "--fsdp",
+            ],
+        ),
+        (
+            f"{_m}_compile_domain",
+            4,
+            ["--model", _m, "--domain_size", "4", "--batch_size", "1", "--compile"],
+        ),
+    ]
+
+# 3D variants. NOTE natten needs a larger volume: at 128^3 with patch 8 the
+# patch grid is 16 per axis, so a 2-way shard leaves 8 >= kernel_size 7 rows
+# per rank (smaller volumes deadlock the halo exchange).
+CONFIGS += [
+    (
+        "conv_3d_domain",
+        2,
+        [
+            "--model",
+            "conv",
+            "--dimension",
+            "3",
+            "--domain_size",
+            "2",
+            "--batch_size",
+            "1",
+            "--image_size_start",
+            "64",
+            "--image_size_stop",
+            "64",
+        ],
+    ),
+    (
+        "natten_3d_domain",
+        2,
+        [
+            "--model",
+            "natten",
+            "--dimension",
+            "3",
+            "--domain_size",
+            "2",
+            "--batch_size",
+            "1",
+            "--image_size_start",
+            "128",
+            "--image_size_stop",
+            "128",
+        ],
+    ),
 ]
 
 
@@ -173,7 +282,10 @@ CONFIGS = [
     "nproc,extra_args", [(n, a) for _, n, a in CONFIGS], ids=[c[0] for c in CONFIGS]
 )
 def test_training_script(nproc, extra_args, tmp_path):
+    """Run one configuration from the distributed training smoke-test matrix."""
     require_gpus(nproc)
+    if "natten" in extra_args and importlib.util.find_spec("natten") is None:
+        pytest.skip("optional natten package not installed")
     result = run_example(nproc, extra_args, tmp_path)
     assert_success(result, tmp_path)
 
