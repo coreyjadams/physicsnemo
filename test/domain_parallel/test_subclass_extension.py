@@ -14,16 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Tests for the ShardTensor subclass extension points.
-
-A ShardTensor subclass that needs to (a) carry an extra always-present inner
-tensor and (b) attach a nested flatten context should be able to do so by
-declaring ``_extra_inner_tensors`` and implementing the two subclass hooks —
-*without* re-implementing ``__tensor_flatten__`` / ``__tensor_unflatten__`` /
-``__metadata_guard__``. These tests exercise a minimal in-tree subclass through
-flatten/unflatten round-trips and ``torch.compile`` to prove the base-class
-plumbing carries the extra inner tensor and nested context losslessly.
-"""
+r"""Tests that a ShardTensor subclass can carry an extra inner tensor and nested flatten context through round-trips and ``torch.compile``."""
 
 import pytest
 import torch
@@ -33,13 +24,10 @@ from test.domain_parallel.test_redistribute import shard_tensor_factory
 
 
 class _ExtInnerShardTensor(ShardTensor):
-    """Minimal subclass that adds one extra inner tensor (``_aux``) and a nested
-    flatten context (an opaque ``_payload``), using only the base extension
-    points — it does not override the flatten protocol."""
+    """Minimal subclass adding an extra inner tensor (``_aux``) and nested context (``_payload``)."""
 
     _extra_inner_tensors = ("_aux",)
 
-    # Backing store for the extra inner tensor + its per-instance sentinel cache.
     _aux_v = None
     _aux_c = None
     _payload = 0
@@ -49,8 +37,7 @@ class _ExtInnerShardTensor(ShardTensor):
         v = self._aux_v
         if v is not None:
             return v
-        # Unset: return the stable per-instance sentinel the base helper mints.
-        return self._stable_inner_sentinel("_aux_c")
+        return self._stable_inner_sentinel("_aux_c")  # unset: stable sentinel
 
     @_aux.setter
     def _aux(self, value) -> None:
@@ -81,9 +68,8 @@ def run_flatten_includes_extra_inner_and_nested_context(mesh):
 
     inner_names, ctx = st.__tensor_flatten__()
 
-    # The extra inner is declared and appended after ``_local_tensor``.
+    # Extra inner appended after ``_local_tensor``; context nested as (base, subclass).
     assert inner_names == ["_local_tensor", "_aux"]
-    # Context is nested: ``(base_ctx, subclass_ctx)``.
     (base_ctx, subclass_ctx) = ctx
     spec, requires_grad = base_ctx
     assert spec is st._spec
@@ -106,11 +92,10 @@ def run_unflatten_roundtrip_is_lossless(mesh):
     inner = {name: getattr(st, name) for name in inner_names}
     rebuilt = type(st).__tensor_unflatten__(inner, ctx, st.shape, st.stride())
 
-    # Reconstructed as the subclass (via ``cls`` — no __class__ reassignment).
+    # Reconstructed as the subclass with extra inner tensor and nested context intact.
     assert isinstance(rebuilt, _ExtInnerShardTensor)
     assert rebuilt.placements == st.placements
     assert rebuilt.shape == st.shape
-    # Extra inner tensor and nested context both round-trip.
     torch.testing.assert_close(rebuilt._aux, st._aux)
     assert rebuilt._payload == 13
     torch.testing.assert_close(rebuilt.full_tensor(), expected_full)
@@ -127,8 +112,7 @@ def run_metadata_guard_ignores_subclass_context(mesh):
     _names, ctx = st.__tensor_flatten__()
     (base_ctx, _subclass_ctx) = ctx
 
-    # Same (spec, requires_grad) but a differing subclass context must still
-    # guard as equal — the routing/opaque metadata is not part of the guard.
+    # Differing subclass context still guards as equal (opaque metadata is not guarded).
     same = (base_ctx, ("marker", 999))
     other = (base_ctx, ("different", -1))
     assert _ExtInnerShardTensor.__metadata_guard__(same, other) is True
@@ -160,8 +144,7 @@ def run_metadata_propagates_onto_op_results(mesh):
     )
     routed._route = "policyX"
 
-    # A base-typed autowrap result is re-classed to the subclass and the routing
-    # attr is copied from the input.
+    # Autowrap result is re-classed to the subclass with the routing attr copied over.
     out = routed * 2.0
     assert isinstance(out, _RoutedShardTensor)
     assert out._route == "policyX"
@@ -171,9 +154,7 @@ def run_metadata_propagates_onto_op_results(mesh):
     assert isinstance(out2, _RoutedShardTensor)
     assert out2._route == "policyX"
 
-    # A plain base ShardTensor (no declared propagated attrs) is untouched: its
-    # op results stay the base type. This guards the "no overhead / no behavior
-    # change for base" property.
+    # A plain base ShardTensor is untouched: op results stay the base type.
     base_out = st * 2.0
     assert type(base_out) is ShardTensor
 
@@ -189,8 +170,7 @@ def _sum_squares(x):
 
 
 def run_compile_with_propagated_attrs_does_not_error(mesh):
-    # A subclass declaring propagated attrs must still compile (propagation is
-    # skipped under compile; metadata would travel via the flatten context).
+    # A subclass declaring propagated attrs must still compile.
     st = shard_tensor_factory(mesh, uneven=True)
     routed = _RoutedShardTensor.__new__(
         _RoutedShardTensor,
@@ -214,10 +194,7 @@ def test_compile_with_propagated_attrs_does_not_error_1d(distributed_mesh):
 
 
 def run_compile_subclass_survives(mesh):
-    # A subclass carrying an extra inner tensor + nested context must survive
-    # Dynamo flatten/unflatten + AOTAutograd with zero graph breaks, forward and
-    # backward matching eager. This is the subclass analogue of the base
-    # compile-backward smoke test and exercises the extension points end to end.
+    # Subclass with extra inner + nested context must compile with no graph breaks (fwd+bwd match eager).
     x = _as_subclass(mesh).detach().requires_grad_(True)
 
     torch._dynamo.reset()

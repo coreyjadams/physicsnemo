@@ -14,14 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""``torch.compile`` tests for the halo scatter-correction primitive.
-
-The compiled ``halo_scatter_correct`` op is checked against an independent
-plain-``funcol`` reference (forward and backward), so a bug in the op cannot hide
-behind an equally-buggy reference. Runs under the standard ``multigpu_static``
-harness (``torchrun`` + ``distributed_mesh``); the correction needs at least two
-ranks to have any halo, so single-rank runs are skipped.
-"""
+r"""``torch.compile`` tests checking ``halo_scatter_correct`` (fwd+bwd) against an independent funcol reference."""
 
 import os
 
@@ -39,9 +32,7 @@ from physicsnemo.domain_parallel.shard_utils.halo_scatter import (
 
 
 def _ring_routing(rank: int, world_size: int, n_owned: int, lend: int):
-    r"""Directed-ring halo: each rank lends its first ``lend`` owned rows to the
-    next rank and borrows ``lend`` ghost rows from the previous rank. Non-degenerate
-    for any ``world_size >= 2``."""
+    r"""Directed-ring halo: each rank lends its first ``lend`` rows to the next rank."""
     send_indices = [[] for _ in range(world_size)]
     send_indices[(rank + 1) % world_size] = list(range(lend))
     send_sizes = [[0] * world_size for _ in range(world_size)]
@@ -73,9 +64,7 @@ def run_halo_scatter_correct(mesh, backend, n_owned=6, lend=2, feat=4):
     def fn(p, r):
         return halo_scatter_correct(p, r, group=mesh)
 
-    # Independent ground truth: forward(reverse(.)) via plain funcol (no custom_op).
-    # The map M = forward.reverse is self-adjoint, so the gradient of sum(M @ p) is
-    # M @ ones (== the op applied to a ones tensor).
+    # Independent oracle: self-adjoint forward(reverse(.)), so grad == op(ones).
     def _plain_correct(p):
         return halo_forward_exchange(
             halo_reverse_exchange(
@@ -92,8 +81,7 @@ def run_halo_scatter_correct(mesh, backend, n_owned=6, lend=2, feat=4):
     ref_grad = _plain_correct(torch.ones_like(padded0))
     assert not torch.allclose(ref_fwd, padded0), "halo correction is a no-op here"
 
-    # Closed-form check independent of the exchange kernels: correct(ones) on owned
-    # row i == 1 (itself) + the number of ranks that borrowed it.
+    # Closed-form check: correct(ones) on owned row i == 1 + number of borrowers.
     lent_count = torch.zeros(n_owned, dtype=torch.float64, device=device)
     for j in range(world_size):
         for i in send_indices[j]:
@@ -103,14 +91,14 @@ def run_halo_scatter_correct(mesh, backend, n_owned=6, lend=2, feat=4):
         ref_grad[:n_owned], expected_owned, rtol=1e-12, atol=1e-12
     )
 
-    # Eager custom_op matches the independent reference (forward and backward).
+    # Eager.
     pe = padded0.clone().requires_grad_(True)
     out_e = fn(pe, routing)
     (grad_e,) = torch.autograd.grad(out_e.sum(), pe)
     torch.testing.assert_close(out_e, ref_fwd, rtol=1e-12, atol=1e-12)
     torch.testing.assert_close(grad_e, ref_grad, rtol=1e-12, atol=1e-12)
 
-    # Compiled (fullgraph) matches the same reference.
+    # Compiled.
     torch._dynamo.reset()
     pc = padded0.clone().requires_grad_(True)
     cf = torch.compile(fn, backend=backend, fullgraph=True)
@@ -130,11 +118,7 @@ def test_halo_scatter_correct_1d(distributed_mesh, backend):
 
 
 def _make_halo_shard_tensor(padded, mesh, routing):
-    r"""A ShardTensor whose local is a ``[owned | ghost]`` halo, carrying the packed
-    routing as an extra inner tensor. Uses a local-honest ``Replicate`` spec
-    (global == local): the overlapping halo locals do not tile a mesh global, so an
-    honest ``Shard(0)`` would make AOT insert cross-rank redistributes for the local
-    scatter. Cross-rank movement lives in the halo op instead."""
+    r"""A halo ShardTensor (local-honest ``Replicate``) carrying packed routing as an extra inner tensor."""
     from torch.distributed.tensor._dtensor_spec import TensorMeta
     from torch.distributed.tensor.placement_types import Replicate
 
@@ -201,7 +185,7 @@ def run_halo_shard_tensor_scatter_add(mesh, backend, n_owned=6, lend=2, feat=4):
     torch.manual_seed(100 + rank)
     src0 = torch.randn(n_padded, feat, dtype=torch.float64, device=device)
 
-    # Reference: identity scatter (agg is zeros) then the plain halo correction.
+    # Reference: identity scatter into zeros, then the plain correction.
     def _plain_correct(p):
         return halo_forward_exchange(
             halo_reverse_exchange(
@@ -221,8 +205,7 @@ def run_halo_shard_tensor_scatter_add(mesh, backend, n_owned=6, lend=2, feat=4):
     def fn(agg, index, source):
         return agg.scatter_add(0, index, source)
 
-    # Eager: the scatter_add function handler applies the halo correction, with the
-    # gradient threaded through the wrapper (``to_local``) back to the plain source.
+    # Eager: the scatter_add handler applies the correction.
     src_e = src0.clone().requires_grad_(True)
     agg_e = _make_halo_shard_tensor(
         torch.zeros(n_padded, feat, dtype=torch.float64, device=device), mesh, routing
@@ -232,8 +215,7 @@ def run_halo_shard_tensor_scatter_add(mesh, backend, n_owned=6, lend=2, feat=4):
     torch.testing.assert_close(out_e._local_tensor, ref_fwd, rtol=1e-9, atol=1e-9)
     torch.testing.assert_close(grad_e, ref_grad, rtol=1e-9, atol=1e-9)
 
-    # Compiled: the correction survives as a differentiable graph node; the gradient
-    # for the plain source comes back plain (not re-wrapped as a ShardTensor).
+    # Compiled: correction survives as a differentiable node; source gradient comes back plain.
     torch._dynamo.reset()
     src_c = src0.clone().requires_grad_(True)
     agg_c = _make_halo_shard_tensor(
@@ -264,9 +246,7 @@ def _force_halo_backend(name):
 
 
 def _symm_mem_capable(mesh):
-    r"""True when the symmetric-memory backend can serve this mesh (CUDA, >=2 ranks,
-    and a workspace rendezvous succeeds). Collective: every rank runs it, so all
-    return the same verdict on homogeneous hardware."""
+    r"""True when the symm-mem backend can serve this mesh (CUDA, >=2 ranks, rendezvous OK). Collective."""
     if not torch.cuda.is_available() or mesh.size() < 2:
         return False
     try:
@@ -280,8 +260,7 @@ def _symm_mem_capable(mesh):
 
 
 def run_symm_mem_equivalence(mesh, backend, n_owned=6, lend=2, feat=4):
-    r"""The symm-mem transport must match the funcol oracle bitwise (fwd+bwd), eager
-    and compiled -- pins the self-adjoint / linear-map equivalence across backends."""
+    r"""The symm-mem transport must match the funcol oracle (fwd+bwd), eager and compiled."""
     device = DistributedManager().device
     group = mesh.get_group()
     rank = dist.get_rank(group)
@@ -299,14 +278,13 @@ def run_symm_mem_equivalence(mesh, backend, n_owned=6, lend=2, feat=4):
     def fn(p, r):
         return halo_scatter_correct(p, r, group=mesh)
 
-    # funcol oracle (eager fwd+bwd).
+    # funcol oracle.
     _force_halo_backend("funcol")
     pf = padded0.clone().requires_grad_(True)
     ref_fwd = fn(pf, routing)
     (ref_grad,) = torch.autograd.grad(ref_fwd.sum(), pf)
 
-    # symm-mem, eager: identical float64 arithmetic, only the transport differs, so equality is
-    # exact. Repeat many times to surface any nondeterministic ordering race in the fences.
+    # symm-mem, eager: exact equality; repeated to surface any fence race.
     _force_halo_backend("symm_mem")
     try:
         for _ in range(50):
@@ -318,12 +296,12 @@ def run_symm_mem_equivalence(mesh, backend, n_owned=6, lend=2, feat=4):
     finally:
         _force_halo_backend(None)
 
-    # Auto-selection (no env override) also picks symm-mem here.
+    # Auto-selection also picks symm-mem here.
     from physicsnemo.domain_parallel.shard_utils.halo_scatter import select_halo_backend
 
     assert select_halo_backend(mesh).name == "symm_mem"
 
-    # symm-mem, compiled: the op body reads the backend env at runtime, so it survives tracing.
+    # symm-mem, compiled.
     _force_halo_backend("symm_mem")
     try:
         torch._dynamo.reset()

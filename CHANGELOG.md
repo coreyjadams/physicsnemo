@@ -23,67 +23,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a boundary, so that external-flow "box minus obstacle" domains work
   directly), for any implicit function (signed-distance functions, level
   sets, or neural fields).
-- Adds compile-safe subclassing extension points to `domain_parallel.ShardTensor`:
-  a `_extra_inner_tensors` declaration (extra always-present inner tensors carried
-  through Dynamo flatten/unflatten + AOTAutograd), `__subclass_flatten_context__` /
-  `__subclass_unflatten__` hooks for a nested flatten context, a
-  `_stable_inner_sentinel` helper, and a DTensor-style `__metadata_guard__` that
-  guards only on `(spec, requires_grad)`. A subclass can now carry extra inner
-  tensors and opaque per-instance metadata through `torch.compile` without
-  re-implementing the flatten protocol. Defaults leave base behavior unchanged.
-- Adds `ShardTensor._subclass_propagated_attrs`: a subclass may declare
-  instance-attribute names that base `__torch_function__` copies from an op's
-  input onto its (eager) op-result outputs, re-classing a base-typed autowrap
-  result back to the subclass. Lets a subclass route per-field metadata across
-  ops without overriding `__torch_function__`. Skipped under `torch.compile`;
-  empty by default (no overhead, base behavior unchanged).
-- Adds `domain_parallel.shard_tensor.install_aot_plain_tangent_coercion` (run on
-  import): patches AOTAutograd's `process_runtime_tangent` so a compiled
-  ShardTensor output whose backward cotangent is materialized as a *plain*
-  tensor across a Dynamo graph break is rebuilt into a ShardTensor from the
-  traced `SubclassCreationMeta` (lossless for a `Replicate` boundary) instead of
-  raising "guessed its metadata incorrectly". Scoped to ShardTensor and degrades
-  gracefully; a general AOTAutograd gap pending an upstream PyTorch hook.
-  `ShardTensor.__coerce_same_metadata_as_tangent__` now also coerces *down* to a
-  plain `torch.Tensor` for a replicated boundary.
+- Adds compile-safe subclassing extension points to `domain_parallel.ShardTensor`
+  (`_extra_inner_tensors`, `__subclass_flatten_context__` / `__subclass_unflatten__`,
+  `_stable_inner_sentinel`, and a DTensor-style `__metadata_guard__`), so a subclass can
+  carry extra inner tensors and opaque metadata through `torch.compile` without
+  re-implementing the flatten protocol. Base behavior unchanged.
+- Adds `ShardTensor._subclass_propagated_attrs`: attribute names base `__torch_function__`
+  copies from an op input onto its eager op-result, re-classing it to the subclass. Skipped
+  under compile; empty by default.
+- Adds `install_aot_plain_tangent_coercion` (run on import): rebuilds a plain backward
+  cotangent into a `ShardTensor` when a boundary crosses a Dynamo graph break, instead of
+  AOTAutograd raising "guessed its metadata incorrectly". `__coerce_same_metadata_as_tangent__`
+  now also coerces down to a plain tensor at a replicated boundary.
 - Adds `domain_parallel.shard_utils.halo_scatter`: a `torch.compile`-safe halo
-  scatter-correction primitive for `Shard(0)` ShardTensors with a borrowed-ghost
-  overlay. `halo_reverse_exchange` / `halo_forward_exchange` express the
-  fold-to-owner / refresh-ghost halves as functional collectives (AOT-traceable),
-  and `halo_scatter_correct` fuses them into a `torch.library.custom_op` that is
-  opaque to fake mode (self-adjoint registered backward) so the correction survives
-  both `aot_eager` and inductor, forward and backward. Routing is passed as a packed
-  graph-input tensor (via `pack_halo_routing`), so it survives Dynamo graph breaks
-  and per-step value changes without recompiling, and the primitive carries no
-  partitioner/spatial assumptions. `register_halo_scatter_handlers` wires the
-  correction onto `ShardTensor.scatter_add` / `index_add` via a `__torch_function__`
-  handler (invoked for both eager and compile) that scatters on the plain local,
-  emits `halo_scatter_correct`, and re-wraps through an `autograd.Function`; running
-  above `__torch_dispatch__` is what keeps the correction's backward in the compiled
-  graph, and the halo ShardTensor's local-honest (`Replicate`, global == local) spec
-  keeps that backward free of spurious cross-rank redistributes. The row
-  all-to-all-v transport is a pluggable backend (`select_halo_backend`,
-  `PHYSICSNEMO_HALO_BACKEND` override): a portable functional-collective path (the
-  always-available fallback and correctness oracle) and an intra-node symmetric-memory
-  (CUDA-IPC) one-sided path that stages into a symmetric workspace and pulls each
-  neighbour block with `get_buffer`, fencing peer-to-peer with `put_signal` /
-  `wait_signal` (O(neighbours) coordination, not a group-wide barrier). The symm-mem
-  path is auto-selected for a single-node group whose one-time (cached, per-group)
-  CUDA-IPC workspace rendezvous succeeds, and is forceable/disableable by env. All
-  entry points accept a neighbour sub-`group` (threaded through the op as its c10d
-  group name) to shrink the coordination span from `O(world)` to `O(neighbours)`.
-- Extends `domain_parallel.shard_utils.halo_scatter` with `pack_halo_routing(cap=)`
-  fixed-shape routing (for compiled `dynamic=False` runs), an in-place `scatter_add_` /
-  `index_add_` dispatch handler (correct value and gradient, eager and compiled), and
-  node-locality routing in `select_halo_backend` (a symmetric-allocation-free hostname
-  check) so a multi-node group falls back to `funcol` while a single-node group uses the
-  intra-node symmetric-memory backend.
-- Adds a `ShardTensor.grad_dtype` property override (returns the local tensor's
-  dtype). Newer PyTorch reads `grad_dtype` during Dynamo fake-tensor conversion;
-  without the override it re-enters `__torch_function__` and falls back to a
-  non-leaf DTensor whose C-level `grad_dtype` getter raises "grad_dtype can only be
-  accessed on leaf tensors", breaking compile. Mirrors the existing `grad_fn` /
-  `is_leaf` / `grad` shields.
+  scatter-correction primitive for `Shard(0)` ShardTensors with a borrowed-ghost overlay.
+  `halo_scatter_correct` fuses the fold-to-owner / refresh-ghost exchanges into a self-adjoint
+  `custom_op` (correct forward and backward under `aot_eager` and inductor), with routing
+  passed as a packed graph-input tensor so it survives graph breaks;
+  `register_halo_scatter_handlers` wires it onto `scatter_add` / `index_add`. The row
+  transport is a pluggable backend (`select_halo_backend`, `PHYSICSNEMO_HALO_BACKEND`):
+  a portable `funcol` path and an intra-node symmetric-memory (CUDA-IPC) path.
+- Extends `halo_scatter` with `pack_halo_routing(cap=)` fixed-shape routing (for compiled
+  `dynamic=False` runs), an in-place `scatter_add_` / `index_add_` dispatch handler, and
+  node-locality routing in `select_halo_backend` (single-node uses symm-mem, multi-node falls
+  back to `funcol`).
+- Adds a `ShardTensor.grad_dtype` property override (returns the local tensor's dtype)
+  so a newer-PyTorch `grad_dtype` read during Dynamo fake conversion doesn't fall back
+  to a non-leaf DTensor and break compile. Mirrors the `grad_fn` / `is_leaf` / `grad`
+  shields.
 - Adds `integrate_moment` and `Mesh.integrate_moment` for measure-weighted
   outer-product moments. Mesh integration APIs now accept `nan_policy`.
 - Adds per-cell measure weights that are preserved through cell subsampling

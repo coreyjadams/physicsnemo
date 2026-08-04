@@ -208,11 +208,9 @@ def test_coerce_expected_subclass_rebuilds_1d(distributed_mesh):
 
 
 def run_unflatten_does_not_force_inner_requires_grad(mesh):
-    # ``__tensor_unflatten__`` must NOT force ``requires_grad`` on the inner. For
-    # the normal detached-local op-result case the wrapper carries requires_grad
-    # (from a grad_fn) while the inner does not; forcing the inner makes them
-    # disagree and trips ``assert_metadata_eq`` under Dynamo re-fake across a
-    # graph break. Match DTensor: the inner keeps its own flag unchanged.
+    # ``__tensor_unflatten__`` must not force ``requires_grad`` on the inner: the wrapper
+    # carries it (via grad_fn) while a detached op-result local does not, and forcing them to
+    # agree trips ``assert_metadata_eq`` on a graph-break re-fake. Matches DTensor.
     st = shard_tensor_factory(mesh, uneven=False)
     local = st._local_tensor.detach()
     assert local.requires_grad is False
@@ -242,9 +240,8 @@ def _sum_squares(x):
 
 
 def run_compile_backward_uneven_shard(mesh):
-    # Smoke test: compile + backward over an uneven ShardTensor must not raise
-    # AOTAutograd's "guessed metadata incorrectly" tangent error. Gradient values
-    # are validated by the direct __coerce_same_metadata_as_tangent__ tests.
+    # Smoke: compile + backward over an uneven ShardTensor must not raise AOT's
+    # "guessed metadata incorrectly"; gradient values are checked in the coerce tests.
     x = shard_tensor_factory(mesh, uneven=True).detach().requires_grad_(True)
 
     torch._dynamo.reset()
@@ -406,16 +403,9 @@ def test_coerce_replicate_to_partial_relabels_1d(distributed_mesh):
     run_coerce_replicate_to_partial_relabels(distributed_mesh)
 
 
-# ---------------------------------------------------------------------------
-# to_local() differentiability under torch.compile.
-#
-# ShardTensor overrides ``__torch_function__``; its eager fallback converts to
-# DTensor via ``autograd.Function``\s that AOTAutograd traces *through*, severing
-# the primal gradient and silently dropping the compiled backward. The
-# ``__torch_function__`` compile-passthrough (routing unpatched ops to
-# ``__torch_dispatch__`` like DTensor) restores it. These tests would produce a
-# zero / missing gradient before that fix.
-# ---------------------------------------------------------------------------
+# to_local() differentiability under torch.compile: ShardTensor's eager fallback converts to
+# DTensor via autograd.Functions that AOT traces through, dropping the compiled backward; the
+# __torch_function__ compile-passthrough restores it. These tests catch a zero/missing gradient.
 def _to_local_sq_sum(x):
     return (x.to_local() ** 2).sum()
 
@@ -429,13 +419,7 @@ def _op_result_to_local(x):
     return ((x * 2.0 + x).to_local() ** 2).sum()
 
 
-# Plain-``torch`` references (no ShardTensor) for the same computations, applied
-# directly to a rank's local tensor. These give an INDEPENDENT ground truth for
-# the gradient: because ``to_local()`` returns the local shard and the ops are
-# elementwise, the sharded gradient w.r.t. the local input must equal the plain
-# autograd gradient of the same expression on that local tensor. (Comparing only
-# against ShardTensor's own eager path would validate compiled==eager but not
-# that either is correct.)
+# Plain-torch references on the local tensor: an independent gradient oracle.
 def _ref_sq_sum(local):
     return (local**2).sum()
 

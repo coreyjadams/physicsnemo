@@ -641,15 +641,10 @@ class _FromTorchTensor(torch.autograd.Function):
 
 
 def _is_tracing(args: object, kwargs: object = None) -> bool:
-    r"""Return True when any tensor in ``args``/``kwargs`` is a fake tensor, i.e.
-    we are inside a ``torch.compile`` / AOTAutograd trace.
-
-    ``torch.compiler.is_compiling()`` is unreliable here: ``__torch_function__``
-    runs eagerly on the fake operands during tracing (not in an inlined Dynamo
-    frame), so it reads ``False``. Detecting a ``FakeTensor`` operand is the
-    robust signal, and it correctly stays ``False`` for the real-tensor eager
-    path (including construction happening outside the compiled region).
-    """
+    r"""True when any tensor in ``args``/``kwargs`` is fake, i.e. inside a ``torch.compile``
+    trace. ``torch.compiler.is_compiling()`` is unreliable here -- ``__torch_function__``
+    runs eagerly on fake operands and reads ``False`` -- so detect a ``FakeTensor`` operand
+    instead (correctly ``False`` on the real-tensor eager path)."""
     for leaf in torch.utils._pytree.tree_leaves((args, kwargs)):
         if isinstance(leaf, torch.Tensor) and is_fake(leaf):
             return True
@@ -751,34 +746,13 @@ class ShardTensor(torch.Tensor):
     # alongside a ShardTensor in an intercepted op (see TensorPromotionMode).
     _promotion_mode: TensorPromotionMode = TensorPromotionMode.SILENT
 
-    # -- Subclass extension points (compile-safe subclassing) -----------------
-    # A ShardTensor subclass may need to carry extra, always-present inner
-    # tensors (beyond ``_local_tensor``) through Dynamo flatten/unflatten +
-    # AOTAutograd -- e.g. per-step routing metadata that must appear as a graph
-    # input rather than a baked trace-time constant. Keeping the inner-tensor
-    # count uniform across the forward trace and every backward tangent is what
-    # avoids AOT's ``len(meta.attrs) == len(runtime_subclass_keys)`` assert.
-    #
-    # Declaring the attribute names here lets the base ``__tensor_flatten__`` /
-    # ``__tensor_unflatten__`` include them automatically, so a subclass does not
-    # re-implement the flatten protocol. Each name must resolve (via attribute or
-    # property) to a tensor on every instance; use ``_stable_inner_sentinel`` for
-    # a per-instance placeholder when the slot is logically unset. Empty by
-    # default -- base ShardTensor behavior is unchanged.
+    # -- Subclass extension points (compile-safe subclassing) --
+    # Extra inner-tensor attribute names a subclass carries through flatten/unflatten so
+    # per-instance metadata rides as a graph input; the base flatten protocol handles them.
     _extra_inner_tensors: tuple[str, ...] = ()
 
-    # Instance-attribute names a subclass wants copied from an op's input onto
-    # its (eager) op-result outputs -- per-field routing metadata that must ride
-    # along results. When non-empty, base ``__torch_function__`` copies these and
-    # re-classes a base-typed autowrap result back to the subclass type. The
-    # subclass MUST NOT declare ``__slots__`` (the ``__class__`` reassignment
-    # needs an identical instance layout -- a ``__dict__``-bearing subclass
-    # qualifies, a ``__slots__`` one does not). The FIRST name doubles as the
-    # "already-propagated" sentinel: a result whose first attr is ``None`` (its
-    # class default) receives a fresh copy. Propagation is skipped under
-    # ``torch.compile`` (there the metadata rides via the flatten context /
-    # ``_extra_inner_tensors`` instead). Empty by default -- no overhead, base
-    # behavior unchanged.
+    # Attribute names copied from an op input onto its eager op-result, re-classing it to
+    # the subclass (needs a __dict__-bearing subclass); skipped under compile.
     _subclass_propagated_attrs: tuple[str, ...] = ()
 
     @classmethod
@@ -918,43 +892,22 @@ class ShardTensor(torch.Tensor):
         """Return the placement strategy for each mesh dimension."""
         return self._spec.placements
 
-    # -- Subclass extension hooks ---------------------------------------------
-    # These let a subclass carry extra flatten context (nested alongside the
-    # base ``(spec, requires_grad)``) without re-implementing the flatten
-    # protocol. Both default to no-ops, so base ShardTensor is unchanged.
+    # -- Subclass extension hooks --
+    # Carry extra flatten context without re-implementing the protocol; both default to no-ops.
 
     def __subclass_flatten_context__(self) -> object | None:
-        r"""Hook: extra per-instance metadata a subclass wants carried through
-        Dynamo flatten/unflatten.
-
-        The returned value (if not ``None``) is nested by
-        :meth:`__tensor_flatten__` as ``(base_ctx, subclass_ctx)`` and handed
-        back to :meth:`__subclass_unflatten__` on reconstruction. It must be a
-        graph-constant for a given compiled region (routing tensors/objects with
-        no value-equality belong here, not shape/placement info -- see
-        :meth:`__metadata_guard__`). Default ``None``: the base emits its flat
-        ``(spec, requires_grad)`` context.
-        """
+        r"""Hook: extra per-instance metadata to carry through Dynamo flatten, nested as
+        ``(base_ctx, subclass_ctx)``. Must be a graph-constant; default ``None``."""
         return None
 
     def __subclass_unflatten__(self, subclass_ctx: object) -> None:
-        r"""Hook: reattach the metadata produced by
-        :meth:`__subclass_flatten_context__` onto a freshly reconstructed
-        instance. Default no-op.
-        """
+        r"""Hook: reattach :meth:`__subclass_flatten_context__` metadata on reconstruction."""
         return None
 
     def _stable_inner_sentinel(self, cache_attr: str) -> torch.Tensor:
-        r"""Return a per-instance-cached zero-length ``int64`` sentinel tensor for
-        an extra inner slot that is logically unset.
-
-        AOTAutograd flattens an input subclass several times and asserts the
-        inner tensors are the *same object* across calls, so the sentinel is
-        cached on ``cache_attr`` (which the subclass must be able to store). It
-        is minted in ``_local_tensor``'s device / fake context so it participates
-        in tracing correctly (a shared real sentinel would mix fake and real
-        inner tensors under ``FakeTensorMode``).
-        """
+        r"""Per-instance-cached empty int64 tensor for an unset inner slot. Cached because
+        AOTAutograd re-flattens an input and needs the same object each time; minted in
+        ``_local_tensor``'s device/fake context so it traces correctly."""
         cached = getattr(self, cache_attr, None)
         if cached is None:
             cached = torch.zeros(0, dtype=torch.int64, device=self._local_tensor.device)
@@ -963,18 +916,9 @@ class ShardTensor(torch.Tensor):
 
     @classmethod
     def __metadata_guard__(cls, orig: object, other: object) -> bool:
-        r"""Dynamo tensor-subclass metadata guard.
-
-        ``orig`` / ``other`` are the contexts :meth:`__tensor_flatten__` emits --
-        either the base flat ``(spec, requires_grad)`` or a subclass's nested
-        ``((spec, requires_grad), subclass_ctx)``. Guard only on
-        ``(spec, requires_grad)``: any subclass context is deliberately ignored,
-        because it may hold tensors/objects without value-equality (the default
-        ``==``-against-deepcopy guard would then always fail and block compile),
-        and genuine shape/placement changes are already caught by
-        ``ShardTensorSpec`` equality plus Dynamo's own size guards. Mirrors
-        DTensor's ``__metadata_guard__``.
-        """
+        r"""Dynamo subclass metadata guard: compare only ``(spec, requires_grad)`` and
+        ignore any nested subclass context, which may hold non-value-equal objects that
+        would otherwise always fail the guard and block compile. Mirrors DTensor."""
         try:
             orig_base = orig[0] if isinstance(orig[0], tuple) else orig
             other_base = other[0] if isinstance(other[0], tuple) else other
@@ -986,10 +930,8 @@ class ShardTensor(torch.Tensor):
 
     @classmethod
     def _find_metadata_source(cls, args, kwargs) -> "ShardTensor | None":
-        r"""Return the input instance whose subclass metadata should ride onto op
-        outputs: the first ``cls``-typed argument already carrying routing (its
-        sentinel attr is set), else the first ``cls``-typed argument. Walks
-        (shallow) tuples / lists in the positional and keyword arguments."""
+        r"""Input instance whose subclass metadata rides onto op outputs: the first
+        ``cls``-typed arg already carrying routing, else the first ``cls``-typed arg."""
         sentinel = cls._subclass_propagated_attrs[0]
         fallback = None
 
@@ -1014,10 +956,8 @@ class ShardTensor(torch.Tensor):
 
     @classmethod
     def _propagate_subclass_metadata(cls, result: object, source: "ShardTensor"):
-        r"""Copy ``cls._subclass_propagated_attrs`` from ``source`` onto any
-        ShardTensor in ``result`` that doesn't already carry them, re-classing a
-        base-typed autowrap result back to ``cls`` first. Walks tuples / lists.
-        No-op when the subclass declares no propagated attrs."""
+        r"""Copy ``_subclass_propagated_attrs`` from ``source`` onto any ShardTensor in
+        ``result`` lacking them, re-classing a base autowrap result to ``cls`` first."""
         attrs = cls._subclass_propagated_attrs
         if not attrs:
             return result
@@ -1027,9 +967,7 @@ class ShardTensor(torch.Tensor):
             if not isinstance(t, ShardTensor):
                 return
             if type(t) is not cls:
-                # Re-class a base autowrap result up to the subclass. Requires an
-                # identical instance layout (see ``_subclass_propagated_attrs``);
-                # a layout mismatch or unrelated type is skipped, not forced.
+                # Re-class a base autowrap result up to the subclass; skip on mismatch.
                 if not issubclass(cls, type(t)):
                     return
                 try:
@@ -1073,26 +1011,11 @@ class ShardTensor(torch.Tensor):
             dtype=spec.tensor_meta.dtype,
         )
 
-        # Normalize ``_sharding_shapes`` to plain ``tuple[int, ...]`` entries
-        # (never ``torch.Size``). Under dynamo fakeification, ``torch.Size``
-        # special-casing converts the contained ints into unbacked SymInts
-        # that orphan whenever an op's output drops shard tracking
-        # (Partial / Replicate / None), producing
-        # ``PendingUnbackedSymbolNotFound`` during AOT tracing.
-        #
-        # If the incoming spec has no ``_sharding_shapes``, derive them from
-        # chunk semantics against the outer global shape -- pure arithmetic,
-        # no collectives. This avoids leaving the field ``None``, which would
-        # force the next ``sharding_shapes()`` call to ``_all_gather_shard_shapes``
-        # (a blocking collective that is not AOT-traceable).
-        #
-        # Recompute likewise when the incoming shapes contain SymInts: under
-        # dynamic-shape tracing the captured spec's shard shapes were
-        # chunk-computed from a *symbolic* outer_size, and copying SymInts
-        # into a runtime spec makes it unhashable (DTensor's sharding-prop
-        # cache calls ``hash(spec)``). Re-chunking against the given
-        # outer_size is faithful -- those entries were chunk-derived to begin
-        # with -- and is concrete at runtime, symbolic during tracing.
+        # Reconstruct ``_sharding_shapes`` as plain int tuples. Reuse the incoming shapes
+        # only when fully concrete; otherwise re-derive from chunk semantics against
+        # ``outer_size`` (pure arithmetic, no collectives). This avoids ``None`` (which
+        # forces a blocking, non-traceable shape all-gather) and avoids ``torch.Size`` /
+        # SymInt entries, which break AOT tracing and make the spec unhashable.
         def _all_concrete(shapes_by_mesh_dim):
             return all(
                 type(dim) is int
@@ -1122,22 +1045,11 @@ class ShardTensor(torch.Tensor):
             _local_shape=local_tensor.shape,
             _sharding_shapes=sharding_shapes,
         )
-        # Do NOT force ``local_tensor.requires_grad_(requires_grad)`` on the
-        # reconstructed inner. The wrapper's ``requires_grad`` is set below via
-        # ``__new__`` -> ``_make_wrapper_subclass(requires_grad=...)``. Forcing
-        # the inner makes the reconstructed local's ``requires_grad`` disagree
-        # with the real tensor's for the (normal) detached-local op-result case
-        # (``wrapper.requires_grad=True`` from a ``grad_fn`` but
-        # ``_local_tensor.requires_grad=False``): under Dynamo re-faking across a
-        # graph break, ``assert_metadata_eq`` then trips on the inner
-        # (``False != True``). Stock DTensor never forces the inner -- it keeps
-        # the local's own flag and sets ``requires_grad`` on the wrapper only --
-        # which is why DTensor survives the identical op-result /
-        # ``to_local``-after-graph-break path that a tensor-subclass forward
-        # hits. Match DTensor: pass ``local_tensor`` through unchanged.
-        #
-        # Build the concrete (possibly subclass) type via ``cls`` so a subclass
-        # is reconstructed as itself -- no ``__class__`` reassignment needed.
+        # Pass ``local_tensor`` through unchanged: do NOT force its ``requires_grad`` to the
+        # wrapper's (set via ``__new__`` below). Forcing it makes the inner disagree with the
+        # real tensor for a detached op-result local, tripping ``assert_metadata_eq`` when
+        # Dynamo re-fakes across a graph break. Matches DTensor (wrapper flag only).
+        # ``cls`` reconstructs a subclass as itself -- no ``__class__`` reassignment.
         out = cls.__new__(
             cls,
             local_tensor=local_tensor,
@@ -1202,27 +1114,14 @@ class ShardTensor(torch.Tensor):
         flatten_spec: tuple,
         expected_type: type | None = None,
     ) -> "ShardTensor | None":
-        """Runtime hook: redistribute ``self`` to match the recorded tangent's
-        placements and ``_sharding_shapes`` (preserves uneven layouts).
+        """Runtime hook: redistribute ``self`` to match the recorded tangent's placements
+        and ``_sharding_shapes`` (preserving uneven layouts).
 
-        Unlike stock DTensor -- which returns ``None`` whenever ``expected_type``
-        differs (refuse cross-type) -- this hook is subclass-friendly. A
-        ``ShardTensor`` subclass may produce forward *outputs* of the subclass
-        type while many backward *tangents* are constructed as this *base* type
-        (e.g. ``_ToTorchTensor.backward``). AOTAutograd records
-        ``expected_type=<subclass>`` from the output, then asks the base-typed
-        tangent to coerce *up* to it; returning ``None`` there makes *every*
-        op's backward raise "guessed its metadata incorrectly". Instead we:
-        (1) accept a subclass's nested ``(base_ctx, subclass_ctx)`` flatten
-        context as well as the base's flat ``(spec, requires_grad)``;
-        (2) treat ``{}`` and ``None`` ``_sharding_shapes`` as equal (an
-        op-result re-wrap carries ``{}``, a fresh spec carries ``None`` -- both
-        mean "no explicit per-rank shapes"); (3) reconcile placements / sharding
-        as before; and (4) when a differing ``expected_type`` that is itself a
-        ``ShardTensor`` subclass is requested, rebuild via *that* type's own
-        ``__tensor_unflatten__`` (which reclasses and reattaches its metadata)
-        rather than returning ``None``. For a genuinely foreign ``expected_type``
-        (a plain tensor / ``DTensor``) the DTensor ``None`` convention is kept.
+        Subclass-friendly: a subclass whose forward output is the subclass type but whose
+        tangent arrives as the base type would make DTensor return ``None`` and AOT raise
+        "guessed its metadata incorrectly". Instead, accept the nested flatten context,
+        treat ``{}`` / ``None`` sharding shapes as equal, and rebuild through a requested
+        ``ShardTensor``-subclass ``expected_type`` (a foreign one keeps DTensor's ``None``).
         """
         # Accept the subclass's nested ``(base_ctx, subclass_ctx)`` context or
         # the base's flat ``(spec, requires_grad)`` context.
@@ -1307,14 +1206,9 @@ class ShardTensor(torch.Tensor):
             )
 
         if expected_type is not None and expected_type is not type(coerced):
-            # Cross-type: if the expected type is a ``ShardTensor`` subclass,
-            # rebuild via ITS own unflatten (handles ``__class__`` reclass +
-            # reattaching subclass metadata from the nested subclass context).
-            # This is what lets a subclass whose forward outputs are the subclass
-            # type accept a base-typed backward tangent without AOTAutograd
-            # raising "guessed its metadata incorrectly". For a genuinely foreign
-            # type (e.g. a plain ``torch.Tensor`` or ``DTensor``) we cannot do
-            # that -- preserve the DTensor convention and decline the coercion.
+            # Cross-type: rebuild via the expected ``ShardTensor`` subclass's own unflatten
+            # (reclass + reattach metadata) so it can accept a base-typed tangent without AOT
+            # raising "guessed its metadata incorrectly"; a foreign type keeps DTensor's ``None``.
             if isinstance(expected_type, type) and issubclass(
                 expected_type, ShardTensor
             ):
@@ -1324,13 +1218,8 @@ class ShardTensor(torch.Tensor):
                     tuple(coerced.shape),
                     coerced.stride(),
                 )
-            # Coerce DOWN to a plain ``torch.Tensor`` when the boundary is fully
-            # replicated (local == global, so returning the local view is
-            # lossless). This is the mirror of the up/across cases: AOTAutograd
-            # may ask a ShardTensor output to produce a plain-tensor tangent, and
-            # returning ``None`` there would raise "guessed its metadata
-            # incorrectly". For any other (non-replicated, or non-plain) foreign
-            # type the DTensor ``None`` convention holds.
+            # Coerce down to a plain tensor at a fully-replicated boundary (local == global, so
+            # the local view is lossless); the mirror of the subclass rebuild above.
             if expected_type is torch.Tensor and all(
                 isinstance(p, Replicate) for p in coerced._spec.placements
             ):
@@ -1421,17 +1310,11 @@ class ShardTensor(torch.Tensor):
 
     @property  # type: ignore[override]
     def grad_dtype(self):  # type: ignore[override]
-        """dtype this tensor's gradient takes (newer PyTorch).
+        """dtype of this tensor's gradient (newer PyTorch): the local tensor's dtype.
 
-        Returns the local tensor's dtype -- the default, and the only case
-        ShardTensor supports. Overriding shields the read from
-        ``__torch_function__``: the C-level ``grad_dtype`` getset descriptor
-        otherwise re-enters it and falls back via
-        :func:`_torch_function_fallback_via_dtensor`, which builds a *non-leaf*
-        DTensor whose ``grad_dtype`` getter raises "grad_dtype can only be
-        accessed on leaf tensors" (hit during Dynamo fake conversion, which reads
-        ``grad_dtype != dtype``). Mirrors ``.grad_fn`` / ``.is_leaf`` / ``.grad``.
-        """
+        Overriding shields the read from ``__torch_function__``, which would otherwise fall
+        back to a non-leaf DTensor whose ``grad_dtype`` getter raises during Dynamo fake
+        conversion. Mirrors ``.grad_fn`` / ``.is_leaf`` / ``.grad``."""
         return self._local_tensor.dtype
 
     @property  # type: ignore[override]
@@ -1523,19 +1406,15 @@ class ShardTensor(torch.Tensor):
         elif str(func) in cls._named_function_registry and cls._enable_shard_patches:
             res = cls._named_function_registry[str(func)](func, types, args, kwargs)
         elif _is_tracing(args, kwargs):
-            # Under torch.compile / AOTAutograd tracing, route unpatched ops
-            # straight to ``__torch_dispatch__`` (like DTensor, which has no
-            # ``__torch_function__``). The eager fallback converts to DTensor via
-            # ``_ShardTensorToDTensor`` autograd.Functions; Passing through here
-            # lets the aten-level ``__torch_dispatch__`` (which AOT handles correctly)
-            # own the op and keeps the graph differentiable.
+            # Under torch.compile tracing, route unpatched ops straight to
+            # ``__torch_dispatch__`` (like DTensor) so the aten-level path -- which AOT
+            # handles correctly -- owns the op and keeps the graph differentiable.
             with torch._C.DisableTorchFunctionSubclass():
                 return func(*args, **kwargs)
         else:
             res = _torch_function_fallback_via_dtensor(func, args, kwargs)
-        # Ride subclass routing metadata onto op outputs (eager only -- under
-        # compile it travels via the flatten context / _extra_inner_tensors).
-        # No-op for base ShardTensor (_subclass_propagated_attrs is empty).
+        # Ride subclass routing metadata onto op outputs (eager only; under compile it
+        # travels via the flatten context). No-op for base ShardTensor.
         if cls._subclass_propagated_attrs and not torch.compiler.is_compiling():
             source = cls._find_metadata_source(args, kwargs)
             if source is not None:
@@ -1920,30 +1799,15 @@ def scatter_tensor(
 
 
 def install_aot_plain_tangent_coercion() -> None:
-    r"""Patch ``AOTDispatchAutograd.process_runtime_tangent`` so a *plain* runtime
-    backward tangent is rebuilt into a :class:`ShardTensor` when the compiled
-    graph traced a ShardTensor tangent at that position.
+    r"""Patch ``AOTDispatchAutograd.process_runtime_tangent`` so a plain runtime backward
+    tangent is rebuilt into a :class:`ShardTensor` when the graph traced a ShardTensor
+    tangent there.
 
-    AOTAutograd can coerce a runtime *subclass* tangent to its traced metadata
-    (via :meth:`ShardTensor.__coerce_same_metadata_as_tangent__`), but has no
-    hook for a runtime *plain* ``torch.Tensor`` where the graph traced a subclass
-    tangent -- so it raises ``...guessed its metadata incorrectly``. That happens
-    when a ShardTensor boundary tensor crosses a Dynamo graph break: AOT
-    materializes the boundary cotangent as a plain tensor while the upstream
-    subgraph traced a ShardTensor tangent. The plain cotangent is value-correct
-    when the boundary placement is ``Replicate`` (local == global), so rebuilding
-    the subclass from it plus the traced ``SubclassCreationMeta`` (via
-    ``__tensor_unflatten__``) is lossless.
-
-    This is a general AOTAutograd expressiveness gap (no plain->subclass tangent
-    hook), not a ShardTensor one -- ideally PyTorch grows a first-class inverse
-    hook and this shim is deleted. It is scoped to ShardTensor: other subclasses
-    and plain-where-plain tangents fall through untouched. Idempotent; import or
-    rebuild failures degrade gracefully to the stock behavior. Declared inner
-    slots beyond ``_local_tensor`` (see :attr:`ShardTensor._extra_inner_tensors`)
-    are filled with zero-length ``int64`` sentinels, matching the flatten
-    contract.
-    """
+    AOT can coerce a runtime *subclass* tangent but has no hook for a *plain* tensor where
+    the graph traced a subclass, so it raises "guessed its metadata incorrectly" when a
+    ShardTensor boundary crosses a graph break. The plain cotangent is value-correct at a
+    ``Replicate`` boundary, so rebuilding via ``__tensor_unflatten__`` is lossless. Scoped to
+    ShardTensor, idempotent, degrades gracefully; a general AOT gap pending an upstream hook."""
     try:
         from torch._functorch._aot_autograd.runtime_wrappers import (
             AOTDispatchAutograd,
@@ -1962,9 +1826,7 @@ def install_aot_plain_tangent_coercion() -> None:
         return
 
     def _process_runtime_tangent(x, meta, *args, **kwargs):
-        # ``*args`` / ``**kwargs`` forward any extra params the stock method
-        # takes across torch versions (e.g. ``tangent_idx`` added in torch 2.12);
-        # the coercion only touches ``(x, meta)``.
+        # ``*args``/``**kwargs`` forward extra params across torch versions; only (x, meta) matter.
         subclass_type = getattr(meta, "original_subclass_type", None)
         if (
             isinstance(x, torch.Tensor)
@@ -1997,8 +1859,6 @@ def install_aot_plain_tangent_coercion() -> None:
     AOTDispatchAutograd.process_runtime_tangent = staticmethod(_process_runtime_tangent)
 
 
-# Install on import so ShardTensor survives a compiled backward whose cotangent
-# is materialized as a plain tensor across a Dynamo graph break. The shim is
-# scoped to ShardTensor and degrades gracefully, so it is inert for every other
-# compilation in the process.
+# Install on import so a ShardTensor survives a compiled backward whose cotangent is a plain
+# tensor across a graph break. Scoped and graceful, so inert for other compilations.
 install_aot_plain_tangent_coercion()
