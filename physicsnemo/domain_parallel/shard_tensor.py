@@ -19,7 +19,6 @@ from __future__ import annotations
 import dataclasses
 import enum
 import hashlib
-import logging
 import threading
 import warnings
 from collections.abc import Iterable, Mapping
@@ -54,8 +53,6 @@ from physicsnemo.domain_parallel._shard_tensor_spec import (
 )
 
 aten = torch.ops.aten
-
-logger = logging.getLogger(__name__)
 
 
 class TensorPromotionMode(enum.Enum):
@@ -1815,10 +1812,6 @@ def install_aot_plain_tangent_coercion() -> None:
         from torch._functorch._aot_autograd.schemas import SubclassCreationMeta
         from torch.utils._python_dispatch import is_traceable_wrapper_subclass
     except Exception:  # pragma: no cover - torch internals moved / unavailable
-        logger.debug(
-            "AOT plain-tangent coercion shim not installed (import failed)",
-            exc_info=True,
-        )
         return
 
     _orig = AOTDispatchAutograd.process_runtime_tangent
@@ -1848,11 +1841,8 @@ def install_aot_plain_tangent_coercion() -> None:
                 x = subclass_type.__tensor_unflatten__(
                     inner, meta.meta, meta.outer_size, meta.outer_stride
                 )
-            except Exception:  # pragma: no cover - fall through to stock error
-                logger.debug(
-                    "plain->ShardTensor runtime-tangent rebuild failed",
-                    exc_info=True,
-                )
+            except Exception:  # noqa: S110  # pragma: no cover - graceful fallback
+                pass
         return _orig(x, meta, *args, **kwargs)
 
     _process_runtime_tangent._shardtensor_plain_tangent_shim = True
