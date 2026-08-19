@@ -232,6 +232,8 @@ class MeshReader:
         include_index_in_metadata: bool = True,
         subsample_n_points: int | None = None,
         subsample_n_cells: int | None = None,
+        domain_parallel: dict | None = None,
+        device_mesh: "torch.distributed.device_mesh.DeviceMesh | None" = None,
     ) -> None:
         """
         Initialize the mesh reader.
@@ -266,13 +268,42 @@ class MeshReader:
             probability as measure weights, preserving the integration
             measure (see :mod:`physicsnemo.mesh.calculus.measure`).  Applied before
             ``subsample_n_points`` when both are set.
+        domain_parallel : dict, optional
+            Optional dict to configure domain-parallel (rank-local)
+            reading; see :class:`~physicsnemo.datapipes.readers.base.Reader`
+            for the schema. Mesh readers support only
+            ``placements="auto"``: the mesh schema decides the axes
+            (points/point_data over n_points, cell_data over n_cells) and
+            the size gate (``auto_threshold``) decides shard-vs-replicate
+            per mesh. Composes with the ``subsample_*`` options: the rank
+            chunk is taken of the (rank-consistent) subsampled window. The
+            sample returns as a proto payload that ``MeshDataset``
+            assembles into a ShardTensor-backed ``Mesh`` on the GPU.
+        device_mesh : torch.distributed.device_mesh.DeviceMesh, optional
+            1-D device mesh for domain-parallel reading; required with
+            ``domain_parallel``. Constructed and injected at runtime.
         """
+        from physicsnemo.datapipes._domain_parallel import (
+            validate_domain_parallel_config,
+        )
+
         self._root = Path(path)
         self._pattern = pattern
         self.pin_memory = pin_memory
         self.include_index_in_metadata = include_index_in_metadata
         self.subsample_n_points = subsample_n_points
         self.subsample_n_cells = subsample_n_cells
+        validate_domain_parallel_config(domain_parallel, device_mesh)
+        if (
+            domain_parallel is not None
+            and domain_parallel.get("placements", "auto") != "auto"
+        ):
+            raise ValueError(
+                'mesh readers support only placements="auto"; the mesh '
+                "schema decides which tensors shard"
+            )
+        self._domain_parallel_config = domain_parallel
+        self._device_mesh = device_mesh
         # Base seed + epoch for deterministic per-index RNG (see
         # :meth:`set_generator`). ``None`` means unseeded.
         self._seed_base: int | None = None
@@ -375,6 +406,25 @@ class MeshReader:
             generator=generator,
         )
 
+        if self._domain_parallel_config is not None:
+            # Rank-local read: keep only this rank's chunk of the (possibly
+            # subsampled) mesh. The window above is rank-consistent by the
+            # (seed, epoch, index) RNG scheme, and on a memmap-backed mesh
+            # the slice is the disk read itself.
+            from physicsnemo.datapipes._sharded_proto_mesh import shard_slice_mesh
+
+            proto = shard_slice_mesh(
+                mesh,
+                self._device_mesh,
+                self._domain_parallel_config.get("auto_threshold"),
+            )
+            if self.pin_memory:
+                proto = proto.pin_memory()
+            metadata = self._get_sample_metadata(index)
+            if self.include_index_in_metadata:
+                metadata["index"] = index
+            return proto, metadata
+
         if self.pin_memory:
             mesh = mesh.pin_memory()
 
@@ -390,6 +440,16 @@ class MeshReader:
             except Exception as e:
                 logger.error("Sample %s failed: %s", i, e)
                 raise RuntimeError(f"Sample {i} failed: {e}") from e
+
+    def close(self) -> None:
+        """Release cached zarr store handles.
+
+        ``MeshDataset.close`` calls this unconditionally; memmap-backed
+        samples hold no reader-level resources.
+        """
+        cache = getattr(self, "_zarr_groups", None)
+        if cache:
+            cache.clear()
 
     def __repr__(self) -> str:
         return f"MeshReader(path={self._root!r}, len={len(self)})"
@@ -417,6 +477,8 @@ class DomainMeshReader:
         extra_boundaries: dict[str, dict] | None = None,
         drop_interior_cells: bool = False,
         drop_in_file_boundaries: bool = False,
+        domain_parallel: dict | None = None,
+        device_mesh: "torch.distributed.device_mesh.DeviceMesh | None" = None,
     ) -> None:
         """
         Initialize the domain mesh reader.
@@ -490,7 +552,19 @@ class DomainMeshReader:
             otherwise be subsampled (an expensive ``slice_points`` remap,
             GIL-held, that blocks worker-thread overlap) and pinned every
             sample for nothing.
+        domain_parallel : dict, optional
+            Optional dict to configure domain-parallel (rank-local)
+            reading; see :class:`MeshReader`. Each sub-mesh (interior and
+            every boundary, including ``extra_boundaries``) is size-gated
+            independently: large sub-meshes shard, small patches replicate.
+        device_mesh : torch.distributed.device_mesh.DeviceMesh, optional
+            1-D device mesh for domain-parallel reading; required with
+            ``domain_parallel``. Constructed and injected at runtime.
         """
+        from physicsnemo.datapipes._domain_parallel import (
+            validate_domain_parallel_config,
+        )
+
         self._root = Path(path)
         self._pattern = pattern
         self.pin_memory = pin_memory
@@ -499,6 +573,17 @@ class DomainMeshReader:
         self.drop_in_file_boundaries = drop_in_file_boundaries
         self.subsample_n_points = subsample_n_points
         self.subsample_n_cells = subsample_n_cells
+        validate_domain_parallel_config(domain_parallel, device_mesh)
+        if (
+            domain_parallel is not None
+            and domain_parallel.get("placements", "auto") != "auto"
+        ):
+            raise ValueError(
+                'mesh readers support only placements="auto"; the mesh '
+                "schema decides which tensors shard"
+            )
+        self._domain_parallel_config = domain_parallel
+        self._device_mesh = device_mesh
         # Base seed + epoch for deterministic per-index RNG (see
         # :meth:`set_generator`). ``None`` means unseeded.
         self._seed_base: int | None = None
@@ -650,15 +735,35 @@ class DomainMeshReader:
         if self._extra_boundaries:
             dm = self._load_extra_boundaries(dm, index)
 
-        if self.pin_memory:
-            dm = dm.pin_memory()
-
         metadata: dict[str, Any] = {
             "source_path": str(self._paths[index]),
             "boundary_names": dm.boundary_names,
         }
         if self.include_index_in_metadata:
             metadata["index"] = index
+
+        if self._domain_parallel_config is not None:
+            # Rank-local read: keep only this rank's chunk of each sub-mesh
+            # (independently size-gated). On memmap-backed samples the
+            # slice is the disk read itself. Extra boundaries always
+            # replicate: they exist for whole-geometry queries (e.g. SDF).
+            from physicsnemo.datapipes._sharded_proto_mesh import (
+                shard_slice_domain_mesh,
+            )
+
+            proto = shard_slice_domain_mesh(
+                dm,
+                self._device_mesh,
+                self._domain_parallel_config.get("auto_threshold"),
+                replicate_names=set(self._extra_boundaries),
+            )
+            if self.pin_memory:
+                proto = proto.pin_memory()
+            return proto, metadata
+
+        if self.pin_memory:
+            dm = dm.pin_memory()
+
         return dm, metadata
 
     def _load_extra_boundaries(self, dm: DomainMesh, index: int) -> DomainMesh:
@@ -707,6 +812,9 @@ class DomainMeshReader:
             except Exception as e:
                 logger.error("Sample %s failed: %s", i, e)
                 raise RuntimeError(f"Sample {i} failed: {e}") from e
+
+    def close(self) -> None:
+        """No reader-level resources; present for ``MeshDataset.close``."""
 
     def __repr__(self) -> str:
         return f"DomainMeshReader(path={self._root!r}, len={len(self)})"

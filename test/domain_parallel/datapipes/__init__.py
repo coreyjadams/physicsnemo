@@ -13,13 +13,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Dataset root directories.
-# Fill in the paths below to point to your local dataset locations.
-# Use ??? as a placeholder for paths you have not yet configured.
-# OmegaConf will raise MissingMandatoryValue at runtime for any
-# path that is still ???.
-
-drivaer_ml: /lustre/fsw/portfolios/coreai/projects/coreai_modulus_cae/datasets/PhysicsNeMo-DrivaerML
-highlift_aero_ml: ???
-shift_suv: ???

@@ -160,8 +160,21 @@ def _reduce_and_average(
         same leaves in the same order (all ranks share one ``target_config``).
         Single-process skips the reduction, leaving single-GPU logs unchanged.
     """
+
+    ### Under domain parallelism the 0-D leaves may still be ShardTensors
+    ### (results of reductions over the sharded point axis). Materialize
+    ### them to plain replicated tensors before the flat fused all_reduce:
+    ### full_tensor() resolves any pending Partial and is a no-op copy for
+    ### Replicate. Values are then identical across each domain group, so
+    ### the world-wide AVG below still equals the ddp-axis mean.
+    def _materialize(t: torch.Tensor) -> torch.Tensor:
+        return t.full_tensor() if hasattr(t, "full_tensor") else t
+
+    loss_sum = _materialize(loss_sum)
     if losses_td is None or metrics_td is None:
         return loss_sum.item() / max(n_samples, 1), {}, {}
+    losses_td = TensorDict({k: _materialize(v) for k, v in losses_td.items()})
+    metrics_td = TensorDict({k: _materialize(v) for k, v in metrics_td.items()})
     ### Divide by the local sample count first, then AVG across ranks: a
     ### mean-of-means equal to the global mean under even shards, with no
     ### integer count entering the float reduction buffer.
@@ -208,6 +221,21 @@ def _log_to_tensorboard(
 ### ---------------------------------------------------------------------------
 ### Forward pass
 ### ---------------------------------------------------------------------------
+
+
+def _materialize_leaves(td: TensorDict) -> TensorDict:
+    """Materialize ShardTensor leaves of a logging TensorDict, in place-safe.
+
+    ``full_tensor()`` resolves any pending ``Partial`` and is a no-op copy
+    for ``Replicate``; plain tensors pass through, so this costs one
+    attribute check per leaf on a non-domain-parallel run.
+    """
+    return TensorDict(
+        {
+            key: value.full_tensor() if hasattr(value, "full_tensor") else value
+            for key, value in td.items()
+        }
+    )
 
 
 def forward_pass(
@@ -269,7 +297,17 @@ def forward_pass(
     ### a D2H copy happens; running ``.item()`` here would serialise the
     ### forward kernels against the host. ``TensorDict.detach()`` walks
     ### every leaf in one fast-apply pass.
-    return loss, loss_td.detach(), metric_td.detach()
+    ###
+    ### Under domain parallelism the 0-D leaves are ShardTensors;
+    ### materialize the detached LOGGING copies to plain replicated
+    ### tensors (resolving any pending Partial) so the epoch accumulators
+    ### and the fused all-reduce see uniform plain tensors. The live
+    ### ``loss`` stays untouched for ``backward()``.
+    return (
+        loss,
+        _materialize_leaves(loss_td.detach()),
+        _materialize_leaves(metric_td.detach()),
+    )
 
 
 ### ---------------------------------------------------------------------------
@@ -384,8 +422,12 @@ def _run_epoch(
             n_local += 1
 
             ### Detached scalar loss: accumulate the epoch sum on-device (no
-            ### host sync) and feed the per-step reducer below.
+            ### host sync) and feed the per-step reducer below. Materialized
+            ### to a plain tensor under domain parallelism so the plain
+            ### accumulator's in-place add doesn't see a ShardTensor.
             loss_det = loss.detach()
+            if hasattr(loss_det, "full_tensor"):
+                loss_det = loss_det.full_tensor()
             total_loss += loss_det
 
             step_dt = time.perf_counter() - step_t0
@@ -757,6 +799,28 @@ def main(cfg: DictConfig) -> None:
     set_seed(seed, rank=dist_manager.rank)
     logger.info(f"Random seed: {seed} (rank offset: {dist_manager.rank})")
 
+    # -- Domain parallelism: runtime DeviceMesh construction ---------------------
+    # The mesh is a live torch object, never config: build it here and inject
+    # it into the readers via build_dataloaders. domain_size == 1 leaves every
+    # code path identical to a non-domain-parallel run.
+    domain_size = int(cfg.get("domain_parallelism", {}).get("domain_size", 1))
+    domain_mesh = None
+    data_mesh = None
+    if domain_size > 1:
+        if dist_manager.world_size % domain_size != 0:
+            raise ValueError(
+                f"world_size {dist_manager.world_size} is not divisible by "
+                f"domain_parallelism.domain_size {domain_size}"
+            )
+        global_mesh = dist_manager.initialize_mesh(
+            mesh_shape=(-1, domain_size), mesh_dim_names=("ddp", "domain")
+        )
+        domain_mesh = global_mesh["domain"]
+        data_mesh = global_mesh["ddp"]
+        logger.info(
+            f"Domain parallelism: ddp={data_mesh.size()} x domain={domain_size}"
+        )
+
     checkpoint_dir = getattr(cfg, "checkpoint_dir", None) or cfg.output_dir
 
     # -- Logging setup (rank 0 only) ----------------------------------------------
@@ -772,7 +836,9 @@ def main(cfg: DictConfig) -> None:
         val_writer = SummaryWriter(log_dir=os.path.join(run_dir, "tb", "val"))
         log_jsonl = make_jsonl_logger(os.path.join(run_dir, "metrics.jsonl"))
 
-    train_loader, val_loader, normalizer, dataset_info = build_dataloaders(cfg)
+    train_loader, val_loader, normalizer, dataset_info = build_dataloaders(
+        cfg, domain_mesh=domain_mesh, data_mesh=data_mesh
+    )
     target_config: dict[str, FieldType] = dataset_info["targets"]
     ### `metrics_list` is derived later from cfg.metrics (recipe-side);
     ### build_dataloaders no longer ships a "metrics" key in dataset_info.
@@ -833,6 +899,14 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Parameters: {num_params:,}")
 
     model.to(device)
+
+    if domain_mesh is not None:
+        # All ranks in a domain group process the same sample and must hold
+        # identical weights; DDP below all-reduces gradients over the flat
+        # world, which covers both the ddp and domain axes.
+        from physicsnemo.domain_parallel import sync_module_over_mesh
+
+        sync_module_over_mesh(model, domain_mesh)
 
     if dist_manager.world_size > 1:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -908,6 +982,18 @@ def main(cfg: DictConfig) -> None:
     loaded_epoch = load_checkpoint(device=device, **ckpt_args)
 
     if cfg.compile:
+        if domain_size > 1:
+            # ShardTensor/DTensor under torch.compile:
+            # - DDPOptimizer (bucket-split backend) re-fakeifies real tensor
+            #   subclasses per submodule and is documented as incompatible
+            #   with them; DDP comm hooks are unaffected.
+            # - DTensor sharding propagation requires static shapes (SymInt
+            #   specs are unhashable). Shapes here are static by design
+            #   (fixed sampling resolution; the multi-scale local-feature
+            #   widths are a finite, fixed set), so specialize per shape
+            #   instead of letting automatic-dynamic promote dims to SymInt.
+            torch._dynamo.config.optimize_ddp = False
+            torch._dynamo.config.automatic_dynamic_shapes = False
         model = torch.compile(model)
 
     num_epochs = cfg.training.num_epochs

@@ -28,7 +28,7 @@ from physicsnemo.domain_parallel.shard_utils.patch_core import (
 )
 from physicsnemo.domain_parallel.shard_utils.ring import (
     RingPassingConfig,
-    perform_ring_iteration,
+    perform_ring_iteration_funcol,
 )
 from physicsnemo.nn.functional.neighbors.knn._cuml_impl import knn_impl
 
@@ -126,7 +126,7 @@ def ring_knn(
         recv_shape = points_sharding_shapes[next_source_rank]
         if i != local_size - 1:
             # Don't do a ring on the last iteration.
-            next_local_points = perform_ring_iteration(
+            next_local_points = perform_ring_iteration_funcol(
                 local_points,
                 mesh,
                 ring_config,

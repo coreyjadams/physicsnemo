@@ -49,6 +49,16 @@ dataloader:
   num_workers: 4
   pin_memory: true
 
+# -- Domain parallelism (ShardTensor) ----------------------------------------
+# domain_size > 1 splits each sample's large tensors over a group of GPUs:
+# world_size = ddp_size x domain_size, samples shard over the domain axis and
+# batch over the ddp axis. The DeviceMesh is constructed at runtime in
+# train.py and injected into the readers; this block is declarative policy.
+domain_parallelism:
+  domain_size: 1          # 1 = off
+  placements: auto        # readers shard/replicate per tensor from metadata
+  auto_threshold: null    # optional {value: K, unit: world_size|rows|bytes}
+
 # -- Logging -----------------------------------------------------------------
 logging:
   log_every_n_steps: 10

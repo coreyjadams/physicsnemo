@@ -98,6 +98,8 @@ class TensorStoreZarrReader(Reader):
         pin_memory: bool = False,
         include_index_in_metadata: bool = True,
         coordinated_subsampling: Optional[dict[str, Any]] = None,
+        domain_parallel: Optional[dict[str, Any]] = None,
+        device_mesh: Optional["torch.distributed.device_mesh.DeviceMesh"] = None,
     ) -> None:
         """
         Initialize the TensorStore Zarr reader.
@@ -129,6 +131,14 @@ class TensorStoreZarrReader(Reader):
         coordinated_subsampling : dict[str, Any], optional
             Optional dict to configure coordinated subsampling. If provided,
             must contain ``n_points`` (int) and ``target_keys`` (list of str).
+        domain_parallel : dict[str, Any], optional
+            Optional dict to configure domain-parallel (rank-local) reading;
+            see :class:`~physicsnemo.datapipes.readers.base.Reader`. Sharded
+            keys read only this rank's chunk (of the coordinated window when
+            subsampling is also configured).
+        device_mesh : torch.distributed.device_mesh.DeviceMesh, optional
+            1-D device mesh for domain-parallel reading; required with
+            ``domain_parallel``. Constructed and injected at runtime.
 
         Raises
         ------
@@ -150,6 +160,8 @@ class TensorStoreZarrReader(Reader):
             pin_memory=pin_memory,
             include_index_in_metadata=include_index_in_metadata,
             coordinated_subsampling=coordinated_subsampling,
+            domain_parallel=domain_parallel,
+            device_mesh=device_mesh,
         )
 
         self.path = Path(path).expanduser().resolve()
@@ -258,18 +270,17 @@ class TensorStoreZarrReader(Reader):
 
         return {}
 
-    def _load_sample(self, index: int) -> dict[str, torch.Tensor]:
-        """Load a single sample from a Zarr group using TensorStore."""
+    def _open_stores(
+        self, index: int
+    ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+        """Open the sample's array stores (async, metadata-only) + attributes."""
         group_path = self._groups[index]
-        # Per-sample generator: reproducible regardless of read order/thread.
-        generator = self._index_generator(index)
 
         # Read attributes (stored as tensors in sample)
         attributes = self._read_attributes(group_path)
 
         # Determine which fields to read
-        fields_to_load = self.fields
-        fields_from_arrays = set(fields_to_load) - set(attributes.keys())
+        fields_from_arrays = set(self.fields) - set(attributes.keys())
 
         # Check for missing required fields using cached available fields
         # (discovered once during __init__ from the first group)
@@ -282,14 +293,7 @@ class TensorStoreZarrReader(Reader):
                 f"Available: {list(available)}"
             )
 
-        # Determine cyclic block indices if coordinated subsampling is enabled.
-        subsample_indices = None
-        target_keys_set = set()
-        if self._coordinated_subsampling_config is not None:
-            n_points = self._coordinated_subsampling_config["n_points"]
-            target_keys_set = set(self._coordinated_subsampling_config["target_keys"])
-
-        # Open all array stores asynchronously
+        # Open all array stores asynchronously (metadata only, no data read)
         read_futures = {}
         for key in fields_from_arrays:
             if key not in available:
@@ -308,49 +312,118 @@ class TensorStoreZarrReader(Reader):
 
         # Wait for opens to complete
         stores = {key: future.result() for key, future in read_futures.items()}
+        return stores, attributes
 
-        # Determine the range from the first available target key. A cyclic
-        # block gives every point equal inclusion probability while retaining
-        # contiguous storage locality.
-        if (
-            subsample_indices is None
-            and self._coordinated_subsampling_config is not None
-        ):
-            for key in target_keys_set:
-                if key in stores:
-                    array_shape = stores[key].shape[0]
-                    subsample_indices = _cyclic_block_indices(
-                        array_shape, n_points, generator=generator
-                    ).numpy()
-                    break
+    def _window_indices(
+        self, stores: dict[str, Any], generator
+    ) -> tuple[Any, set[str]]:
+        """Cyclic-block window for coordinated subsampling, or ``None``.
 
-        # Trigger async reads
-        tensor_futures = {}
-        for key in fields_from_arrays:
-            if key not in stores:
-                continue
+        The window length comes from the first *configured* target key
+        present -- list order, not set order, so every rank derives the
+        window from the same key.
+        """
+        if self._coordinated_subsampling_config is None:
+            return None, set()
+        n_points = self._coordinated_subsampling_config["n_points"]
+        target_keys = list(self._coordinated_subsampling_config["target_keys"])
 
-            # Apply subsampling if this key is a target
-            if subsample_indices is not None and key in target_keys_set:
-                tensor_futures[key] = stores[key][subsample_indices].read()
-            else:
-                tensor_futures[key] = stores[key][:].read()
+        # A cyclic block gives every point equal inclusion probability while
+        # retaining contiguous storage locality.
+        for key in target_keys:
+            if key in stores:
+                subsample_indices = _cyclic_block_indices(
+                    stores[key].shape[0], n_points, generator=generator
+                ).numpy()
+                return subsample_indices, set(target_keys)
+        return None, set(target_keys)
 
-        # Wait for reads and convert to torch tensors
+    def _finalize_sample(
+        self, tensor_futures: dict[str, Any], attributes: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Resolve read futures, merge attributes and default values."""
         data = {
             key: torch.as_tensor(future.result(), dtype=torch.float32)
             for key, future in tensor_futures.items()
         }
-
-        # Add attributes
         data.update(attributes)
-
-        # Add default values for missing optional fields
         for key, default_value in self.default_values.items():
             if key not in data:
                 data[key] = default_value.clone()
-
         return data
+
+    def _load_sample(self, index: int) -> dict[str, torch.Tensor]:
+        """Load a single sample from a Zarr group using TensorStore."""
+        # Per-sample generator: reproducible regardless of read order/thread.
+        generator = self._index_generator(index)
+        stores, attributes = self._open_stores(index)
+        subsample_indices, target_keys_set = self._window_indices(stores, generator)
+
+        # Trigger async reads
+        tensor_futures = {}
+        for key, store in stores.items():
+            # Apply subsampling if this key is a target
+            if subsample_indices is not None and key in target_keys_set:
+                tensor_futures[key] = store[subsample_indices].read()
+            else:
+                tensor_futures[key] = store[:].read()
+
+        return self._finalize_sample(tensor_futures, attributes)
+
+    def _load_sample_domain_parallel(
+        self, index: int
+    ) -> tuple[dict[str, torch.Tensor], dict[str, int | None]]:
+        """Load this rank's chunk of a single sample using TensorStore.
+
+        Placements resolve from store metadata shapes (opens are
+        metadata-only); the rank chunk is taken of the coordinated window
+        for target keys, of the full row range otherwise. Attributes and
+        default values always replicate.
+        """
+        from physicsnemo.datapipes._domain_parallel import (
+            chunk_bounds,
+            resolve_placements,
+        )
+
+        generator = self._index_generator(index)
+        stores, attributes = self._open_stores(index)
+        subsample_indices, target_keys_set = self._window_indices(stores, generator)
+
+        # Effective global row count per array key: the window length for
+        # target keys, the stored row count otherwise. Metadata only.
+        meta = {}
+        for key, store in stores.items():
+            rows = (
+                len(subsample_indices)
+                if subsample_indices is not None and key in target_keys_set
+                else store.shape[0]
+            )
+            meta[key] = ((rows, *store.shape[1:]), store.dtype.numpy_dtype)
+        sharded = resolve_placements(
+            meta, self._domain_parallel_config, self._device_mesh
+        )
+
+        # Trigger async reads of each key's rank chunk / full rows
+        tensor_futures = {}
+        global_lengths: dict[str, int | None] = {}
+        for key, store in stores.items():
+            windowed = subsample_indices is not None and key in target_keys_set
+            if sharded[key]:
+                global_rows = meta[key][0][0]
+                lo, hi = chunk_bounds(global_rows, self._device_mesh)
+                # Rank chunk of the window (a sub-slice of a 1-2 run cyclic
+                # block) or of the full row range.
+                rows = subsample_indices[lo:hi] if windowed else slice(lo, hi)
+                global_lengths[key] = global_rows
+            else:
+                rows = subsample_indices if windowed else slice(None)
+                global_lengths[key] = None
+            tensor_futures[key] = store[rows].read()
+
+        data = self._finalize_sample(tensor_futures, attributes)
+        for key in data:
+            global_lengths.setdefault(key, None)  # attributes / defaults replicate
+        return data, global_lengths
 
     def __len__(self) -> int:
         """Return number of samples."""
@@ -370,6 +443,11 @@ class TensorStoreZarrReader(Reader):
     @property
     def _supports_coordinated_subsampling(self) -> bool:
         """TensorStore Zarr reader supports coordinated subsampling."""
+        return True
+
+    @property
+    def _supports_domain_parallel(self) -> bool:
+        """TensorStore Zarr reader supports domain-parallel reading."""
         return True
 
     def __repr__(self) -> str:

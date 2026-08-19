@@ -179,12 +179,31 @@ class Dataset(DatasetBase):
     # DatasetBase implementation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _assemble(data: Any) -> Any:
+        """Assemble a domain-parallel proto payload into its TensorDict.
+
+        A no-op for regular TensorDict samples; a domain-parallel reader
+        returns a :class:`ShardedProtoTensorDict` whose sharded keys become
+        ``Shard(0)`` ShardTensors here (communication-free chunk wrap).
+        """
+        from physicsnemo.datapipes._domain_parallel import (
+            ShardedProtoTensorDict,
+            wrap_sharded_tensordict,
+        )
+
+        if isinstance(data, ShardedProtoTensorDict):
+            return wrap_sharded_tensordict(data)
+        return data
+
     def _load(self, index: int) -> tuple[TensorDict, dict[str, Any]]:
         """Synchronous load: reader → device transfer → transforms."""
         data, metadata = self.reader[index]
 
         if self.target_device is not None:
             data = data.to(self.target_device, non_blocking=True)
+
+        data = self._assemble(data)
 
         if self.transforms is not None:
             data = self.transforms(data)
@@ -349,6 +368,7 @@ class Dataset(DatasetBase):
         with preprocessing_stream(stream if use_stream else None):
             if self.target_device is not None:
                 data = data.to(self.target_device, non_blocking=True)
+            data = self._assemble(data)
             if self.transforms is not None:
                 data = self.transforms(data)
 

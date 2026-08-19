@@ -88,6 +88,10 @@ class MeshDataset(DatasetBase):
         ----------
         reader : MeshReader or DomainMeshReader
             Mesh reader; returns (Mesh, metadata) or (DomainMesh, metadata).
+            A reader configured for domain-parallel reading (its
+            ``domain_parallel`` / ``device_mesh`` options) returns proto
+            payloads that this dataset assembles into ShardTensor-backed
+            meshes after the device transfer.
         transforms : sequence of MeshTransform, optional
             Transforms to apply in order. None means no transforms.
         device : str or torch.device, optional
@@ -166,6 +170,28 @@ class MeshDataset(DatasetBase):
     # DatasetBase implementation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _assemble(data: Any) -> Any:
+        """Assemble a domain-parallel proto payload into its mesh.
+
+        A no-op for regular Mesh/DomainMesh samples; a domain-parallel
+        reader returns a proto payload whose sharded pieces become
+        ``Shard(0)`` ShardTensors here (communication-free chunk wrap,
+        using the device mesh carried on the payload).
+        """
+        from physicsnemo.datapipes._sharded_proto_mesh import (
+            ShardedProtoDomainMesh,
+            ShardedProtoMesh,
+            wrap_sharded_domain_mesh,
+            wrap_sharded_mesh,
+        )
+
+        if isinstance(data, ShardedProtoDomainMesh):
+            return wrap_sharded_domain_mesh(data)
+        if isinstance(data, ShardedProtoMesh):
+            return wrap_sharded_mesh(data)
+        return data
+
     def _load(
         self, index: int
     ) -> tuple[Union[Mesh, DomainMesh, TensorDict], dict[str, Any]]:
@@ -176,6 +202,8 @@ class MeshDataset(DatasetBase):
         if self._device is not None:
             with torch.profiler.record_function("MeshDataset._load: data.to(device)"):
                 data = data.to(self._device)
+
+        data = self._assemble(data)
 
         for t in self.transforms:
             with torch.profiler.record_function(
@@ -292,6 +320,7 @@ class MeshDataset(DatasetBase):
                     "MeshDataset._consume: data.to(device)"
                 ):
                     data = data.to(self._device, non_blocking=True)
+            data = self._assemble(data)
             with torch.profiler.record_function(
                 "MeshDataset._consume: _apply_transforms"
             ):

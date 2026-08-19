@@ -87,6 +87,8 @@ class Reader(ABC):
         pin_memory: bool = False,
         include_index_in_metadata: bool = True,
         coordinated_subsampling: dict[str, Any] | None = None,
+        domain_parallel: dict[str, Any] | None = None,
+        device_mesh: "torch.distributed.device_mesh.DeviceMesh | None" = None,
     ) -> None:
         """
         Initialize the reader.
@@ -110,10 +112,38 @@ class Reader(ABC):
             point has equal inclusion probability while reads retain storage
             locality. This allows configuration via Hydra. Readers that don't
             support coordinated subsampling will ignore this parameter.
+        domain_parallel : dict[str, Any], optional
+            Optional dict to configure domain-parallel (rank-local) reading.
+            Requires ``device_mesh``. If provided, may contain:
+
+            - ``placements``: per-key ``{key: "shard" | "replicate"}`` map,
+              or ``"auto"`` (default) to shard keys whose global size
+              crosses ``auto_threshold`` and replicate the rest
+            - ``auto_threshold``: ``{"value": K, "unit": "world_size" |
+              "rows" | "bytes"}``; default one row per rank
+
+            Supporting readers read only this rank's chunk of every sharded
+            key and return a proto payload the dataset assembles into
+            ``Shard(0)`` ShardTensors on the GPU. Composes with
+            ``coordinated_subsampling``: the rank chunk is taken of the
+            coordinated window. Every rank in the device mesh must request
+            the same sample indices. Readers that don't support
+            domain-parallel reading will ignore this parameter.
+        device_mesh : torch.distributed.device_mesh.DeviceMesh, optional
+            1-D device mesh for domain-parallel reading. Not serializable
+            configuration: construct it in Python at runtime and inject it
+            alongside ``domain_parallel``.
         """
+        from physicsnemo.datapipes._domain_parallel import (
+            validate_domain_parallel_config,
+        )
+
         self.pin_memory = pin_memory
         self.include_index_in_metadata = include_index_in_metadata
         self._coordinated_subsampling_config = coordinated_subsampling
+        validate_domain_parallel_config(domain_parallel, device_mesh)
+        self._domain_parallel_config = domain_parallel
+        self._device_mesh = device_mesh
         # Base seed + epoch for deterministic per-index RNG. See
         # :meth:`_index_generator`. ``None`` means no seed was provided
         # (random draws fall back to the global default RNG).
@@ -209,6 +239,46 @@ class Reader(ABC):
         return False
 
     @property
+    def _supports_domain_parallel(self) -> bool:
+        """
+        Return True if this reader supports domain-parallel reading.
+
+        Override this property (and implement
+        :meth:`_load_sample_domain_parallel`) in subclasses that can read
+        rank-local chunks.
+
+        Returns
+        -------
+        bool
+            True if domain-parallel reading is supported.
+        """
+        return False
+
+    def _load_sample_domain_parallel(
+        self, index: int
+    ) -> tuple[dict[str, torch.Tensor], dict[str, int | None]]:
+        """
+        Load this rank's chunk of a single sample.
+
+        Implement in subclasses that declare
+        :attr:`_supports_domain_parallel`. Must be thread-safe (no scratch
+        state on ``self``): the per-key global lengths return alongside the
+        data.
+
+        Parameters
+        ----------
+        index : int
+            Sample index (0 to len-1).
+
+        Returns
+        -------
+        tuple[dict[str, torch.Tensor], dict[str, int or None]]
+            Per-key local rows, and the global dim-0 length of each sharded
+            key (``None`` for replicated keys, whose rows are complete).
+        """
+        raise NotImplementedError
+
+    @property
     def field_names(self) -> list[str]:
         """
         List of field names available in samples.
@@ -247,8 +317,15 @@ class Reader(ABC):
                 f"Index {index} out of range for reader with {len(self)} samples"
             )
 
+        domain_parallel = (
+            self._domain_parallel_config is not None and self._supports_domain_parallel
+        )
+
         # Load data
-        data_dict = self._load_sample(index)
+        if domain_parallel:
+            data_dict, global_lengths = self._load_sample_domain_parallel(index)
+        else:
+            data_dict = self._load_sample(index)
 
         # Build metadata
         metadata = self._get_sample_metadata(index)
@@ -258,6 +335,16 @@ class Reader(ABC):
         # Pin memory if requested
         if self.pin_memory:
             data_dict = {k: v.pin_memory() for k, v in data_dict.items()}
+
+        if domain_parallel:
+            from physicsnemo.datapipes._domain_parallel import ShardedProtoTensorDict
+
+            data = ShardedProtoTensorDict(
+                tensors=TensorDict(data_dict, device=torch.device("cpu")),
+                global_lengths=global_lengths,
+                device_mesh=self._device_mesh,
+            )
+            return data, metadata
 
         # Create TensorDict
         data = TensorDict(data_dict, device=torch.device("cpu"))

@@ -34,8 +34,10 @@ import torch.distributed as dist
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.domain_parallel.shard_utils.ring import (
     RingPassingConfig,
+    finish_ring_iteration,
     perform_ring_iteration,
     perform_ring_iteration_async,
+    perform_ring_iteration_funcol,
 )
 
 from .utils import collective_assert, collective_assert_close
@@ -161,6 +163,157 @@ def test_ring_iteration_uneven_shapes(distributed_mesh, comm_method):
     collective_assert(
         received.shape == recv_shape,
         msg=f"uneven shape mismatch: got {received.shape}, expected {recv_shape}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests for perform_ring_iteration_funcol (functional collectives)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.multigpu_static
+@pytest.mark.parametrize("direction", ["forward", "backward"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_ring_iteration_funcol_single_step(distributed_mesh, direction, dtype):
+    """Funcol variant, blocking form: one ring step matches the neighbor's data."""
+    dm = DistributedManager()
+    mesh = distributed_mesh
+    local_group = mesh.get_group(0)
+    local_rank = mesh.get_local_rank(0)
+    local_size = dist.get_world_size(group=local_group)
+
+    shape = (4, 8)
+    tensor = _make_rank_tensor(shape, dtype, dm.device, local_rank)
+
+    config = RingPassingConfig(
+        mesh_dim=0,
+        mesh_size=local_size,
+        ring_direction=direction,
+    )
+
+    received = perform_ring_iteration_funcol(tensor, mesh, config)
+
+    if direction == "forward":
+        expected_source = (local_rank - 1) % local_size
+    else:
+        expected_source = (local_rank + 1) % local_size
+
+    expected = _make_rank_tensor(shape, dtype, dm.device, expected_source)
+    collective_assert_close(
+        received,
+        expected,
+        atol=0,
+        rtol=0,
+        msg=f"funcol ring single step ({direction})",
+    )
+
+
+@pytest.mark.multigpu_static
+def test_ring_iteration_funcol_full_rotation(distributed_mesh):
+    """N funcol ring steps return the original tensor to each rank."""
+    dm = DistributedManager()
+    mesh = distributed_mesh
+    local_group = mesh.get_group(0)
+    local_rank = mesh.get_local_rank(0)
+    local_size = dist.get_world_size(group=local_group)
+
+    shape = (3, 5)
+    original = _make_rank_tensor(shape, torch.float32, dm.device, local_rank)
+    current = original.clone()
+
+    config = RingPassingConfig(
+        mesh_dim=0,
+        mesh_size=local_size,
+        ring_direction="forward",
+    )
+
+    for _ in range(local_size):
+        current = perform_ring_iteration_funcol(current, mesh, config)
+
+    collective_assert_close(
+        current,
+        original,
+        atol=0,
+        rtol=0,
+        msg="funcol ring full rotation",
+    )
+
+
+@pytest.mark.multigpu_static
+def test_ring_iteration_funcol_uneven_shapes(distributed_mesh):
+    """Funcol variant with recv_shape != send shape (uneven shards)."""
+    dm = DistributedManager()
+    mesh = distributed_mesh
+    local_group = mesh.get_group(0)
+    local_rank = mesh.get_local_rank(0)
+    local_size = dist.get_world_size(group=local_group)
+
+    n_rows = 10 + local_rank * 3
+    n_cols = 4
+    tensor = torch.randn(n_rows, n_cols, dtype=torch.float32, device=dm.device)
+
+    config = RingPassingConfig(
+        mesh_dim=0,
+        mesh_size=local_size,
+        ring_direction="forward",
+    )
+
+    source_rank = (local_rank - 1) % local_size
+    recv_n_rows = 10 + source_rank * 3
+    recv_shape = torch.Size([recv_n_rows, n_cols])
+
+    received = perform_ring_iteration_funcol(
+        tensor, mesh, config, recv_shape=recv_shape
+    )
+
+    collective_assert(
+        received.shape == recv_shape,
+        msg=f"funcol uneven shape mismatch: got {received.shape}, expected {recv_shape}",
+    )
+
+    # Values must match the reference blocking implementation's contract:
+    # compare against the source rank's actual tensor via a full rotation check.
+    reference = perform_ring_iteration(tensor, mesh, config, recv_shape=recv_shape)
+    collective_assert_close(
+        received,
+        reference,
+        atol=0,
+        rtol=0,
+        msg="funcol uneven-shape values differ from blocking reference",
+    )
+
+
+@pytest.mark.multigpu_static
+def test_ring_iteration_funcol_deferred_wait(distributed_mesh):
+    """wait=False + finish_ring_iteration: the overlap form used by ring SDPA."""
+    dm = DistributedManager()
+    mesh = distributed_mesh
+    local_group = mesh.get_group(0)
+    local_rank = mesh.get_local_rank(0)
+    local_size = dist.get_world_size(group=local_group)
+
+    shape = (6, 7)
+    tensor = _make_rank_tensor(shape, torch.float32, dm.device, local_rank)
+
+    config = RingPassingConfig(
+        mesh_dim=0,
+        mesh_size=local_size,
+        ring_direction="forward",
+    )
+
+    in_flight = perform_ring_iteration_funcol(tensor, mesh, config, wait=False)
+    # Unrelated compute in the overlap window.
+    _ = tensor.square().sum()
+    received = finish_ring_iteration(in_flight, tensor.shape)
+
+    expected_source = (local_rank - 1) % local_size
+    expected = _make_rank_tensor(shape, torch.float32, dm.device, expected_source)
+    collective_assert_close(
+        received,
+        expected,
+        atol=0,
+        rtol=0,
+        msg="funcol deferred-wait ring step",
     )
 
 

@@ -88,6 +88,8 @@ class ZarrReader(Reader):
         pin_memory: bool = False,
         include_index_in_metadata: bool = True,
         coordinated_subsampling: Optional[dict[str, Any]] = None,
+        domain_parallel: Optional[dict[str, Any]] = None,
+        device_mesh: Optional["torch.distributed.device_mesh.DeviceMesh"] = None,
         cache_stores: bool = True,
     ) -> None:
         """
@@ -116,6 +118,14 @@ class ZarrReader(Reader):
         coordinated_subsampling : dict[str, Any], optional
             Optional dict to configure coordinated subsampling. If provided,
             must contain ``n_points`` (int) and ``target_keys`` (list of str).
+        domain_parallel : dict[str, Any], optional
+            Optional dict to configure domain-parallel (rank-local) reading;
+            see :class:`~physicsnemo.datapipes.readers.base.Reader`. Sharded
+            keys read only this rank's chunk (of the coordinated window when
+            subsampling is also configured).
+        device_mesh : torch.distributed.device_mesh.DeviceMesh, optional
+            1-D device mesh for domain-parallel reading; required with
+            ``domain_parallel``. Constructed and injected at runtime.
         cache_stores : bool, default=True
             If True, cache opened zarr stores to avoid repeated opening and
             prevent executor shutdown errors. Set to False if memory is a
@@ -137,6 +147,8 @@ class ZarrReader(Reader):
             pin_memory=pin_memory,
             include_index_in_metadata=include_index_in_metadata,
             coordinated_subsampling=coordinated_subsampling,
+            domain_parallel=domain_parallel,
+            device_mesh=device_mesh,
         )
 
         self.path = Path(path).expanduser().resolve()
@@ -239,21 +251,15 @@ class ZarrReader(Reader):
         """
         return (path / "zarr.json").exists() or (path / ".zgroup").exists()
 
-    def _load_sample(self, index: int) -> dict[str, torch.Tensor]:
-        """Load a single sample from a Zarr group."""
-        # Per-sample generator: reproducible regardless of read order/thread.
-        generator = self._index_generator(index)
+    def _open_sample(self, index: int) -> tuple[Any, set[str]]:
+        """Open the sample's group and validate required-field availability."""
         if self._single_group_mode:
             # Single group: index into first dimension of each array
             group_path = self._groups[0]
-            root = self._open_zarr_store(group_path)
         else:
             # Directory mode: each group is one sample
             group_path = self._groups[index]
-            root = self._open_zarr_store(group_path)
-
-        data = {}
-        fields_to_load = self.fields
+        root = self._open_zarr_store(group_path)
 
         # Discover available arrays and attributes for this sample at runtime
         available_arrays = set(root.array_keys())
@@ -261,7 +267,7 @@ class ZarrReader(Reader):
         available = available_arrays | available_attrs
 
         # Check for missing required fields (check both arrays and attributes)
-        required_fields = set(fields_to_load) - set(self.default_values.keys())
+        required_fields = set(self.fields) - set(self.default_values.keys())
         missing_fields = required_fields - available
         if missing_fields:
             raise KeyError(
@@ -269,31 +275,44 @@ class ZarrReader(Reader):
                 f"Available arrays: {list(available_arrays)}, "
                 f"Available attributes: {list(available_attrs)}"
             )
+        return root, available_attrs
 
-        # Determine cyclic block indices if coordinated subsampling is enabled.
-        subsample_indices = None
-        target_keys_set = set()
-        if self._coordinated_subsampling_config is not None:
-            n_points = self._coordinated_subsampling_config["n_points"]
-            target_keys_set = set(self._coordinated_subsampling_config["target_keys"])
+    def _array_rows(self, array) -> int:
+        """Row count of an array's batch dim (dim 1 in single-group mode)."""
+        return array.shape[1] if self._single_group_mode else array.shape[0]
 
-            # Find the range from the first available target key. A cyclic
-            # block gives every point equal inclusion probability while
-            # retaining contiguous storage locality.
-            for field in target_keys_set:
-                if field in root:
-                    if self._single_group_mode:
-                        # In single group mode, subsample along dimensions after the first
-                        array_shape = root[field].shape[1]
-                    else:
-                        array_shape = root[field].shape[0]
-                    subsample_indices = _cyclic_block_indices(
-                        array_shape, n_points, generator=generator
-                    ).numpy()
-                    break
+    def _window_indices(self, root, generator) -> tuple[Any, set[str]]:
+        """Cyclic-block window for coordinated subsampling, or ``None``.
 
+        The window length comes from the first *configured* target key
+        present in the group -- list order, not set order, so every rank
+        derives the window from the same key.
+        """
+        if self._coordinated_subsampling_config is None:
+            return None, set()
+        n_points = self._coordinated_subsampling_config["n_points"]
+        target_keys = list(self._coordinated_subsampling_config["target_keys"])
+
+        # A cyclic block gives every point equal inclusion probability while
+        # retaining contiguous storage locality.
+        for field in target_keys:
+            if field in root:
+                subsample_indices = _cyclic_block_indices(
+                    self._array_rows(root[field]), n_points, generator=generator
+                ).numpy()
+                return subsample_indices, set(target_keys)
+        return None, set(target_keys)
+
+    def _load_sample(self, index: int) -> dict[str, torch.Tensor]:
+        """Load a single sample from a Zarr group."""
+        # Per-sample generator: reproducible regardless of read order/thread.
+        generator = self._index_generator(index)
+        root, available_attrs = self._open_sample(index)
+        subsample_indices, target_keys_set = self._window_indices(root, generator)
+
+        data = {}
         # Load each field
-        for field in fields_to_load:
+        for field in self.fields:
             if field in root:
                 if self._single_group_mode:
                     # Single group mode: index into first dimension
@@ -320,6 +339,73 @@ class ZarrReader(Reader):
                 data[field] = self.default_values[field].clone()
 
         return data
+
+    def _load_sample_domain_parallel(
+        self, index: int
+    ) -> tuple[dict[str, torch.Tensor], dict[str, int | None]]:
+        """Load this rank's chunk of a single sample from a Zarr group.
+
+        Placements resolve from store metadata shapes (no data read); the
+        rank chunk is taken of the coordinated window for target keys, of
+        the full row range otherwise. Attributes and default values always
+        replicate.
+        """
+        from physicsnemo.datapipes._domain_parallel import (
+            chunk_bounds,
+            resolve_placements,
+        )
+
+        generator = self._index_generator(index)
+        root, available_attrs = self._open_sample(index)
+        subsample_indices, target_keys_set = self._window_indices(root, generator)
+
+        # Effective global row count per array key: the window length for
+        # target keys, the stored row count otherwise. Metadata only.
+        meta = {}
+        for field in self.fields:
+            if field in root:
+                rows = (
+                    len(subsample_indices)
+                    if subsample_indices is not None and field in target_keys_set
+                    else self._array_rows(root[field])
+                )
+                array = root[field]
+                trailing = (
+                    array.shape[2:] if self._single_group_mode else array.shape[1:]
+                )
+                meta[field] = ((rows, *trailing), array.dtype)
+        sharded = resolve_placements(
+            meta, self._domain_parallel_config, self._device_mesh
+        )
+
+        data: dict[str, torch.Tensor] = {}
+        global_lengths: dict[str, int | None] = {}
+        for field in self.fields:
+            if field in root:
+                array = root[field]
+                windowed = subsample_indices is not None and field in target_keys_set
+                if sharded[field]:
+                    global_rows = meta[field][0][0]
+                    lo, hi = chunk_bounds(global_rows, self._device_mesh)
+                    # Rank chunk of the window (a sub-slice of a 1-2 run
+                    # cyclic block) or of the full row range.
+                    rows = subsample_indices[lo:hi] if windowed else slice(lo, hi)
+                    global_lengths[field] = global_rows
+                else:
+                    rows = subsample_indices if windowed else slice(None)
+                    global_lengths[field] = None
+                if self._single_group_mode:
+                    data[field] = torch.from_numpy(array[index, rows])
+                else:
+                    data[field] = torch.from_numpy(array[rows])
+            elif field in available_attrs:
+                data[field] = self._convert_attr_to_tensor(root.attrs[field], field)
+                global_lengths[field] = None
+            elif field in self.default_values:
+                data[field] = self.default_values[field].clone()
+                global_lengths[field] = None
+
+        return data, global_lengths
 
     def _convert_attr_to_tensor(self, value: Any, field_name: str) -> torch.Tensor:
         """
@@ -389,6 +475,11 @@ class ZarrReader(Reader):
     @property
     def _supports_coordinated_subsampling(self) -> bool:
         """Zarr reader supports coordinated subsampling."""
+        return True
+
+    @property
+    def _supports_domain_parallel(self) -> bool:
+        """Zarr reader supports domain-parallel (rank-local) reading."""
         return True
 
     def close(self) -> None:

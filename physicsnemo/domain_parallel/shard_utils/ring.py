@@ -24,20 +24,27 @@ in a circular fashion between processes, such as ring attention.
 The module provides:
 
 - ``RingPassingConfig``: Configuration dataclass for ring communication parameters
-- ``get_comm_stream``: Cached CUDA stream accessor for overlapping communication
-  with computation (one stream per device, reused across calls)
-- ``perform_ring_iteration``: Blocking single step of ring communication
-- ``perform_ring_iteration_async``: Non-blocking variant returning work handles
-  for overlapping communication with computation
+- ``perform_ring_iteration_funcol``: Ring step via functional collectives; the
+  preferred primitive. Overlap comes from issuing the shift before the local
+  compute and calling ``finish_ring_iteration`` after it -- no caller-managed
+  streams or work handles.
+- ``finish_ring_iteration``: Synchronization point for an in-flight funcol step
+- ``perform_ring_iteration``: Blocking single step over raw ``dist.*`` p2p/a2a
+  (legacy; kept until funcol benchmark parity is confirmed)
+- ``perform_ring_iteration_async``: Non-blocking ``dist.*`` variant returning
+  work handles (legacy, requires caller-managed streams)
+- ``get_comm_stream``: Cached CUDA stream accessor (legacy overlap machinery)
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 from torch.distributed.device_mesh import DeviceMesh
 
 
@@ -267,6 +274,81 @@ def perform_ring_iteration(
         dist.all_to_all(all_to_all_recv, all_to_all_send, group=local_group)
 
     return tensor_recv
+
+
+def perform_ring_iteration_funcol(
+    tensor: torch.Tensor,
+    mesh: DeviceMesh,
+    ring_config: RingPassingConfig,
+    recv_shape: torch.Size | None = None,
+    wait: bool = True,
+) -> torch.Tensor:
+    r"""Single ring step via functional collectives -- no streams, no work handles.
+
+    The shift is an ``all_to_all_single`` whose split sizes are zero everywhere
+    except the send/recv neighbor slots. Functional collectives are issued
+    asynchronously on the communicator's internal stream, so overlap with
+    compute comes from *when the result is waited on*, not from caller-managed
+    CUDA streams: issue the shift before the local compute and wait after it.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        The tensor to send to the next rank in the ring.
+    mesh : DeviceMesh
+        Device mesh that defines the distributed process group.
+    ring_config : RingPassingConfig
+        Configuration for the ring communication pattern.
+    recv_shape : torch.Size | None, optional
+        Shape of the incoming tensor (shards may be uneven). If ``None``,
+        assumes the same shape as ``tensor``.
+    wait : bool, optional
+        If ``True`` (default), wait and return the reshaped received tensor --
+        a drop-in replacement for ``perform_ring_iteration``. If ``False``,
+        return the *flat* unwaited tensor; complete it later with
+        ``finish_ring_iteration``.
+
+    Returns
+    -------
+    torch.Tensor
+        The received tensor (``wait=True``), or the flat in-flight tensor
+        (``wait=False``).
+    """
+    local_group, local_size, local_id_for_send, local_id_for_recv, _, _ = (
+        _get_ring_comm_ranks(mesh, ring_config)
+    )
+
+    if recv_shape is None:
+        recv_shape = tensor.shape
+
+    input_split_sizes = [0] * local_size
+    output_split_sizes = [0] * local_size
+    input_split_sizes[local_id_for_send] = tensor.numel()
+    output_split_sizes[local_id_for_recv] = math.prod(recv_shape)
+
+    flat_recv = funcol.all_to_all_single(
+        tensor.contiguous().reshape(-1),
+        output_split_sizes,
+        input_split_sizes,
+        local_group,
+    )
+
+    if wait:
+        return finish_ring_iteration(flat_recv, recv_shape)
+    return flat_recv
+
+
+def finish_ring_iteration(
+    flat_recv: torch.Tensor,
+    recv_shape: torch.Size,
+) -> torch.Tensor:
+    r"""Complete an in-flight ring step started with ``wait=False``.
+
+    Waits on the functional collective and reshapes the flat buffer to
+    ``recv_shape``. This is the synchronization point: place it after the
+    compute that should overlap the communication.
+    """
+    return funcol.wait_tensor(flat_recv).reshape(recv_shape)
 
 
 def perform_ring_iteration_async(

@@ -747,6 +747,33 @@ def radius_search(
         The formatted radius search results, whose contents depend on
         ``return_dists`` and ``return_points``.
     """
+    if hasattr(points, "_spec") or hasattr(queries, "_spec"):
+        return _radius_search_sharded(
+            points, queries, radius, max_points, return_dists, return_points
+        )
+    indices, points_out, distances, _ = radius_search_impl(
+        points, queries, radius, max_points, return_dists, return_points
+    )
+    return format_returns(indices, points_out, distances, return_dists, return_points)
+
+
+@torch.compiler.disable(recursive=True)
+def _radius_search_sharded(
+    points: torch.Tensor,
+    queries: torch.Tensor,
+    radius: float,
+    max_points: int | None,
+    return_dists: bool,
+    return_points: bool,
+):
+    """Eager-only radius search for distributed (``ShardTensor``) inputs.
+
+    Under ``torch.compile``, dynamo fake-propagates ``radius_search_impl``
+    directly, bypassing the ``ShardTensor.__torch_function__`` handler that
+    routes to the ring/ringless sharded implementations. Running the call
+    eagerly (as a graph-break region) restores the handler dispatch; the
+    surrounding model stays compiled.
+    """
     indices, points_out, distances, _ = radius_search_impl(
         points, queries, radius, max_points, return_dists, return_points
     )

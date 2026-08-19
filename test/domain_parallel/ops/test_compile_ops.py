@@ -192,6 +192,23 @@ class SDPAWrapper(torch.nn.Module):
         return torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
 
+class BallQueryWrapper(torch.nn.Module):
+    r"""``radius_search`` on sharded points/queries (exercises RingBallQuery).
+
+    Sums the neighbor points so the module returns a single tensor for the
+    harness. Sharded inputs route to the eager graph-break twin inside
+    ``radius_search``; plain inputs trace through the custom op's fake impl.
+    """
+
+    def forward(self, points: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+        from physicsnemo.nn.functional import radius_search
+
+        _, neighbor_points = radius_search(
+            points, queries, radius=0.5, max_points=8, return_points=True
+        )
+        return neighbor_points.sum(dim=-2)
+
+
 class GradReducerWrapper(torch.nn.Module):
     r"""``GradReducer.apply(tensor, spec)`` (exercises ``GradReducer``).
 
@@ -545,39 +562,24 @@ def test_compile_partial_group_norm_1d(distributed_mesh):
     _run_compile_fwd_bwd(module, [sharded])
 
 
-# Note: ``test_compile_ring_sdpa_1d`` (smoke-test that compile around sharded
-# SDPA succeeds) was removed because the overlap variant's ``record_stream``
-# call cannot survive AOTAutograd functionalization, and the
-# ``@torch.compiler.disable`` on ``ring_sdpa`` only suppresses dynamo's
-# tracing of the body, not AOT's later re-execution of the captured FX
-# graph (which re-enters via ``ShardTensor.__torch_function__`` on the
-# captured SDPA node and trips ``record_stream``). Re-enabling compile of
-# sharded SDPA requires a separate refactor (drop ``record_stream``, switch
-# ``perform_ring_iteration`` to functional p2p collectives, etc.). The
-# limitation is documented in ``ring_sdpa``'s docstring in
-# ``shard_utils/attention_patches.py``. The eager path is fully covered by
-# ``test_sdpa.py`` and ``test_ring_sdpa_overlap.py``.
-
-
 @pytest.mark.multigpu_static
-@pytest.mark.timeout(60)
-def test_compile_ring_sdpa_fullgraph_errors(distributed_mesh):
-    r"""Regression guard: ``torch.compile`` around sharded ring SDPA must error.
+@pytest.mark.timeout(120)
+def test_compile_ring_sdpa_graph_break(distributed_mesh):
+    r"""``torch.compile`` around sharded ring SDPA succeeds and matches eager.
 
-    Today compile around sharded SDPA fails at AOT functionalization of
-    ``aten::record_stream`` (an alias-annotated op called inside the
-    overlap variant). The exact exception type varies between PyTorch
-    versions, but it is *some* ``Exception``. We assert that, so if a
-    future refactor accidentally makes compile silently "succeed" without
-    actually wiring up a functional-collective ring (the only way it can
-    be correct under AOT), this test starts failing and forces us to
-    re-evaluate.
+    The ring is a functional-collective implementation with no streams,
+    events, or ``record_stream``, and ``ring_sdpa`` carries
+    ``@torch.compiler.disable`` so it runs as an eager graph-break region
+    inside the compiled module (dynamo does not route ops through the
+    ``ShardTensor`` handler table, so tracing it would bypass the ring).
+    ``fullgraph=False`` is therefore required and correct here.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
     dm = DistributedManager()
     batch_size, num_heads, seq_len, head_dim = 1, 4, 128, 32
+    torch.manual_seed(7)
     q = torch.randn(
         batch_size, num_heads, seq_len, head_dim, device=dm.device, requires_grad=True
     )
@@ -592,8 +594,58 @@ def test_compile_ring_sdpa_fullgraph_errors(distributed_mesh):
     k_s = scatter_tensor(k, 0, distributed_mesh, (Shard(2),), requires_grad=True)
     v_s = scatter_tensor(v, 0, distributed_mesh, (Shard(2),), requires_grad=True)
 
-    with pytest.raises(Exception, match=r"record_stream|functionaliz"):
-        _run_compile_fwd_bwd(SDPAWrapper(), [q_s, k_s, v_s], fullgraph=True)
+    eager_out = SDPAWrapper()(q_s, k_s, v_s)
+    compiled_out = _run_compile_fwd_bwd(SDPAWrapper(), [q_s, k_s, v_s], fullgraph=False)
+
+    assert type(compiled_out) is type(eager_out)
+    torch.testing.assert_close(
+        compiled_out.to_local(),
+        eager_out.to_local(),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.skip(
+    reason="Known bug: fakeifying a ShardTensor whose _local_tensor has a "
+    "nonzero storage offset crashes torch's meta-converter (rank-asymmetric, "
+    "so a 2-rank run deadlocks). DTensor with the identical local fakeifies "
+    "fine -- ShardTensor-side fix pending. See repro_fakeify.py."
+)
+@pytest.mark.multigpu_static
+@pytest.mark.timeout(120)
+def test_compile_ring_ball_query_graph_break(distributed_mesh):
+    r"""``torch.compile`` around sharded ball query succeeds and matches eager.
+
+    Sharded inputs route to the ``@torch.compiler.disable`` twin inside
+    ``radius_search`` (an eager graph-break region), restoring the
+    ``ShardTensor`` handler dispatch that dynamo's fake propagation would
+    otherwise bypass (it used to crash on the Warp kernel's data-pointer
+    access). Forward-only: the ring ball query has no backward patch.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    dm = DistributedManager()
+    torch.manual_seed(11)
+    points = torch.randn(1, 512, 3, device=dm.device)
+    queries = torch.randn(1, 256, 3, device=dm.device)
+
+    points_s = scatter_tensor(points, 0, distributed_mesh, (Shard(1),))
+    queries_s = scatter_tensor(queries, 0, distributed_mesh, (Shard(1),))
+
+    eager_out = BallQueryWrapper()(points_s, queries_s)
+    compiled_out = _run_compile_fwd_bwd(
+        BallQueryWrapper(), [points_s, queries_s], backward=False, fullgraph=False
+    )
+
+    assert type(compiled_out) is type(eager_out)
+    torch.testing.assert_close(
+        compiled_out.to_local(),
+        eager_out.to_local(),
+        atol=0,
+        rtol=0,
+    )
 
 
 @pytest.mark.multigpu_static
