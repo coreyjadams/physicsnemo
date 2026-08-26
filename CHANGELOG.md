@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Adds an optional-dependency gate for the
+  [physicsnemo-ops](https://github.com/NVIDIA/physicsnemo-ops) accelerated
+  kernels (`physicsnemo.utils._physicsnemo_ops`). The gate resolves the
+  import once, applies a measured device/compile policy (CUDA eager uses the
+  kernels; CPU and `torch.compile` regions keep the pure-torch paths), and
+  exposes two environment switches: `PHYSICSNEMO_DISABLE_PHYSICSNEMO_OPS=1`
+  disables the accelerated paths entirely and
+  `PHYSICSNEMO_PHYSICSNEMO_OPS_CPU=1` opts CPU tensors in. Without the
+  package installed nothing changes.
 - Adds `ShardTensor` support for GeoTransolver and FLARE models.
 - Adds zarr save/load for `Mesh` and `DomainMesh` via tensordict's zarr
   storage backend: `physicsnemo.mesh.io.to_zarr` / `from_zarr`, with
