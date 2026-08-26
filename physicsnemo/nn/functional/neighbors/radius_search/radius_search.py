@@ -14,11 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Literal
+
 import torch
 from jaxtyping import Float
 
 from physicsnemo.core.function_spec import FunctionSpec
 
+from ._physicsnemo_ops_impl import radius_search as radius_search_physicsnemo_ops
+from ._physicsnemo_ops_impl import radius_search_eligible
 from ._torch_impl import radius_search as radius_search_torch
 from ._warp_impl import radius_search as radius_search_warp
 
@@ -101,7 +105,23 @@ class RadiusSearch(FunctionSpec):
         ("batched-bwd-b4-p1024-q512-r0p1-m32", 4, 1024, 512, 0.1, 32),
     )
 
-    @FunctionSpec.register(name="warp", required_imports=("warp>=0.6.0",), rank=0)
+    @FunctionSpec.register(
+        name="physicsnemo_ops", required_imports=("physicsnemo_ops",), rank=0
+    )
+    def physicsnemo_ops_forward(
+        points: Float[torch.Tensor, "*batch num_points 3"],
+        queries: Float[torch.Tensor, "*batch num_queries 3"],
+        radius: float,
+        max_points: int | None = None,
+        return_dists: bool = False,
+        return_points: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        """Compact-spatial-cell radius search (fixed-shape mode only)."""
+        return radius_search_physicsnemo_ops(
+            points, queries, radius, max_points, return_dists, return_points
+        )
+
+    @FunctionSpec.register(name="warp", required_imports=("warp>=0.6.0",), rank=1)
     def warp_forward(
         points: Float[torch.Tensor, "*batch num_points 3"],
         queries: Float[torch.Tensor, "*batch num_queries 3"],
@@ -115,7 +135,7 @@ class RadiusSearch(FunctionSpec):
             points, queries, radius, max_points, return_dists, return_points
         )
 
-    @FunctionSpec.register(name="torch", rank=1, baseline=True)
+    @FunctionSpec.register(name="torch", rank=2, baseline=True)
     def torch_forward(
         points: Float[torch.Tensor, "*batch num_points 3"],
         queries: Float[torch.Tensor, "*batch num_queries 3"],
@@ -262,6 +282,54 @@ class RadiusSearch(FunctionSpec):
     def compare_backward(cls, output: torch.Tensor, reference: torch.Tensor) -> None:
         """Element-wise comparison of two backward-pass gradient tensors."""
         torch.testing.assert_close(output, reference, atol=1e-5, rtol=1e-5)
+
+    @classmethod
+    def dispatch(
+        cls,
+        points: Float[torch.Tensor, "*batch num_points 3"],
+        queries: Float[torch.Tensor, "*batch num_queries 3"],
+        radius: float,
+        max_points: int | None = None,
+        return_dists: bool = False,
+        return_points: bool = False,
+        implementation: Literal["physicsnemo_ops", "warp", "torch"] | None = None,
+    ) -> tuple[torch.Tensor, ...] | torch.Tensor:
+        """Select and run a radius-search backend by explicit name or policy."""
+        # Lookup the implementation registry for this FunctionSpec.
+        impls = cls._get_impls()
+
+        # Check if the implementation is registered.
+        cls._check_impl(implementation, impls)
+
+        # If a specific implementation is requested, validate and call it.
+        if implementation is not None:
+            impl = impls[implementation]
+            if not impl.available:
+                raise ImportError(
+                    f"Implementation '{implementation}' is not available for {cls.__name__}"
+                )
+            return impl.func(
+                points, queries, radius, max_points, return_dists, return_points
+            )
+
+        # Auto-select: the physicsnemo_ops kernel serves only the fixed-shape
+        # mode (max_points set) with plain float32 CUDA tensors; everything
+        # else keeps the existing warp -> torch preference.
+        if points.is_cuda and radius_search_eligible(points, queries, max_points):
+            ops_impl = impls.get("physicsnemo_ops")
+            if ops_impl is not None and ops_impl.available:
+                return ops_impl.func(
+                    points, queries, radius, max_points, return_dists, return_points
+                )
+
+        preferred = impls.get("warp")
+        impl = preferred if preferred is not None and preferred.available else None
+        if impl is None:
+            impl = impls["torch"]
+            cls._warn_fallback(preferred, impl)
+        return impl.func(
+            points, queries, radius, max_points, return_dists, return_points
+        )
 
 
 radius_search = RadiusSearch.make_function("radius_search")

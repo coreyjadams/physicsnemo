@@ -643,3 +643,119 @@ def test_radius_search_batched_opcheck(device: str):
         radius_search_warp,
         args=(points, queries, 1.5, 8, True, True),
     )
+
+
+# Validate the physicsnemo_ops implementation (fixed-shape mode only).
+def _physicsnemo_ops_available() -> bool:
+    try:
+        import physicsnemo_ops.torch  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.parametrize("return_dists", [True, False])
+@pytest.mark.parametrize("return_points", [True, False])
+def test_radius_search_physicsnemo_ops(
+    device: str,
+    return_dists: bool,
+    return_points: bool,
+):
+    if not _physicsnemo_ops_available():
+        pytest.skip("physicsnemo_ops not available")
+    points, queries = _build_problem(device)
+    radius = 0.17
+    max_points = 5
+    results = radius_search(
+        points=points,
+        queries=queries,
+        radius=radius,
+        max_points=max_points,
+        return_dists=return_dists,
+        return_points=return_points,
+        implementation="physicsnemo_ops",
+    )
+    _assert_radius_outputs(
+        points,
+        queries,
+        radius,
+        max_points,
+        return_dists,
+        return_points,
+        results,
+    )
+
+
+def test_radius_search_physicsnemo_ops_parity_untruncated(device: str):
+    if not _physicsnemo_ops_available():
+        pytest.skip("physicsnemo_ops not available")
+    points, queries = _build_problem(device)
+    radius = 0.17
+    # Generous cap: no truncation, so per-query aggregates must agree exactly
+    # (neighbor ordering is unspecified across backends).
+    max_points = points.shape[0]
+    out = radius_search(
+        points,
+        queries,
+        radius,
+        max_points=max_points,
+        return_dists=True,
+        implementation="physicsnemo_ops",
+    )
+    ref = radius_search(
+        points,
+        queries,
+        radius,
+        max_points=max_points,
+        return_dists=True,
+        implementation="torch",
+    )
+    torch.testing.assert_close((out[1] > 0).sum(-1), (ref[1] > 0).sum(-1))
+    torch.testing.assert_close(out[1].sum(-1), ref[1].sum(-1), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out[0].sum(-1), ref[0].sum(-1))
+
+
+def test_radius_search_physicsnemo_ops_requires_max_points(device: str):
+    if not _physicsnemo_ops_available():
+        pytest.skip("physicsnemo_ops not available")
+    points, queries = _build_problem(device)
+    with pytest.raises(ValueError, match="max_points"):
+        radius_search(points, queries, 0.17, implementation="physicsnemo_ops")
+
+
+@pytest.mark.parametrize("precision", [torch.bfloat16, torch.float16, torch.float32])
+def test_radius_search_physicsnemo_ops_reduced_precision(device: str, precision):
+    if not _physicsnemo_ops_available():
+        pytest.skip("physicsnemo_ops not available")
+    points, queries = _build_problem(device)
+    points = points.to(precision)
+    queries = queries.to(precision)
+    radius = 0.17
+    max_points = points.shape[0]  # untruncated -> aggregates comparable
+    out = radius_search(
+        points,
+        queries,
+        radius,
+        max_points=max_points,
+        return_dists=True,
+        return_points=True,
+        implementation="physicsnemo_ops",
+    )
+    ref = radius_search(
+        points.float(),
+        queries.float(),
+        radius,
+        max_points=max_points,
+        return_dists=True,
+        implementation="torch",
+    )
+    indices, pts, dists = out
+    # Outputs keep the input dtype (warp-backend contract).
+    assert pts.dtype == precision and dists.dtype == precision
+    # Neighbor counts must match the float32 torch reference exactly up to
+    # boundary points whose rounded distance straddles the radius.
+    count_out = (dists > 0).sum(-1)
+    count_ref = (ref[1] > 0).sum(-1)
+    tol = 0 if precision == torch.float32 else 3
+    assert (count_out - count_ref).abs().max() <= tol

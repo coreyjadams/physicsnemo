@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disables the accelerated paths entirely and
   `PHYSICSNEMO_PHYSICSNEMO_OPS_CPU=1` opts CPU tensors in. Without the
   package installed nothing changes.
+- Adds physicsnemo-ops backends for `physicsnemo.nn.functional.knn` and
+  `radius_search`, registered as rank-0 `FunctionSpec` implementations with
+  constraint-guarded auto-dispatch (CUDA, fixed-shape mode; explicit
+  `implementation="physicsnemo_ops"` works everywhere). Reduced-precision
+  inputs (bf16/f16) are cast-restored around the kernel, matching the warp
+  backend's contract. At GeoTransolver's multi-scale ball-query shapes on
+  DrivAerML geometry the kernel is 4-16x faster than the warp backend,
+  which translates to ~1.8x faster end-to-end GeoTransolver training steps
+  in the unified external aerodynamics recipe with no recipe changes.
 - Adds `ShardTensor` support for GeoTransolver and FLARE models.
 - Adds zarr save/load for `Mesh` and `DomainMesh` via tensordict's zarr
   storage backend: `physicsnemo.mesh.io.to_zarr` / `from_zarr`, with

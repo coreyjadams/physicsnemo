@@ -22,6 +22,8 @@ from jaxtyping import Float, Int
 from physicsnemo.core.function_spec import FunctionSpec
 
 from ._cuml_impl import knn_impl as knn_cuml
+from ._physicsnemo_ops_impl import knn_eligible
+from ._physicsnemo_ops_impl import knn_impl as knn_physicsnemo_ops
 from ._scipy_impl import knn_impl as knn_scipy
 from ._torch_impl import knn_impl as knn_torch
 
@@ -41,10 +43,12 @@ class KNN(FunctionSpec):
         Tensor of shape (M, D) containing the points to search for.
     k : int
         Number of nearest neighbors to return for each query point.
-    implementation : {"cuml", "torch", "scipy"} or None
+    implementation : {"physicsnemo_ops", "cuml", "torch", "scipy"} or None
         Implementation to use for the search. When ``None``, the preferred
         implementation for the input device is selected and falls back to
-        torch when unavailable.
+        torch when unavailable. On CUDA, float32 ``(N, 3)`` inputs with
+        ``k <= 32`` prefer the exact ``physicsnemo_ops`` kernel when the
+        optional ``physicsnemo-ops`` package is installed.
 
     Returns
     -------
@@ -63,7 +67,20 @@ class KNN(FunctionSpec):
     )
 
     @FunctionSpec.register(
-        name="cuml", required_imports=("cuml>=26.2.0", "cupy>=13.6.0"), rank=0
+        name="physicsnemo_ops", required_imports=("physicsnemo_ops",), rank=0
+    )
+    def physicsnemo_ops_forward(
+        points: Float[torch.Tensor, "num_points dim"],
+        queries: Float[torch.Tensor, "num_queries dim"],
+        k: int,
+    ) -> tuple[
+        Int[torch.Tensor, "num_queries k"], Float[torch.Tensor, "num_queries k"]
+    ]:
+        """Exact kNN via the physicsnemo-ops compact-cell-grid kernel."""
+        return knn_physicsnemo_ops(points, queries, k)
+
+    @FunctionSpec.register(
+        name="cuml", required_imports=("cuml>=26.2.0", "cupy>=13.6.0"), rank=1
     )
     def cuml_forward(
         points: Float[torch.Tensor, "num_points dim"],
@@ -72,9 +89,10 @@ class KNN(FunctionSpec):
     ) -> tuple[
         Int[torch.Tensor, "num_queries k"], Float[torch.Tensor, "num_queries k"]
     ]:
+        """kNN via RAPIDS cuML nearest neighbors (CUDA)."""
         return knn_cuml(points, queries, k)
 
-    @FunctionSpec.register(name="scipy", required_imports=("scipy>=1.7.0",), rank=1)
+    @FunctionSpec.register(name="scipy", required_imports=("scipy>=1.7.0",), rank=2)
     def scipy_forward(
         points: Float[torch.Tensor, "num_points dim"],
         queries: Float[torch.Tensor, "num_queries dim"],
@@ -82,9 +100,10 @@ class KNN(FunctionSpec):
     ) -> tuple[
         Int[torch.Tensor, "num_queries k"], Float[torch.Tensor, "num_queries k"]
     ]:
+        """kNN via SciPy KDTree (CPU)."""
         return knn_scipy(points, queries, k)
 
-    @FunctionSpec.register(name="torch", rank=2, baseline=True)
+    @FunctionSpec.register(name="torch", rank=3, baseline=True)
     def torch_forward(
         points: Float[torch.Tensor, "num_points dim"],
         queries: Float[torch.Tensor, "num_queries dim"],
@@ -92,10 +111,12 @@ class KNN(FunctionSpec):
     ) -> tuple[
         Int[torch.Tensor, "num_queries k"], Float[torch.Tensor, "num_queries k"]
     ]:
+        """Brute-force kNN in pure torch (baseline)."""
         return knn_torch(points, queries, k)
 
     @classmethod
     def make_inputs_forward(cls, device: torch.device | str = "cpu"):
+        """Yield ``(label, args, kwargs)`` benchmark cases for the forward pass."""
         device = torch.device(device)
         for label, num_points, num_queries, k in cls._BENCHMARK_CASES:
             points = torch.rand(num_points, 3, device=device)
@@ -112,6 +133,7 @@ class KNN(FunctionSpec):
         output: tuple[torch.Tensor, torch.Tensor],
         reference: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
+        """Order-invariant comparison of two kNN outputs (distances only)."""
         # Neighbor ordering can differ for equal-distance ties across backends.
         _, distances = output
         _, reference_distances = reference
@@ -128,10 +150,12 @@ class KNN(FunctionSpec):
         points: Float[torch.Tensor, "num_points dim"],
         queries: Float[torch.Tensor, "num_queries dim"],
         k: int,
-        implementation: Literal["cuml", "torch", "scipy"] | None = None,
+        implementation: Literal["physicsnemo_ops", "cuml", "torch", "scipy"]
+        | None = None,
     ) -> tuple[
         Int[torch.Tensor, "num_queries k"], Float[torch.Tensor, "num_queries k"]
     ]:
+        """Select and run a kNN backend by explicit name or device policy."""
         # Lookup the implementation registry for this FunctionSpec.
         impls = cls._get_impls()
 
@@ -151,6 +175,14 @@ class KNN(FunctionSpec):
 
             # Execute the implementation.
             return impl.func(points, queries, k)
+
+        # Auto-select: prefer the exact physicsnemo_ops kernel on CUDA when the
+        # call fits its constraints (f32, (N, 3), k <= 32, no grad). The CPU
+        # kernel is brute-force, so CPU auto-dispatch keeps preferring SciPy.
+        if points.is_cuda and knn_eligible(points, queries, k):
+            ops_impl = impls.get("physicsnemo_ops")
+            if ops_impl is not None and ops_impl.available:
+                return ops_impl.func(points, queries, k)
 
         # Otherwise, auto-select an implementation based on device and availability.
         # Prefer cuML on CUDA and SciPy on CPU when auto-selecting.

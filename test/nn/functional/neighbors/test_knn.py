@@ -239,3 +239,58 @@ def test_knn_error_handling(device: str):
     if "cuda" in device and check_version_spec("scipy", "1.7.0", hard_fail=False):
         with pytest.raises(ValueError, match="does not support CUDA"):
             knn(points, queries, k=3, implementation="scipy")
+
+
+# Validate the physicsnemo_ops implementation when available.
+def _physicsnemo_ops_available() -> bool:
+    try:
+        import physicsnemo_ops.torch  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.parametrize("k", [1, 4, 32])
+def test_knn_physicsnemo_ops_impl(device: str, k: int):
+    if not _physicsnemo_ops_available():
+        pytest.skip("physicsnemo_ops not available")
+    points, queries = _build_problem(device, torch.float32)
+    indices, distances = knn(points, queries, k=k, implementation="physicsnemo_ops")
+    _assert_knn_outputs(points, queries, indices, distances, k)
+
+    # Distances must match the torch baseline (order-invariant per query).
+    _, ref_distances = knn(points, queries, k=k, implementation="torch")
+    torch.testing.assert_close(
+        torch.sort(distances, dim=1)[0],
+        torch.sort(ref_distances, dim=1)[0],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_knn_auto_dispatch_uses_physicsnemo_ops_on_cuda(device: str, monkeypatch):
+    if "cuda" not in device:
+        pytest.skip("CUDA-only auto-dispatch test")
+    if not _physicsnemo_ops_available():
+        pytest.skip("physicsnemo_ops not available")
+    points, queries = _build_problem(device, torch.float32)
+
+    import importlib
+
+    knn_module = importlib.import_module("physicsnemo.nn.functional.neighbors.knn.knn")
+
+    called = {}
+    original = knn_module.knn_physicsnemo_ops
+
+    def spy(*args, **kwargs):
+        called["hit"] = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(knn_module, "knn_physicsnemo_ops", spy)
+    knn(points, queries, k=3)
+    assert called.get("hit"), "auto-dispatch should route to physicsnemo_ops on CUDA"
+
+    # Constraint violations (k > 32) must fall back without error.
+    indices, distances = knn(points, queries, k=33)
+    assert indices.shape == (queries.shape[0], 33)
