@@ -20,6 +20,8 @@ import math
 
 import torch
 
+from physicsnemo.utils._physicsnemo_ops import int_rows_ok, physicsnemo_ops_for
+
 
 def _packed_tuple_capacity_fits(index_bound: int, n_columns: int) -> bool:
     """Return whether ``index_bound**n_columns`` safely fits in signed int64."""
@@ -80,6 +82,19 @@ def unique_index_tuples(
             dim=0,
             return_inverse=return_inverse,
             return_counts=return_counts,
+        )
+
+    ### Accelerated path: hash-table dedup from physicsnemo_ops. Bit-exact
+    ### parity with torch.unique(dim=0) (sorted rows, int64 inverse/counts).
+    ops = physicsnemo_ops_for(rows)
+    if ops is not None and int_rows_ok(rows, index_bound):
+        return ops.unique_rows(
+            rows.contiguous(),
+            index_bound,
+            sorted=True,
+            return_inverse=return_inverse,
+            return_counts=return_counts,
+            trim=True,
         )
 
     rows_i64 = rows.to(dtype=torch.int64)

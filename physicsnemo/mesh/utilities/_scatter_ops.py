@@ -25,6 +25,211 @@ import torch
 from jaxtyping import Float, Int, Shaped
 
 from physicsnemo.mesh.utilities._tolerances import safe_eps
+from physicsnemo.utils._physicsnemo_ops import (
+    csr_cmp_dtype_ok,
+    csr_mean_dtype_ok,
+    csr_sum_dtype_ok,
+    physicsnemo_ops_for,
+    segment_cmp_dtype_ok,
+    segment_sum_dtype_ok,
+)
+
+
+def scatter_sum_coo(
+    src: Shaped[torch.Tensor, "n_src ..."],
+    index: Int[torch.Tensor, " n_src"],
+    n_dst: int,
+    *,
+    init: Shaped[torch.Tensor, "n_dst ..."] | None = None,
+) -> Shaped[torch.Tensor, "n_dst ..."]:
+    """Segmented sum: ``out[j] = init[j] + sum(src[i] for index[i] == j)``.
+
+    Drop-in for the ``zeros().scatter_add_`` pattern, accelerated by the
+    optional ``physicsnemo_ops.segment_sum`` kernel (autograd-capable,
+    including double backward). Falls back to ``torch.scatter_add_``.
+    """
+    ops = physicsnemo_ops_for(src)
+    if (
+        ops is not None
+        and src.shape[0] > 0
+        and not src.is_complex()
+        and segment_sum_dtype_ok(src)
+        and index.dtype in (torch.int32, torch.int64)
+        and (init is None or init.dtype == src.dtype)
+    ):
+        return ops.segment_sum(src.contiguous(), index.contiguous(), n_dst, init)
+
+    if init is not None:
+        out = init.clone()
+    else:
+        out = torch.zeros((n_dst, *src.shape[1:]), dtype=src.dtype, device=src.device)
+    if src.shape[0] == 0:
+        return out
+    expanded_index = index.view(-1, *([1] * (src.ndim - 1))).expand_as(src)
+    return out.scatter_add(0, expanded_index.long(), src)
+
+
+def _scatter_cmp_coo(
+    src: Shaped[torch.Tensor, "n_src ..."],
+    index: Int[torch.Tensor, " n_src"],
+    n_dst: int,
+    init: Shaped[torch.Tensor, "n_dst ..."],
+    reduce: str,
+) -> Shaped[torch.Tensor, "n_dst ..."]:
+    ops = physicsnemo_ops_for(src)
+    if (
+        ops is not None
+        and src.shape[0] > 0
+        and segment_cmp_dtype_ok(src)
+        and index.dtype in (torch.int32, torch.int64)
+        and init.dtype == src.dtype
+        and not src.requires_grad
+        and not init.requires_grad
+    ):
+        op = ops.segment_min if reduce == "amin" else ops.segment_max
+        return op(src.contiguous(), index.contiguous(), n_dst, init.contiguous())
+
+    out = init.clone()
+    if src.shape[0] == 0:
+        return out
+    expanded_index = index.view(-1, *([1] * (src.ndim - 1))).expand_as(src)
+    return out.scatter_reduce_(
+        0, expanded_index.long(), src, reduce=reduce, include_self=True
+    )
+
+
+def scatter_min_coo(
+    src: Shaped[torch.Tensor, "n_src ..."],
+    index: Int[torch.Tensor, " n_src"],
+    n_dst: int,
+    *,
+    init: Shaped[torch.Tensor, "n_dst ..."],
+) -> Shaped[torch.Tensor, "n_dst ..."]:
+    """Segmented min with include-self semantics: destinations that receive no
+    source keep ``init``. No autograd (index-producing/label use only)."""
+    return _scatter_cmp_coo(src, index, n_dst, init, "amin")
+
+
+def scatter_max_coo(
+    src: Shaped[torch.Tensor, "n_src ..."],
+    index: Int[torch.Tensor, " n_src"],
+    n_dst: int,
+    *,
+    init: Shaped[torch.Tensor, "n_dst ..."],
+) -> Shaped[torch.Tensor, "n_dst ..."]:
+    """Segmented max with include-self semantics (see :func:`scatter_min_coo`)."""
+    return _scatter_cmp_coo(src, index, n_dst, init, "amax")
+
+
+def _csr_segment_ids(
+    offsets: Int[torch.Tensor, " n_segments_plus_1"],
+    n_elements: int,
+) -> Int[torch.Tensor, " n_elements"]:
+    """Expand CSR offsets to per-element segment ids (fallback path helper)."""
+    n_segments = offsets.shape[0] - 1
+    return torch.repeat_interleave(
+        torch.arange(n_segments, device=offsets.device),
+        offsets.diff(),
+        output_size=n_elements,
+    )
+
+
+def segment_sum_csr(
+    values: Shaped[torch.Tensor, "n_elements ..."],
+    offsets: Int[torch.Tensor, " n_segments_plus_1"],
+) -> Shaped[torch.Tensor, "n_segments ..."]:
+    """CSR segmented sum; empty segments are 0. Deterministic on the
+    accelerated path; autograd-capable on both paths."""
+    ops = physicsnemo_ops_for(values)
+    if (
+        ops is not None
+        and values.shape[0] > 0
+        and not values.is_complex()
+        and csr_sum_dtype_ok(values)
+        and offsets.dtype in (torch.int32, torch.int64)
+    ):
+        return ops.segment_sum_csr(values.contiguous(), offsets.contiguous())
+
+    n_segments = offsets.shape[0] - 1
+    out = torch.zeros(
+        (n_segments, *values.shape[1:]), dtype=values.dtype, device=values.device
+    )
+    if values.shape[0] == 0:
+        return out
+    seg_ids = _csr_segment_ids(offsets, values.shape[0])
+    expanded = seg_ids.view(-1, *([1] * (values.ndim - 1))).expand_as(values)
+    return out.scatter_add(0, expanded, values)
+
+
+def segment_mean_csr(
+    values: Float[torch.Tensor, "n_elements ..."],
+    offsets: Int[torch.Tensor, " n_segments_plus_1"],
+) -> Float[torch.Tensor, "n_segments ..."]:
+    """CSR segmented mean; empty segments are 0. Autograd-capable."""
+    ops = physicsnemo_ops_for(values)
+    if (
+        ops is not None
+        and values.shape[0] > 0
+        and not values.is_complex()
+        and csr_mean_dtype_ok(values)
+        and offsets.dtype in (torch.int32, torch.int64)
+    ):
+        return ops.segment_mean_csr(values.contiguous(), offsets.contiguous())
+
+    sums = segment_sum_csr(values, offsets)
+    counts = offsets.diff().clamp_min(1)
+    return sums / counts.view(-1, *([1] * (values.ndim - 1))).to(sums.dtype)
+
+
+def _segment_cmp_csr(
+    values: Shaped[torch.Tensor, "n_elements ..."],
+    offsets: Int[torch.Tensor, " n_segments_plus_1"],
+    reduce: str,
+) -> Shaped[torch.Tensor, "n_segments ..."]:
+    ops = physicsnemo_ops_for(values)
+    if (
+        ops is not None
+        and values.shape[0] > 0
+        and csr_cmp_dtype_ok(values)
+        and offsets.dtype in (torch.int32, torch.int64)
+        and not values.requires_grad
+    ):
+        op = ops.segment_min_csr if reduce == "amin" else ops.segment_max_csr
+        return op(values.contiguous(), offsets.contiguous())
+
+    n_segments = offsets.shape[0] - 1
+    fill = float("inf") if reduce == "amin" else float("-inf")
+    if not values.is_floating_point():
+        info = torch.iinfo(values.dtype)
+        fill = info.max if reduce == "amin" else info.min
+    out = torch.full(
+        (n_segments, *values.shape[1:]), fill, dtype=values.dtype, device=values.device
+    )
+    counts = offsets.diff()
+    if values.shape[0] > 0:
+        seg_ids = _csr_segment_ids(offsets, values.shape[0])
+        expanded = seg_ids.view(-1, *([1] * (values.ndim - 1))).expand_as(values)
+        out.scatter_reduce_(0, expanded, values, reduce=reduce, include_self=True)
+    ### Empty segments are defined to be 0 (torch_scatter.segment_csr parity,
+    ### matching the physicsnemo_ops CSR kernels).
+    empty = (counts == 0).view(-1, *([1] * (values.ndim - 1)))
+    return torch.where(empty, torch.zeros_like(out), out)
+
+
+def segment_min_csr(
+    values: Shaped[torch.Tensor, "n_elements ..."],
+    offsets: Int[torch.Tensor, " n_segments_plus_1"],
+) -> Shaped[torch.Tensor, "n_segments ..."]:
+    """CSR segmented min; empty segments are 0 (torch_scatter parity)."""
+    return _segment_cmp_csr(values, offsets, "amin")
+
+
+def segment_max_csr(
+    values: Shaped[torch.Tensor, "n_elements ..."],
+    offsets: Int[torch.Tensor, " n_segments_plus_1"],
+) -> Shaped[torch.Tensor, "n_segments ..."]:
+    """CSR segmented max; empty segments are 0 (torch_scatter parity)."""
+    return _segment_cmp_csr(values, offsets, "amax")
 
 
 def scatter_aggregate(
@@ -108,14 +313,9 @@ def scatter_aggregate(
     else:
         compute_dtype = dtype
 
-    ### Fast path: unweighted sum is a single scatter_add_ with no extra work
+    ### Fast path: unweighted sum is a single segmented sum with no extra work
     if weights is None and aggregation == "sum":
-        aggregated_data = torch.zeros((n_dst, *data_shape), dtype=dtype, device=device)
-        expanded_indices = src_to_dst_mapping.view(
-            -1, *([1] * len(data_shape))
-        ).expand_as(src_data)
-        aggregated_data.scatter_add_(dim=0, index=expanded_indices, src=src_data)
-        return aggregated_data
+        return scatter_sum_coo(src_data, src_to_dst_mapping, n_dst)
 
     ### Initialize weights if not provided
     if weights is None:
@@ -133,32 +333,12 @@ def scatter_aggregate(
     weighted_data = src_data.to(compute_dtype) * weights.view(weight_shape)
 
     ### Scatter-add weighted data to destinations
-    aggregated_data = torch.zeros(
-        (n_dst, *data_shape),
-        dtype=compute_dtype,
-        device=device,
-    )
-
-    # Expand src_to_dst_mapping to match data dimensions
-    expanded_indices = src_to_dst_mapping.view(-1, *([1] * len(data_shape))).expand_as(
-        weighted_data
-    )
-
-    aggregated_data.scatter_add_(
-        dim=0,
-        index=expanded_indices,
-        src=weighted_data,
-    )
+    aggregated_data = scatter_sum_coo(weighted_data, src_to_dst_mapping, n_dst)
 
     ### Normalize weighted sum to weighted mean
     if aggregation == "mean":
         ### Compute sum of weights at each destination
-        weight_sums = torch.zeros(n_dst, dtype=compute_dtype, device=device)
-        weight_sums.scatter_add_(
-            dim=0,
-            index=src_to_dst_mapping,
-            src=weights,
-        )
+        weight_sums = scatter_sum_coo(weights, src_to_dst_mapping, n_dst)
 
         ### Normalize by total weight (avoid division by zero)
         weight_sums = weight_sums.clamp(min=safe_eps(weight_sums.dtype))

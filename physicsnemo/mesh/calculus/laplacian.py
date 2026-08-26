@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING
 import torch
 from jaxtyping import Float, Int
 
+from physicsnemo.mesh.utilities._scatter_ops import scatter_sum_coo
 from physicsnemo.mesh.utilities._tolerances import safe_eps
 
 if TYPE_CHECKING:
@@ -90,45 +91,21 @@ def _apply_cotan_laplacian_operator(
     >>> scalar_field = torch.randn(4)
     >>> laplacian = _apply_cotan_laplacian_operator(n_points, edges, weights, scalar_field)
     """
-    ### Initialize output with same shape as data
-    device = data.device
-    if data.ndim == 1:
-        laplacian = torch.zeros(n_points, dtype=data.dtype, device=device)
-    else:
-        laplacian = torch.zeros_like(data)
-
     ### Extract vertex indices
     v0_indices = edges[:, 0]  # (n_edges,)
     v1_indices = edges[:, 1]  # (n_edges,)
 
-    ### Compute weighted differences
-    if data.ndim == 1:
-        # Scalar case
-        contrib_v0 = cotan_weights * (data[v1_indices] - data[v0_indices])
-        contrib_v1 = cotan_weights * (data[v0_indices] - data[v1_indices])
-        laplacian.scatter_add_(0, v0_indices, contrib_v0)
-        laplacian.scatter_add_(0, v1_indices, contrib_v1)
-    else:
-        # Multi-dimensional case (vectors, tensors)
-        # Broadcast weights to match data dimensions
-        weights_expanded = cotan_weights.view(-1, *([1] * (data.ndim - 1)))
-        contrib_v0 = weights_expanded * (data[v1_indices] - data[v0_indices])
-        contrib_v1 = weights_expanded * (data[v0_indices] - data[v1_indices])
+    ### Compute weighted differences and accumulate to both edge endpoints
+    # (the v1 contribution is the exact negation of the v0 contribution).
+    weights_expanded = cotan_weights.view(-1, *([1] * (data.ndim - 1)))
+    contrib_v0 = weights_expanded * (data[v1_indices] - data[v0_indices])
 
-        # Flatten for scatter_add
-        laplacian_flat = laplacian.reshape(n_points, -1)
-        contrib_v0_flat = contrib_v0.reshape(len(edges), -1)
-        contrib_v1_flat = contrib_v1.reshape(len(edges), -1)
-
-        v0_expanded = v0_indices.unsqueeze(-1).expand(-1, contrib_v0_flat.shape[1])
-        v1_expanded = v1_indices.unsqueeze(-1).expand(-1, contrib_v1_flat.shape[1])
-
-        laplacian_flat.scatter_add_(0, v0_expanded, contrib_v0_flat)
-        laplacian_flat.scatter_add_(0, v1_expanded, contrib_v1_flat)
-
-        laplacian = laplacian_flat.reshape(laplacian.shape)
-
-    return laplacian
+    return scatter_sum_coo(
+        -contrib_v0,
+        v1_indices,
+        n_points,
+        init=scatter_sum_coo(contrib_v0, v0_indices, n_points),
+    )
 
 
 def compute_laplacian_points_dec(

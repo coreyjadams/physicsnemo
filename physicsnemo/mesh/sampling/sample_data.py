@@ -29,6 +29,11 @@ from tensordict import TensorDict
 
 from physicsnemo.mesh.neighbors._adjacency import Adjacency, build_adjacency_from_pairs
 from physicsnemo.mesh.spatial import BVH
+from physicsnemo.mesh.utilities._scatter_ops import (
+    scatter_sum_coo,
+    segment_mean_csr,
+    segment_sum_csr,
+)
 from physicsnemo.nn.functional.neighbors import knn
 
 if TYPE_CHECKING:
@@ -528,14 +533,19 @@ def _accumulate_sampled_data(
 
     ### Count how many cells contain each query point. ``torch.bincount`` reads
     ### back the maximum bin on CUDA; fixed-size scatter avoids that host sync.
-    query_containment_count = torch.zeros(n_queries, dtype=torch.long, device=device)
-    query_containment_count.scatter_add_(
-        0, query_indices, torch.ones_like(query_indices)
+    query_containment_count = scatter_sum_coo(
+        torch.ones_like(query_indices), query_indices, n_queries
     )
     if multiple_cells_strategy == "mean":
         invalid_queries = query_containment_count == 0
     else:
         invalid_queries = query_containment_count != 1
+
+    ### CSR offsets for per-query segments. ``query_indices`` is ascending by
+    ### construction (both producers emit CSR-expansion order: expand_to_pairs
+    ### + order-preserving compaction), so per-pair values laid out in
+    ### ``query_indices`` order form contiguous per-query segments.
+    query_offsets = torch.nn.functional.pad(query_containment_count.cumsum(0), (1, 0))
 
     source_data = mesh.cell_data if data_source == "cells" else mesh.point_data
     cells = mesh.cells  # captured for point-data interpolation below
@@ -584,20 +594,16 @@ def _accumulate_sampled_data(
         else:
             raise ValueError(f"Invalid {data_source=!r}. Must be 'cells' or 'points'.")
 
-        ### Scatter directly into the result buffer. The following in-place
-        ### normalization and masking preserve autograd while avoiding redundant
-        ### full-sized output, division, and ``where`` tensors.
-        output = torch.zeros(output_shape, dtype=output_dtype, device=device)
-        idx_expanded = query_indices.view(-1, *([1] * (values.ndim - 1))).expand_as(
-            pair_values
-        )
-        output.scatter_add_(0, idx_expanded, pair_values)
-
+        ### Reduce per-pair values into per-query segments (CSR). Deterministic
+        ### and autograd-preserving; the in-place masking below avoids redundant
+        ### full-sized ``where`` tensors.
         count_shape = (-1,) + (1,) * (values.ndim - 1)
         if multiple_cells_strategy == "mean":
-            # Clamp in integer space because ``clamp_min`` rejects complex dtypes.
-            divisor = query_containment_count.clamp_min(1)
-            output.div_(divisor.view(count_shape))
+            output = segment_mean_csr(pair_values, query_offsets)
+        else:
+            # "nan" keeps only queries with exactly one containing cell, for
+            # which the segment sum equals that single value.
+            output = segment_sum_csr(pair_values, query_offsets)
 
         # Mask in place instead of compacting a CUDA boolean mask. Together with
         # the fixed-size count scatter above, this reduces host synchronizations.

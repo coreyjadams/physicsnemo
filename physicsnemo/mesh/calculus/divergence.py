@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING
 import torch
 from jaxtyping import Float
 
+from physicsnemo.mesh.utilities._scatter_ops import scatter_sum_coo
 from physicsnemo.mesh.utilities._tolerances import safe_eps
 
 if TYPE_CHECKING:
@@ -119,11 +120,12 @@ def compute_divergence_points_dec(
     ### Scatter-add to vertices with orientation signs
     # v0 (smaller index): edge points outward from v0's dual cell → positive
     # v1 (larger index):  edge points inward to v1's dual cell   → negative
-    divergence = torch.zeros(
-        n_points, dtype=vector_field.dtype, device=mesh.points.device
+    divergence = scatter_sum_coo(
+        -weighted_flux,
+        v1_indices,
+        n_points,
+        init=scatter_sum_coo(weighted_flux, v0_indices, n_points),
     )
-    divergence.scatter_add_(0, v0_indices, weighted_flux)
-    divergence.scatter_add_(0, v1_indices, -weighted_flux)
 
     ### Normalize by dual 0-cell volumes
     divergence = divergence / dual_volumes_0.clamp(min=safe_eps(dual_volumes_0.dtype))

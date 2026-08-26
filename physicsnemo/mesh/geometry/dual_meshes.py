@@ -63,8 +63,8 @@ def _scatter_add_cell_contributions_to_vertices(
     dual_volumes: Float[torch.Tensor, " n_points"],
     cells: Int[torch.Tensor, "n_cells n_vertices_per_cell"],
     contributions: Float[torch.Tensor, "n_cells ..."],
-) -> None:
-    """Scatter cell volume contributions to all cell vertices (in place).
+) -> Float[torch.Tensor, " n_points"]:
+    """Scatter cell volume contributions to all cell vertices.
 
     Accepts either a uniform per-cell contribution (broadcast to all vertices)
     or distinct per-vertex contributions.
@@ -72,7 +72,7 @@ def _scatter_add_cell_contributions_to_vertices(
     Parameters
     ----------
     dual_volumes : torch.Tensor
-        Accumulator for dual volumes, shape ``(n_points,)``. Modified in place.
+        Initial dual volumes, shape ``(n_points,)``. Not modified.
     cells : torch.Tensor
         Cell connectivity, shape ``(n_cells, n_vertices_per_cell)``.
     contributions : torch.Tensor
@@ -81,19 +81,24 @@ def _scatter_add_cell_contributions_to_vertices(
         If 2-D ``(n_cells, n_vertices_per_cell)``: per-vertex contributions
         (e.g. Meyer mixed Voronoi areas).
 
+    Returns
+    -------
+    torch.Tensor
+        ``dual_volumes`` plus the accumulated contributions, shape
+        ``(n_points,)``.
+
     Examples
     --------
     >>> import torch
     >>> dual_volumes = torch.zeros(4)
     >>> cells = torch.tensor([[0, 1, 2], [1, 2, 3]])
     >>> # Uniform: 1/3 of each triangle area to every vertex
-    >>> _scatter_add_cell_contributions_to_vertices(
+    >>> dual_volumes = _scatter_add_cell_contributions_to_vertices(
     ...     dual_volumes, cells, torch.tensor([0.5, 0.5]) / 3.0
     ... )
     >>> # Per-vertex: different contribution per corner
-    >>> dual_volumes2 = torch.zeros(4)
-    >>> _scatter_add_cell_contributions_to_vertices(
-    ...     dual_volumes2, cells, torch.tensor([[0.1, 0.2, 0.2], [0.15, 0.15, 0.2]])
+    >>> dual_volumes2 = _scatter_add_cell_contributions_to_vertices(
+    ...     torch.zeros(4), cells, torch.tensor([[0.1, 0.2, 0.2], [0.15, 0.15, 0.2]])
     ... )
     """
     if contributions.ndim not in (1, 2):
@@ -101,9 +106,16 @@ def _scatter_add_cell_contributions_to_vertices(
             f"contributions must be 1D or 2D, got {contributions.ndim}D "
             f"with shape {tuple(contributions.shape)}"
         )
+    from physicsnemo.mesh.utilities._scatter_ops import scatter_sum_coo
+
     if contributions.ndim == 1:
         contributions = contributions.unsqueeze(-1).expand_as(cells)
-    dual_volumes.scatter_add_(0, cells.flatten(), contributions.reshape(-1))
+    return scatter_sum_coo(
+        contributions.reshape(-1),
+        cells.flatten(),
+        dual_volumes.shape[0],
+        init=dual_volumes,
+    )
 
 
 def _compute_meyer_mixed_voronoi_areas(
@@ -365,7 +377,7 @@ def compute_dual_volumes_0(mesh: "Mesh") -> Float[torch.Tensor, " n_points"]:
     if n_manifold_dims == 1:
         ### 1D: Each vertex gets half the length of each incident edge
         # This is exact for piecewise linear 1-manifolds
-        _scatter_add_cell_contributions_to_vertices(
+        dual_volumes = _scatter_add_cell_contributions_to_vertices(
             dual_volumes, mesh.cells, cell_volumes / 2.0
         )
 
@@ -377,14 +389,14 @@ def compute_dual_volumes_0(mesh: "Mesh") -> Float[torch.Tensor, " n_points"]:
         )  # (n_cells * 3,)
 
         ### Scatter per-vertex Voronoi areas to global dual volumes
-        _scatter_add_cell_contributions_to_vertices(
+        dual_volumes = _scatter_add_cell_contributions_to_vertices(
             dual_volumes, mesh.cells, voronoi_areas.reshape(mesh.n_cells, 3)
         )
 
     elif n_manifold_dims >= 3:
         ### 3D and higher: barycentric subdivision (see docstring Notes)
         n_vertices_per_cell = n_manifold_dims + 1
-        _scatter_add_cell_contributions_to_vertices(
+        dual_volumes = _scatter_add_cell_contributions_to_vertices(
             dual_volumes, mesh.cells, cell_volumes / n_vertices_per_cell
         )
 
@@ -653,12 +665,15 @@ def compute_cotan_weights_fem(
     cell_volumes = mesh.cell_areas  # (n_cells,)
     weights_per_cell = -cell_volumes[:, None] * grad_dots  # (n_cells, n_pairs)
 
-    ### Accumulate contributions to unique edges via scatter_add
-    cotan_weights = torch.zeros(n_unique_edges, dtype=dtype, device=device)
+    ### Accumulate contributions to unique edges via segmented sum
+    from physicsnemo.mesh.utilities._scatter_ops import scatter_sum_coo
+
     # inverse_indices maps each candidate edge to its unique edge index.
     # For 1D: shape (n_cells,); for nD>1: shape (n_cells * n_pairs,)
     # weights_per_cell.reshape(-1) aligns with inverse_indices in both cases.
-    cotan_weights.scatter_add_(0, inverse_indices, weights_per_cell.reshape(-1))
+    cotan_weights = scatter_sum_coo(
+        weights_per_cell.reshape(-1), inverse_indices, n_unique_edges
+    )
 
     return cotan_weights, unique_edges
 

@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disables the accelerated paths entirely and
   `PHYSICSNEMO_PHYSICSNEMO_OPS_CPU=1` opts CPU tensors in. Without the
   package installed nothing changes.
+- Routes the `physicsnemo.mesh` scatter and deduplication primitives through
+  the optional physicsnemo-ops kernels, behind graceful pure-torch
+  fallbacks. A wrapper seam in `mesh/utilities/_scatter_ops.py` adds
+  `scatter_{sum,min,max}_coo` and `segment_{sum,mean,min,max}_csr`
+  (deterministic, autograd-capable where the fallback is), consumed across
+  geometry, calculus, boundaries, smoothing, subdivision, sampling, repair,
+  and spatial indexing; `unique_index_tuples` and `find_edges_in_reference`
+  gain hash-table fast paths (`unique_rows` / `lookup_rows`). Laplacian
+  smoothing additionally hoists its invariant per-vertex weight sums out of
+  the iteration loop (~2x faster on CPU at 400k points). Results are
+  unchanged; a parity test suite covers every accelerated path against its
+  fallback.
 - Adds `ShardTensor` support for GeoTransolver and FLARE models.
 - Adds zarr save/load for `Mesh` and `DomainMesh` via tensordict's zarr
   storage backend: `physicsnemo.mesh.io.to_zarr` / `from_zarr`, with

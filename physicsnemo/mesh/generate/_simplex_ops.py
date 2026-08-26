@@ -96,6 +96,21 @@ def _sub_simplices(cells, sub_size):
 # lexicographic row sort (the mesher's hottest operation).
 def _unique_rows(rows):
     """`torch.unique(dim=0)` with a packed-int64 fast path for small ids."""
+    from physicsnemo.utils._physicsnemo_ops import int_rows_ok, physicsnemo_ops_for
+
+    ops = physicsnemo_ops_for(rows)
+    if ops is not None and rows.shape[0] > 0 and rows.shape[1] <= 8:
+        index_bound = int(rows.max()) + 1
+        if int_rows_ok(rows, index_bound):
+            return ops.unique_rows(
+                rows.contiguous(),
+                index_bound,
+                sorted=True,
+                return_inverse=True,
+                return_counts=True,
+                trim=True,
+            )
+
     n, w = rows.shape
     bits = 63 // w
     if n > 0 and rows.max() < (1 << bits):

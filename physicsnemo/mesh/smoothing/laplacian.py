@@ -28,6 +28,7 @@ from jaxtyping import Bool, Float, Int
 from physicsnemo.mesh.boundaries import get_boundary_vertices
 from physicsnemo.mesh.boundaries._facet_extraction import extract_candidate_facets
 from physicsnemo.mesh.geometry.dual_meshes import compute_cotan_weights_fem
+from physicsnemo.mesh.utilities._scatter_ops import scatter_sum_coo
 from physicsnemo.mesh.utilities._tolerances import safe_eps
 from physicsnemo.mesh.utilities._topology import extract_unique_edges
 
@@ -142,7 +143,6 @@ def smooth_laplacian(
     device = mesh.points.device
     dtype = mesh.points.dtype
     n_points = mesh.n_points
-    n_spatial_dims = mesh.n_spatial_dims
 
     ### Compute edge weights (also extracts unique edges)
     edge_weights, edges = _compute_edge_weights(mesh)  # (n_edges,), (n_edges, 2)
@@ -172,9 +172,15 @@ def smooth_laplacian(
         bbox_diagonal = torch.norm(bbox_max - bbox_min)
         convergence_threshold = convergence * bbox_diagonal
 
-    ### Pre-allocate buffers for iterative smoothing (avoid per-iteration allocation)
-    laplacian = torch.zeros((n_points, n_spatial_dims), dtype=dtype, device=device)
-    weight_sum = torch.zeros(n_points, dtype=dtype, device=device)
+    ### The per-vertex weight sums are constant across iterations (edges and
+    ### weights do not change), so accumulate them once up front.
+    weight_sum = scatter_sum_coo(
+        edge_weights,
+        edges[:, 1],
+        n_points,
+        init=scatter_sum_coo(edge_weights, edges[:, 0], n_points),
+    )
+    weight_sum = weight_sum.clamp(min=safe_eps(dtype))
 
     ### Iterative smoothing
     for iteration in range(n_iter):
@@ -183,41 +189,24 @@ def smooth_laplacian(
             old_points = mesh.points.clone()
 
         ### Compute Laplacian at each vertex: L(p_i) = Σ_j w_ij (p_j - p_i)
-        laplacian.zero_()
-        weight_sum.zero_()
-
         # For each edge (i, j) with weight w:
         #   laplacian[i] += w * (p_j - p_i)
         #   laplacian[j] += w * (p_i - p_j)
-        #   weight_sum[i] += w
-        #   weight_sum[j] += w
 
         # Edge vectors: p_j - p_i
         edge_vectors = mesh.points[edges[:, 1]] - mesh.points[edges[:, 0]]
         weighted_vectors = edge_vectors * edge_weights.unsqueeze(-1)
 
-        # Accumulate contributions from edges
-        # For vertex edges[:,0]: add weighted_vectors
-        laplacian.scatter_add_(
-            0,
-            edges[:, 0].unsqueeze(-1).expand(-1, n_spatial_dims),
-            weighted_vectors,
-        )
-        # For vertex edges[:,1]: subtract weighted_vectors
-        laplacian.scatter_add_(
-            0,
-            edges[:, 1].unsqueeze(-1).expand(-1, n_spatial_dims),
+        # Accumulate contributions from both edge endpoints (chained via init)
+        laplacian = scatter_sum_coo(
             -weighted_vectors,
+            edges[:, 1],
+            n_points,
+            init=scatter_sum_coo(weighted_vectors, edges[:, 0], n_points),
         )
 
-        # Accumulate weight sums
-        weight_sum.scatter_add_(0, edges[:, 0], edge_weights)
-        weight_sum.scatter_add_(0, edges[:, 1], edge_weights)
-
-        ### Normalize by total weight per vertex (in place, to actually reuse the
-        # pre-allocated buffers across iterations rather than reallocating each step).
-        weight_sum.clamp_(min=safe_eps(dtype))
-        laplacian /= weight_sum.unsqueeze(-1)
+        ### Normalize by total weight per vertex
+        laplacian = laplacian / weight_sum.unsqueeze(-1)
 
         ### Apply relaxation
         mesh.points = mesh.points + relaxation_factor * laplacian

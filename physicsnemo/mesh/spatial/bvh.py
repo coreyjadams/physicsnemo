@@ -34,6 +34,7 @@ from tensordict import tensorclass
 from physicsnemo.mesh.neighbors._adjacency import Adjacency, build_adjacency_from_pairs
 from physicsnemo.mesh.spatial._lbvh import build_lbvh_topology
 from physicsnemo.mesh.spatial._ragged import _ragged_arange
+from physicsnemo.mesh.utilities._scatter_ops import scatter_max_coo, scatter_min_coo
 
 if TYPE_CHECKING:
     from physicsnemo.mesh.mesh import Mesh
@@ -242,11 +243,18 @@ def _compute_leaf_aabbs(
     cell_maxs = sorted_aabb_max[cell_pos]  # (total_cells, D)
 
     ### Segmented min/max reduction
-    seg_min = torch.full((n_leaf_segs, D), float("inf"), dtype=dtype, device=device)
-    seg_max = torch.full((n_leaf_segs, D), float("-inf"), dtype=dtype, device=device)
-    exp_ids = seg_ids.unsqueeze(1).expand_as(cell_mins)
-    seg_min.scatter_reduce_(0, exp_ids, cell_mins, reduce="amin", include_self=True)
-    seg_max.scatter_reduce_(0, exp_ids, cell_maxs, reduce="amax", include_self=True)
+    seg_min = scatter_min_coo(
+        cell_mins,
+        seg_ids,
+        n_leaf_segs,
+        init=torch.full((n_leaf_segs, D), float("inf"), dtype=dtype, device=device),
+    )
+    seg_max = scatter_max_coo(
+        cell_maxs,
+        seg_ids,
+        n_leaf_segs,
+        init=torch.full((n_leaf_segs, D), float("-inf"), dtype=dtype, device=device),
+    )
 
     return seg_min, seg_max
 

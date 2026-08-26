@@ -80,12 +80,15 @@ def split_pinched_vertices(points, cells, max_rounds: int = 32):
     ev = fverts.reshape(-1)
     na = node_id(ev, pairs[:, 0].repeat_interleave(dp1 - 1))
     nb = node_id(ev, pairs[:, 1].repeat_interleave(dp1 - 1))
+    from physicsnemo.mesh.utilities._scatter_ops import scatter_min_coo
+
+    n_nodes = labels.shape[0]
     for _ in range(max_rounds):
         la, lb = labels[na], labels[nb]
         new = torch.minimum(la, lb)
         changed = bool((la != new).any() or (lb != new).any())
-        labels.scatter_reduce_(0, na, new, reduce="amin")
-        labels.scatter_reduce_(0, nb, new, reduce="amin")
+        labels = scatter_min_coo(new, na, n_nodes, init=labels)
+        labels = scatter_min_coo(new, nb, n_nodes, init=labels)
         if not changed:
             break
 

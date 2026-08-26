@@ -35,6 +35,8 @@ import warnings
 import torch
 from jaxtyping import Float, Int
 
+from physicsnemo.mesh.utilities._scatter_ops import scatter_min_coo
+
 
 def vectorized_connected_components(
     pairs: Int[torch.Tensor, "n_pairs 2"], n_elements: int
@@ -77,12 +79,7 @@ def vectorized_connected_components(
         all_merge_from = torch.cat([merge_from, torch.maximum(parent_from, parent_to)])
         all_merge_to = torch.cat([merge_to, torch.minimum(parent_from, parent_to)])
 
-        parent.scatter_reduce_(
-            dim=0,
-            index=all_merge_from,
-            src=all_merge_to,
-            reduce="amin",
-        )
+        parent = scatter_min_coo(all_merge_to, all_merge_from, n_elements, init=parent)
 
         # Path compression
         parent = parent[parent]

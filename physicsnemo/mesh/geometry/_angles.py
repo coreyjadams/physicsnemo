@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING
 import torch
 from jaxtyping import Float
 
+from physicsnemo.mesh.utilities._scatter_ops import scatter_sum_coo
 from physicsnemo.mesh.utilities._tolerances import safe_eps
 
 if TYPE_CHECKING:
@@ -300,9 +301,4 @@ def compute_vertex_angle_sums(mesh: "Mesh") -> Float[torch.Tensor, " n_points"]:
     angles = compute_vertex_angles(mesh)  # (n_cells, n_verts_per_cell)
 
     ### Scatter-add angles to their corresponding vertex indices
-    angle_sums = torch.zeros(
-        mesh.n_points, dtype=mesh.points.dtype, device=mesh.points.device
-    )
-    angle_sums.scatter_add_(0, mesh.cells.reshape(-1), angles.reshape(-1))
-
-    return angle_sums
+    return scatter_sum_coo(angles.reshape(-1), mesh.cells.reshape(-1), mesh.n_points)

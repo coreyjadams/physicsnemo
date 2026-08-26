@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from physicsnemo.mesh.utilities._scatter_ops import scatter_max_coo, scatter_min_coo
 from physicsnemo.utils._index_tuple_ops import unique_index_tuples
 
 if TYPE_CHECKING:
@@ -357,8 +358,8 @@ def _check_3d_edge_link_connectivity(mesh: "Mesh") -> bool:
         device=device,
     )
     max_labels = torch.zeros(n_unique_edges, dtype=torch.long, device=device)
-    min_labels.scatter_reduce_(0, edge_inverse, labels, reduce="amin")
-    max_labels.scatter_reduce_(0, edge_inverse, labels, reduce="amax")
+    min_labels = scatter_min_coo(labels, edge_inverse, n_unique_edges, init=min_labels)
+    max_labels = scatter_max_coo(labels, edge_inverse, n_unique_edges, init=max_labels)
 
     # Count candidates per edge to identify edges with 2+ tets (others are
     # trivially connected since they have a single candidate).
@@ -572,8 +573,8 @@ def _check_3d_vertex_manifold(mesh: "Mesh") -> bool:
     min_labels = torch.full((mesh.n_points,), total, dtype=torch.long, device=device)
     max_labels = torch.zeros(mesh.n_points, dtype=torch.long, device=device)
 
-    min_labels.scatter_reduce_(0, vertex_ids, labels, reduce="amin")
-    max_labels.scatter_reduce_(0, vertex_ids, labels, reduce="amax")
+    min_labels = scatter_min_coo(labels, vertex_ids, mesh.n_points, init=min_labels)
+    max_labels = scatter_max_coo(labels, vertex_ids, mesh.n_points, init=max_labels)
 
     # Only check vertices with 2+ incident tets (others are trivially manifold)
     incident_counts = p2c.counts  # (n_points,)

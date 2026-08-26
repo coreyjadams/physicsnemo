@@ -25,6 +25,7 @@ from physicsnemo.mesh.boundaries._facet_extraction import extract_candidate_face
 from physicsnemo.mesh.utilities._duplicate_detection import (
     vectorized_connected_components,
 )
+from physicsnemo.mesh.utilities._scatter_ops import scatter_sum_coo
 from physicsnemo.utils._index_tuple_ops import unique_index_tuples
 
 if TYPE_CHECKING:
@@ -262,10 +263,7 @@ def _validate_closed_oriented_triangle_surface(mesh: "Mesh") -> None:
         torch.ones_like(starts),
         -torch.ones_like(starts),
     )
-    direction_sum = torch.zeros(
-        edge_counts.shape, dtype=direction.dtype, device=direction.device
-    )
-    direction_sum.scatter_add_(0, inverse, direction)
+    direction_sum = scatter_sum_coo(direction, inverse, edge_counts.shape[0])
     if bool((direction_sum != 0).any().item()):
         raise ValueError(
             "closed-surface volume energy requires consistently oriented "

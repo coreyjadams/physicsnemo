@@ -36,6 +36,7 @@ from physicsnemo.mesh.subdivision._topology import (
     generate_child_cells,
     get_subdivision_pattern,
 )
+from physicsnemo.mesh.utilities._scatter_ops import scatter_sum_coo, segment_sum_csr
 from physicsnemo.mesh.utilities._topology import extract_unique_edges
 from physicsnemo.utils._index_tuple_ops import unique_index_tuples
 
@@ -105,35 +106,14 @@ def reposition_original_vertices_2d(
     # Handle isolated vertices (valence=0) - beta should be 0 to keep original position
     beta = torch.where(valences > 0, beta, 0.0)
 
-    ### Compute neighbor position sums for all points using scatter_add
-    # For each neighbor relationship, add neighbor's position to source point's sum
+    ### Compute neighbor position sums for all points with a CSR segmented sum
+    # adjacency.indices holds each point's neighbors grouped by point, with
+    # adjacency.offsets delimiting the per-point ranges.
     # Shape: (n_points, n_spatial_dims)
-    neighbor_sums = torch.zeros_like(mesh.points)
-
-    # Get source point indices by expanding offsets
-    # For adjacency.indices[i], the source point is the one whose offset range contains i
-    # We can use searchsorted or create source indices directly
-    source_point_indices = torch.repeat_interleave(
-        torch.arange(n_points, dtype=torch.int64, device=device),
-        valences,
-    )
-
-    # Get neighbor positions and scatter-add to source points
-    # adjacency.indices contains the neighbor point indices
     neighbor_positions = mesh.points[
         adjacency.indices
     ]  # (total_neighbors, n_spatial_dims)
-
-    # Expand source_point_indices for scatter_add
-    source_point_indices_expanded = source_point_indices.unsqueeze(-1).expand(
-        -1, mesh.n_spatial_dims
-    )
-
-    neighbor_sums.scatter_add_(
-        dim=0,
-        index=source_point_indices_expanded,
-        src=neighbor_positions,
-    )
+    neighbor_sums = segment_sum_csr(neighbor_positions, adjacency.offsets)
 
     ### Apply the interior Loop formula for all points at once
     # new_pos = (1 - n*beta) * old_pos + beta * sum(neighbors)
@@ -165,16 +145,17 @@ def reposition_original_vertices_2d(
     boundary_vertex_mask[be0] = True
     boundary_vertex_mask[be1] = True
 
-    boundary_neighbor_sums = torch.zeros_like(mesh.points)
-    idx0 = be0.unsqueeze(-1).expand(-1, mesh.n_spatial_dims)
-    idx1 = be1.unsqueeze(-1).expand(-1, mesh.n_spatial_dims)
-    boundary_neighbor_sums.scatter_add_(0, idx0, mesh.points[be1])
-    boundary_neighbor_sums.scatter_add_(0, idx1, mesh.points[be0])
+    boundary_neighbor_sums = scatter_sum_coo(
+        mesh.points[be0],
+        be1,
+        n_points,
+        init=scatter_sum_coo(mesh.points[be1], be0, n_points),
+    )
 
-    boundary_neighbor_counts = torch.zeros(n_points, dtype=torch.long, device=device)
     ones = torch.ones_like(be0)
-    boundary_neighbor_counts.scatter_add_(0, be0, ones)
-    boundary_neighbor_counts.scatter_add_(0, be1, ones)
+    boundary_neighbor_counts = scatter_sum_coo(
+        ones, be1, n_points, init=scatter_sum_coo(ones, be0, n_points)
+    )
 
     boundary_new_positions = 0.75 * mesh.points + 0.125 * boundary_neighbor_sums
 

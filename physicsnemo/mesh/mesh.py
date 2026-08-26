@@ -1010,13 +1010,6 @@ class Mesh:
         ### Get cell normals (triggers computation if not cached)
         cell_normals = self.cell_normals  # (n_cells, n_spatial_dims)
 
-        ### Initialize accumulated normals for each point
-        accumulated_normals = torch.zeros(
-            (self.n_points, self.n_spatial_dims),
-            dtype=self.points.dtype,
-            device=self.points.device,
-        )
-
         n_vertices_per_cell = self.cells.shape[1]
         point_indices = self.cells.flatten()
 
@@ -1063,15 +1056,11 @@ class Mesh:
             )
 
         ### Apply weights and accumulate
-        normals_to_accumulate = cell_normals_flat * weights.unsqueeze(-1)
+        from physicsnemo.mesh.utilities._scatter_ops import scatter_sum_coo
 
-        point_indices_expanded = point_indices.unsqueeze(-1).expand(
-            -1, self.n_spatial_dims
-        )
-        accumulated_normals.scatter_add_(
-            dim=0,
-            index=point_indices_expanded,
-            src=normals_to_accumulate,
+        normals_to_accumulate = cell_normals_flat * weights.unsqueeze(-1)
+        accumulated_normals = scatter_sum_coo(
+            normals_to_accumulate, point_indices, self.n_points
         )
 
         ### Normalize to get unit normals

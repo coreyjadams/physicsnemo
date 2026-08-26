@@ -33,6 +33,7 @@ import torch
 from jaxtyping import Float, Int
 
 from physicsnemo.mesh.utilities._edge_lookup import find_edges_in_reference
+from physicsnemo.mesh.utilities._scatter_ops import scatter_sum_coo
 
 if TYPE_CHECKING:
     from physicsnemo.mesh.mesh import Mesh
@@ -207,10 +208,8 @@ def sharp(
             )  # (n_matched, n_spatial_dims)
 
             ### Scatter-add to vector_field
-            vector_field.scatter_add_(
-                0,
-                vertex_indices.unsqueeze(-1).expand(-1, n_spatial_dims),
-                contributions,
+            vector_field = scatter_sum_coo(
+                contributions, vertex_indices, n_points, init=vector_field
             )
         else:
             # Tensor case: more complex broadcasting
@@ -232,13 +231,11 @@ def sharp(
 
             # Flatten and scatter
             contributions_flat = contributions.reshape(len(matched_edge_indices), -1)
-            vector_field_flat = vector_field.reshape(n_points, -1)
-
-            vertex_indices_expanded = vertex_indices.unsqueeze(-1).expand(
-                -1, contributions_flat.shape[1]
-            )
-            vector_field_flat.scatter_add_(
-                0, vertex_indices_expanded, contributions_flat
+            vector_field_flat = scatter_sum_coo(
+                contributions_flat,
+                vertex_indices,
+                n_points,
+                init=vector_field.reshape(n_points, -1),
             )
 
             vector_field = vector_field_flat.reshape(vector_field.shape)

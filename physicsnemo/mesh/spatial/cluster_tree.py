@@ -54,6 +54,11 @@ from torch.profiler import record_function
 from physicsnemo.mesh.spatial._lbvh import build_lbvh_topology
 from physicsnemo.mesh.spatial._ragged import _ragged_arange
 from physicsnemo.mesh.spatial.bvh import _compute_morton_codes
+from physicsnemo.mesh.utilities._scatter_ops import (
+    scatter_max_coo,
+    scatter_min_coo,
+    scatter_sum_coo,
+)
 
 logger = logging.getLogger("mesh.spatial.cluster_tree")
 
@@ -423,10 +428,11 @@ def _expand_dual_leaf_hits(
     fn_broadcast_targets = target_point_ids[bcast_sort_order]
     fn_broadcast_targets_validity = active_validity[bcast_sort_order]
 
-    ### Per-lp active count via weighted ``scatter_add_``.  Weight =
+    ### Per-lp active count via weighted segmented sum.  Weight =
     ### ``active_validity.long()``, so non-active entries contribute zero.
-    active_counts_per_lp = torch.zeros(n_pairs, dtype=torch.long, device=device)
-    active_counts_per_lp.scatter_add_(0, leaf_pair_ids_t, active_validity.long())
+    active_counts_per_lp = scatter_sum_coo(
+        active_validity.long(), leaf_pair_ids_t, n_pairs
+    )
     active_starts_per_lp = active_counts_per_lp.cumsum(0) - active_counts_per_lp
 
     ### Return broadcast_starts/counts aligned with the *full* per-source
@@ -437,9 +443,10 @@ def _expand_dual_leaf_hits(
     # ==================================================================
     # Reduced Cartesian product: survivors × close sources only
     # ==================================================================
-    ### Per-lp count of close sources via weighted ``scatter_add_``.
-    close_counts_per_lp = torch.zeros(n_pairs, dtype=torch.long, device=device)
-    close_counts_per_lp.scatter_add_(0, leaf_pair_ids_s, (~source_is_far).long())
+    ### Per-lp count of close sources via weighted segmented sum.
+    close_counts_per_lp = scatter_sum_coo(
+        (~source_is_far).long(), leaf_pair_ids_s, n_pairs
+    )
 
     ### Sort sources by ``(leaf_pair_id, source_is_far)`` so within each
     ### lp's contiguous block the close sources come first (key
@@ -1362,14 +1369,20 @@ def _fill_leaf_aggregates(
     pts = sorted_points[positions]
     areas_per_pos = sorted_areas[positions]
 
-    seg_min = torch.full((n_leaves, D), float("inf"), dtype=dtype, device=device)
-    seg_max = torch.full((n_leaves, D), float("-inf"), dtype=dtype, device=device)
-    exp_ids = seg_ids.unsqueeze(1).expand_as(pts)
-    seg_min.scatter_reduce_(0, exp_ids, pts, reduce="amin", include_self=True)
-    seg_max.scatter_reduce_(0, exp_ids, pts, reduce="amax", include_self=True)
+    seg_min = scatter_min_coo(
+        pts,
+        seg_ids,
+        n_leaves,
+        init=torch.full((n_leaves, D), float("inf"), dtype=dtype, device=device),
+    )
+    seg_max = scatter_max_coo(
+        pts,
+        seg_ids,
+        n_leaves,
+        init=torch.full((n_leaves, D), float("-inf"), dtype=dtype, device=device),
+    )
 
-    leaf_areas = torch.zeros(n_leaves, dtype=areas_per_pos.dtype, device=device)
-    leaf_areas.scatter_add_(0, seg_ids, areas_per_pos)
+    leaf_areas = scatter_sum_coo(areas_per_pos, seg_ids, n_leaves)
 
     aabb_min_buf[leaf_nids] = seg_min
     aabb_max_buf[leaf_nids] = seg_max

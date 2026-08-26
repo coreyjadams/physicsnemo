@@ -24,6 +24,8 @@ exterior derivatives, and sharp/flat operators.
 import torch
 from jaxtyping import Bool, Int
 
+from physicsnemo.utils._physicsnemo_ops import int_rows_ok, physicsnemo_ops_for
+
 
 def find_edges_in_reference(
     reference_edges: Int[torch.Tensor, "n_ref 2"],
@@ -75,6 +77,38 @@ def find_edges_in_reference(
             torch.zeros(len(query_edges), dtype=torch.bool, device=device),
         )
 
+    if index_bound is None:
+        index_bound = (
+            int(max(reference_edges.max().item(), query_edges.max().item())) + 1
+        )
+
+    ### Accelerated path: hash-table probe from physicsnemo_ops. Its
+    ### ``canonicalize=True`` sorts each edge internally, replacing the two
+    ### torch.sort calls and the searchsorted below. A miss is encoded as -1;
+    ### matched indices agree with the sort-based path (any match may be
+    ### returned when the reference contains duplicate edges, matching the
+    ### documented "undefined for unmatched / any match" contract).
+    ### Note: callers may pass wider query rows (e.g. triangle facets against
+    ### reference edges); the sort-based path below hashes only the two
+    ### smallest vertices per row. The accelerated path preserves that legacy
+    ### behavior by only engaging when both inputs are true (n, 2) edges.
+    ops = physicsnemo_ops_for(reference_edges)
+    if (
+        ops is not None
+        and reference_edges.shape[1] == 2
+        and query_edges.shape[1] == 2
+        and int_rows_ok(reference_edges, index_bound)
+        and query_edges.dtype == reference_edges.dtype
+    ):
+        raw_indices = ops.lookup_rows(
+            reference_edges.contiguous(),
+            query_edges.contiguous(),
+            index_bound,
+            canonicalize=True,
+        )
+        matches = raw_indices >= 0
+        return raw_indices.clamp_min(0).long(), matches
+
     ### Canonicalize edges to ascending vertex-index order
     sorted_reference, _ = torch.sort(reference_edges, dim=-1)
     sorted_query, _ = torch.sort(query_edges, dim=-1)
@@ -82,10 +116,6 @@ def find_edges_in_reference(
     ### Compute integer hash for each edge
     # hash = v0 * index_bound + v1
     # This creates a unique mapping for edges with non-negative vertex indices
-    if index_bound is None:
-        index_bound = (
-            int(max(reference_edges.max().item(), query_edges.max().item())) + 1
-        )
     reference_hash = sorted_reference[:, 0] * index_bound + sorted_reference[:, 1]
     query_hash = sorted_query[:, 0] * index_bound + sorted_query[:, 1]
 

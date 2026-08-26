@@ -210,13 +210,13 @@ def flip_pass(points, cells, h, generator=None, q_focus: float = 0.5):
         + gain.double().clamp(0.0, 1.0)
         + torch.arange(n_cand, device=device, dtype=torch.float64) * 1e-18
     )
-    best = torch.zeros(points.shape[0], dtype=prio.dtype, device=device)
-    best.scatter_reduce_(
-        0,
-        cverts.reshape(-1),
+    from physicsnemo.mesh.utilities._scatter_ops import scatter_max_coo
+
+    best = scatter_max_coo(
         prio[:, None].expand_as(cverts).reshape(-1),
-        reduce="amax",
-        include_self=True,
+        cverts.reshape(-1),
+        points.shape[0],
+        init=torch.zeros(points.shape[0], dtype=prio.dtype, device=device),
     )
     wins = (best[cverts] == prio[:, None]).all(dim=1)
     if not wins.any():
