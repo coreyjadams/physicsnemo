@@ -24,10 +24,7 @@ from typing import TYPE_CHECKING, Literal, TypeAlias
 import torch
 from jaxtyping import Bool, Float
 
-from physicsnemo.mesh.transformations.deform._utils import (
-    _mesh_with_deformed_points,
-    _resolve_point_field,
-)
+from physicsnemo.mesh.transformations.deform._utils import _resolve_point_field
 
 if TYPE_CHECKING:
     from physicsnemo.mesh.mesh import Mesh
@@ -160,6 +157,10 @@ def free_form_deform(
     exactly the identity, and a constant lattice translates every point inside
     the box.
 
+    Call it as ``free_form_deform(mesh, ...)`` or as
+    ``mesh.free_form_deform(...)``. The bound method supplies ``mesh``
+    automatically.
+
     Parameters
     ----------
     mesh : Mesh
@@ -281,4 +282,4 @@ def free_form_deform(
         point_weights=point_weights_t,
         implementation=implementation,
     )
-    return _mesh_with_deformed_points(mesh, points)
+    return mesh.with_points(points)
