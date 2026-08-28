@@ -45,6 +45,10 @@ from torch.autograd.profiler import record_function
 from torch.distributed.tensor.placement_types import Replicate
 
 from physicsnemo.core.version_check import OptionalImport
+from physicsnemo.utils._physicsnemo_ops import (
+    physicsnemo_ops_for,
+    slice_reduce_eligible,
+)
 
 from .gumbel_softmax import gumbel_softmax
 
@@ -162,6 +166,24 @@ def _compute_slices_from_projections(
         - ``slice_token``: Shape :math:`(B, H, S, D)`, aggregated features
           per slice.
     """
+    # Fused path: physicsnemo-ops folds the softmax, normalization, and
+    # token-axis aggregation into one deterministic pass with fp32
+    # accumulation. Identical math — the per-slice norm is constant across
+    # tokens, so normalize-then-aggregate equals aggregate-then-normalize —
+    # and the returned weights are bitwise the ones the reduction consumed.
+    # The Transolver++ (gumbel) path and sharded (subclass) tensors keep
+    # the eager math.
+    ops = physicsnemo_ops_for(slice_projections)
+    if ops is not None and not plus and slice_reduce_eligible(slice_projections, fx):
+        clamped_temp = torch.clamp(temperature, min=0.5, max=5).to(
+            slice_projections.dtype
+        )
+        token_partial, norm_partial, slice_weights = ops.slice_attn_softmax_reduce(
+            slice_projections / clamped_temp, fx, return_weights=True
+        )
+        slice_token = (token_partial / (norm_partial[..., None] + 1e-2)).to(fx.dtype)
+        return slice_weights, slice_token
+
     # Compute temperature-scaled softmax over slices
     if plus and proj_temperature is not None:
         # Transolver++ uses learned per-token temperature

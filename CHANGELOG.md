@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the memory-efficient SDPA kernel fp32 otherwise uses); 16-bit engages for
   inference only. Both kernels are bitwise run-to-run deterministic.
   `PHYSICSNEMO_DISABLE_PHYSICSNEMO_OPS=1` restores the eager path exactly.
+- PhysicsAttention (Transolver) slice aggregation routes through the
+  physicsnemo-ops `slice_attn_softmax_reduce` kernel (softmax + weighted
+  token reduction fused in one deterministic pass) when the envelope fits
+  (slice counts that are multiples of 16 up to 256, head dim 16/32/48/64,
+  f16/bf16 on CUDA, standard softmax only — the Transolver++ gumbel path
+  keeps eager math). This
+  covers `PhysicsAttentionIrregularMesh`, GALE, and the GeoTransolver
+  context projector. 16-bit gains fp32 accumulation and bitwise
+  run-to-run determinism; fp32 keeps the eager path (the op never
+  silently changes fp32 numerics). GALE_FA's token-context
+  cross-attention additionally routes through `attn_apply` under the
+  FLARE envelope. The same kill switch applies.
 - Adds an optional-dependency gate for the
   [physicsnemo-ops](https://github.com/NVIDIA/physicsnemo-ops) accelerated
   kernels (`physicsnemo.utils._physicsnemo_ops`). The gate resolves the

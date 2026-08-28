@@ -197,6 +197,16 @@ _ATTENTION_HEAD_DIMS = frozenset({32, 64})
 _ATTENTION_QUERY_COUNTS = frozenset({32, 64, 128})
 
 
+def _plain_cuda(t: torch.Tensor) -> bool:
+    """Whether ``t`` is a plain (non-subclass) CUDA tensor.
+
+    Tensor subclasses (ShardTensor/DTensor in domain-parallel runs) keep
+    the pure-torch paths: their dispatch rules implement the distributed
+    semantics the fused kernels know nothing about.
+    """
+    return type(t) is torch.Tensor and t.is_cuda
+
+
 def flare_attention_eligible(x_mid: torch.Tensor, q_global: torch.Tensor) -> bool:
     """Whether FLARE's two attention passes should use ``physicsnemo_ops``.
 
@@ -208,7 +218,7 @@ def flare_attention_eligible(x_mid: torch.Tensor, q_global: torch.Tensor) -> boo
     16-bit engages for inference only: flash's fused backward still wins
     16-bit training, while the forward is 1.15-1.4x in our favor.
     """
-    if not x_mid.is_cuda:
+    if not _plain_cuda(x_mid):
         return False
     if x_mid.dtype not in _ATTENTION_DTYPES:
         return False
@@ -221,3 +231,52 @@ def flare_attention_eligible(x_mid: torch.Tensor, q_global: torch.Tensor) -> boo
     return not (
         torch.is_grad_enabled() and (x_mid.requires_grad or q_global.requires_grad)
     )
+
+
+def token_cross_attention_eligible(q: torch.Tensor, kv: torch.Tensor) -> bool:
+    """Whether a per-token/small-KV cross-attention should use ``attn_apply``.
+
+    ``attn_apply`` fuses the logits GEMM, softmax, and value apply for many
+    query tokens over a small key/value set (the ``(B, N, H, S)`` logits
+    tensor never exists) with a fused deterministic backward. It measured
+    1.6-3.1x (fp32) and 1.2x (bf16) forward+backward against SDPA at these
+    shapes, so it engages for training and inference at every dtype.
+    """
+    if not (_plain_cuda(q) and _plain_cuda(kv)):
+        return False
+    if q.dtype not in _ATTENTION_DTYPES or kv.dtype is not q.dtype:
+        return False
+    if q.shape[-1] not in _ATTENTION_HEAD_DIMS:
+        return False
+    return kv.shape[2] in _ATTENTION_QUERY_COUNTS
+
+
+#: Slice counts with register-softmax fast paths in the semi-fused reduce.
+# The fused reduce tiles slices in 16-row MMA tiles up to a 256-slice
+# per-CTA accumulator ceiling; other counts keep the eager path.
+_SLICE_COUNT_MULTIPLE = 16
+_SLICE_COUNT_MAX = 256
+_SLICE_HEAD_DIMS = frozenset({16, 32, 48, 64})
+
+
+def slice_reduce_eligible(slice_projections: torch.Tensor, fx: torch.Tensor) -> bool:
+    """Whether Transolver's slice aggregation should use ``physicsnemo_ops``.
+
+    ``slice_attn_softmax_reduce`` fuses the temperature-scaled softmax,
+    normalization, and token-axis aggregation into one deterministic pass
+    with fp32 accumulation. 16-bit only: the op's fp32 path is the exact
+    scalar kernel (never silently changes fp32 numerics), which measures
+    slower than the eager chain, so fp32 keeps eager.
+    """
+    if not (_plain_cuda(slice_projections) and _plain_cuda(fx)):
+        return False
+    if slice_projections.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if fx.dtype is not slice_projections.dtype:
+        return False
+    slices = slice_projections.shape[-1]
+    if slices % _SLICE_COUNT_MULTIPLE != 0 or not (
+        _SLICE_COUNT_MULTIPLE <= slices <= _SLICE_COUNT_MAX
+    ):
+        return False
+    return fx.shape[-1] in _SLICE_HEAD_DIMS

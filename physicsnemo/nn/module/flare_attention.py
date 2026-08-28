@@ -69,6 +69,11 @@ def _flare_self_attention(
     torch.Tensor
         Self-attended output of shape :math:`(B, H, N, D)`.
     """
+    ops = physicsnemo_ops_for(x_mid)
+    if ops is not None and flare_attention_eligible(x_mid, q_global):
+        return _flare_self_attention_physicsnemo_ops(
+            x_mid, q_global, self_k, self_v, scale, ops
+        )
     G = q_global.to(dtype=x_mid.dtype).expand(x_mid.shape[0], -1, -1, -1)
     k = self_k(x_mid)
     v = self_v(x_mid)
@@ -296,24 +301,13 @@ class FLARE(nn.Module):
                 self.heads,
             )
         else:
-            ops = physicsnemo_ops_for(x_mid)
-            if ops is not None and flare_attention_eligible(x_mid, self.q_global):
-                y = _flare_self_attention_physicsnemo_ops(
-                    x_mid,
-                    self.q_global,
-                    self.self_k,
-                    self.self_v,
-                    self.scale,
-                    ops,
-                )
-            else:
-                y = _flare_self_attention(
-                    x_mid,
-                    self.q_global,
-                    self.self_k,
-                    self.self_v,
-                    self.scale,
-                )
+            y = _flare_self_attention(
+                x_mid,
+                self.q_global,
+                self.self_k,
+                self.self_v,
+                self.scale,
+            )
 
         out_x = y.permute(0, 2, 1, 3)  # (B, H, N, D) -> (B, N, H, D)
         out_x = rearrange(out_x, "b n h d -> b n (h d)")

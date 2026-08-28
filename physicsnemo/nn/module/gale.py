@@ -32,6 +32,10 @@ from torch.distributed.tensor.placement_types import Replicate
 
 import physicsnemo  # noqa: F401 for docs
 from physicsnemo.core.version_check import OptionalImport
+from physicsnemo.utils._physicsnemo_ops import (
+    physicsnemo_ops_for,
+    token_cross_attention_eligible,
+)
 
 from .concrete_dropout import ConcreteDropout
 from .flare_attention import _flare_self_attention, _flare_self_attention_te
@@ -737,10 +741,25 @@ class GALE_FA(nn.Module):
                 q = [self.cross_q(_x_mid) for _x_mid in x_mid]
                 k = self.cross_k(context)
                 v = self.cross_v(context)
-                cross_attention = [
-                    F.scaled_dot_product_attention(_q, k, v, scale=self.scale)
-                    for _q in q
-                ]
+                ops = physicsnemo_ops_for(k)
+                if ops is not None and all(
+                    token_cross_attention_eligible(_q, k) for _q in q
+                ):
+                    # Per-token attention over the small context-slice set:
+                    # attn_apply fuses the logits GEMM + softmax + apply
+                    # (deterministic, fused backward); the permuted query
+                    # views feed the kernel's strided reads directly.
+                    cross_attention = [
+                        ops.attn_apply(
+                            _q.permute(0, 2, 1, 3), k, v, scale=self.scale
+                        ).permute(0, 2, 1, 3)
+                        for _q in q
+                    ]
+                else:
+                    cross_attention = [
+                        F.scaled_dot_product_attention(_q, k, v, scale=self.scale)
+                        for _q in q
+                    ]
             outputs = [
                 _mix_self_and_cross(
                     sa,
