@@ -29,6 +29,10 @@ from einops import rearrange
 from jaxtyping import Float
 
 from physicsnemo.core.version_check import OptionalImport
+from physicsnemo.utils._physicsnemo_ops import (
+    flare_attention_eligible,
+    physicsnemo_ops_for,
+)
 
 from .physics_attention import _project_input
 
@@ -70,6 +74,57 @@ def _flare_self_attention(
     v = self_v(x_mid)
     z = F.scaled_dot_product_attention(G, k, v, scale=scale)
     return F.scaled_dot_product_attention(k, G, z, scale=scale)
+
+
+def _flare_self_attention_physicsnemo_ops(
+    x_mid: Float[torch.Tensor, "B H N D"],
+    q_global: nn.Parameter,
+    self_k: nn.Module,
+    self_v: nn.Module,
+    scale: float,
+    ops,
+) -> Float[torch.Tensor, "B H N D"]:
+    r"""FLARE two-pass self-attention on the physicsnemo-ops fused kernels.
+
+    Same computation as :func:`_flare_self_attention`. Pass 1 (few global
+    queries over the huge token axis) runs ``attn_lse_reduce``; pass 2 (every
+    token over the small global-query set) runs ``attn_apply``, whose fused
+    logits GEMM never materializes the ``(B, N, H, S)`` logits tensor. Both
+    kernels are bitwise run-to-run deterministic and differentiable (fused
+    flash-style backward). For fp32 inputs the matmuls use TF32 tensor cores
+    (~5e-4 relative to strict fp32) — fp32 is otherwise locked out of every
+    fast SDPA backend, and this path measures 2.5-3x faster forward and
+    backward at FLARE shapes. Disable via
+    ``PHYSICSNEMO_DISABLE_PHYSICSNEMO_OPS=1``.
+
+    Parameters
+    ----------
+    x_mid : torch.Tensor
+        Projected input of shape :math:`(B, H, N, D)`.
+    q_global : nn.Parameter
+        Learned global queries of shape :math:`(1, H, S, D)`.
+    self_k : nn.Module
+        Key projection applied to ``x_mid``.
+    self_v : nn.Module
+        Value projection applied to ``x_mid``.
+    scale : float
+        Attention scale factor.
+    ops : ModuleType
+        The ``physicsnemo_ops.torch`` module (already gate-resolved).
+
+    Returns
+    -------
+    torch.Tensor
+        Self-attended output of shape :math:`(B, H, N, D)`.
+    """
+    G = q_global.to(dtype=x_mid.dtype).expand(x_mid.shape[0], -1, -1, -1)
+    k = self_k(x_mid)
+    v = self_v(x_mid)
+    z = ops.attn_lse_reduce(G, k, v, scale=scale)
+    # attn_apply consumes token-major queries; the permuted view is free and
+    # the kernel reads strided q directly.
+    y = ops.attn_apply(k.permute(0, 2, 1, 3), G, z, scale=scale)
+    return y.permute(0, 2, 1, 3)
 
 
 def _flare_self_attention_te(
@@ -241,13 +296,24 @@ class FLARE(nn.Module):
                 self.heads,
             )
         else:
-            y = _flare_self_attention(
-                x_mid,
-                self.q_global,
-                self.self_k,
-                self.self_v,
-                self.scale,
-            )
+            ops = physicsnemo_ops_for(x_mid)
+            if ops is not None and flare_attention_eligible(x_mid, self.q_global):
+                y = _flare_self_attention_physicsnemo_ops(
+                    x_mid,
+                    self.q_global,
+                    self.self_k,
+                    self.self_v,
+                    self.scale,
+                    ops,
+                )
+            else:
+                y = _flare_self_attention(
+                    x_mid,
+                    self.q_global,
+                    self.self_k,
+                    self.self_v,
+                    self.scale,
+                )
 
         out_x = y.permute(0, 2, 1, 3)  # (B, H, N, D) -> (B, N, H, D)
         out_x = rearrange(out_x, "b n h d -> b n (h d)")

@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- FLARE attention routes through the fused
+  [physicsnemo-ops](https://github.com/NVIDIA/physicsnemo-ops) attention
+  kernels (`attn_lse_reduce` for the global-query pass, `attn_apply` for the
+  token pass) when the package is installed and the shape/dtype envelope
+  fits (head dim 32/64, 32/64/128 global queries, f16/bf16/f32 on CUDA).
+  fp32 engages for training and inference (TF32 tensor cores, ~5e-4
+  relative to strict fp32; measured 2.5-3x faster forward and backward than
+  the memory-efficient SDPA kernel fp32 otherwise uses); 16-bit engages for
+  inference only. Both kernels are bitwise run-to-run deterministic.
+  `PHYSICSNEMO_DISABLE_PHYSICSNEMO_OPS=1` restores the eager path exactly.
 - Adds an optional-dependency gate for the
   [physicsnemo-ops](https://github.com/NVIDIA/physicsnemo-ops) accelerated
   kernels (`physicsnemo.utils._physicsnemo_ops`). The gate resolves the

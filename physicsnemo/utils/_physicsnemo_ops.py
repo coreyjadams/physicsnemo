@@ -187,3 +187,37 @@ def csr_mean_dtype_ok(values: torch.Tensor) -> bool:
 def csr_cmp_dtype_ok(values: torch.Tensor) -> bool:
     """Whether ``values`` is supported by ``segment_min_csr``/``segment_max_csr``."""
     return values.dtype in _CSR_CMP_DTYPES
+
+
+#: Shape/dtype envelope of the fused attention ops (``attn_lse_reduce`` /
+#: ``attn_apply``) used by FLARE: f16/bf16/f32, head dim 32 or 64, and a
+#: global-query count the fused small-KV kernel has static tiles for.
+_ATTENTION_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float32})
+_ATTENTION_HEAD_DIMS = frozenset({32, 64})
+_ATTENTION_QUERY_COUNTS = frozenset({32, 64, 128})
+
+
+def flare_attention_eligible(x_mid: torch.Tensor, q_global: torch.Tensor) -> bool:
+    """Whether FLARE's two attention passes should use ``physicsnemo_ops``.
+
+    Shape/dtype envelope of the fused kernels, plus the measured precision/
+    performance policy: fp32 engages unconditionally (the fused TF32 path is
+    2.5-3x faster forward AND backward than the memory-efficient SDPA kernel
+    fp32 is otherwise routed to; ~5e-4 relative to strict fp32 — disable via
+    ``PHYSICSNEMO_DISABLE_PHYSICSNEMO_OPS=1`` for bitwise eager numerics).
+    16-bit engages for inference only: flash's fused backward still wins
+    16-bit training, while the forward is 1.15-1.4x in our favor.
+    """
+    if not x_mid.is_cuda:
+        return False
+    if x_mid.dtype not in _ATTENTION_DTYPES:
+        return False
+    if x_mid.shape[-1] not in _ATTENTION_HEAD_DIMS:
+        return False
+    if q_global.shape[2] not in _ATTENTION_QUERY_COUNTS:
+        return False
+    if x_mid.dtype is torch.float32:
+        return True
+    return not (
+        torch.is_grad_enabled() and (x_mid.requires_grad or q_global.requires_grad)
+    )
