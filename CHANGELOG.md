@@ -24,12 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   physicsnemo-ops `slice_attn_softmax_reduce` kernel (softmax + weighted
   token reduction fused in one deterministic pass) when the envelope fits
   (slice counts that are multiples of 16 up to 256, head dim 16/32/48/64,
-  f16/bf16 on CUDA, standard softmax only — the Transolver++ gumbel path
-  keeps eager math). This
+  f16/bf16/f32 on CUDA, standard softmax only — the Transolver++ gumbel
+  path keeps eager math). This
   covers `PhysicsAttentionIrregularMesh`, GALE, and the GeoTransolver
   context projector. 16-bit gains fp32 accumulation and bitwise
-  run-to-run determinism; fp32 keeps the eager path (the op never
-  silently changes fp32 numerics). GALE_FA's token-context
+  run-to-run determinism; fp32 engages the TF32 tensor-core variant
+  (~1e-4 module-level, the same precision class as the FLARE fp32
+  policy; the kill switch restores bitwise eager). GALE_FA's token-context
   cross-attention additionally routes through `attn_apply` under the
   FLARE envelope. The same kill switch applies.
 - Adds an optional-dependency gate for the

@@ -264,13 +264,15 @@ def slice_reduce_eligible(slice_projections: torch.Tensor, fx: torch.Tensor) -> 
 
     ``slice_attn_softmax_reduce`` fuses the temperature-scaled softmax,
     normalization, and token-axis aggregation into one deterministic pass
-    with fp32 accumulation. 16-bit only: the op's fp32 path is the exact
-    scalar kernel (never silently changes fp32 numerics), which measures
-    slower than the eager chain, so fp32 keeps eager.
+    with fp32 accumulation. 16-bit engages on the tensor-core kernel; fp32
+    engages with ``allow_tf32`` (TF32 MMAs, ~1e-4 module-level — the same
+    precision class as the FLARE fp32 policy; the op's exact fp32 kernel
+    measures slower than the eager chain, so strict fp32 keeps eager).
+    ``PHYSICSNEMO_DISABLE_PHYSICSNEMO_OPS=1`` restores bitwise eager.
     """
     if not (_plain_cuda(slice_projections) and _plain_cuda(fx)):
         return False
-    if slice_projections.dtype not in (torch.float16, torch.bfloat16):
+    if slice_projections.dtype not in _ATTENTION_DTYPES:
         return False
     if fx.dtype is not slice_projections.dtype:
         return False

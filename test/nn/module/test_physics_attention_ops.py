@@ -89,19 +89,26 @@ def test_physics_attention_ops_uses_kernels(monkeypatch):
 
 
 @cuda
-def test_physics_attention_ops_fp32_falls_back():
-    """fp32 keeps the eager path bitwise: the op's exact fp32 kernel is
-    slower than eager, and the fast variant would change fp32 numerics."""
+def test_physics_attention_ops_fp32_tf32_class():
+    """fp32 engages the TF32 tensor-core kernel (same precision class as
+    the FLARE fp32 policy); the kill switch restores bitwise eager."""
     module = _physics_attention()
-    x = torch.randn(1, 400, 128, device="cuda")
+    x = torch.randn(1, 2000, 128, device="cuda")
     with torch.no_grad():
         got = module(x)
         ref = _eager_reference(module, x)
-    assert torch.equal(got, ref)
+    err = (got - ref).abs().max() / ref.abs().max()
+    assert err.item() < 5e-4
+    assert not torch.equal(got, ref)  # TF32 engaged, not silently eager
 
 
 @cuda
-@pytest.mark.parametrize("dtype,tol", [(torch.float16, 2e-2), (torch.bfloat16, 5e-2)])
+@pytest.mark.parametrize(
+    "dtype,tol",
+    # fp32 is TF32-class both directions; the temperature grad (a scalar
+    # accumulated over every token) sits at ~3e-3 against strict eager.
+    [(torch.float32, 5e-3), (torch.float16, 2e-2), (torch.bfloat16, 5e-2)],
+)
 def test_physics_attention_ops_grad_parity(dtype, tol):
     """Training goes through the composite backward; parameter gradients
     match the eager path."""

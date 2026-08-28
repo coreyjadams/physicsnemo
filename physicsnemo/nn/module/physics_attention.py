@@ -178,8 +178,10 @@ def _compute_slices_from_projections(
         clamped_temp = torch.clamp(temperature, min=0.5, max=5).to(
             slice_projections.dtype
         )
+        # allow_tf32 affects fp32 only (TF32 MMAs, ~1e-4 — the FLARE fp32
+        # precision class); 16-bit inputs ignore it.
         token_partial, norm_partial, slice_weights = ops.slice_attn_softmax_reduce(
-            slice_projections / clamped_temp, fx, return_weights=True
+            slice_projections / clamped_temp, fx, return_weights=True, allow_tf32=True
         )
         slice_token = (token_partial / (norm_partial[..., None] + 1e-2)).to(fx.dtype)
         return slice_weights, slice_token
