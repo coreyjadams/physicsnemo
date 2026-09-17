@@ -68,6 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Dependencies
 
+- Drops `onnx`, `torchvision` and `pandas` from the required dependencies. Neither
+  `onnx` nor `torchvision` is imported by the package. `pandas` is now optional:
+  it ships with the `datapipes-extras` and `utils-extras` extras and is imported
+  lazily by the HEALPix datapipes and model, the DrivAerNet dataset,
+  `physicsnemo.utils.insolation`, and the experimental HEALDA datapipes.
+
 ## [2.2.1] - 2026-XX-YY
 
 ### Fixed

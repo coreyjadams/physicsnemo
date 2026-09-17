@@ -15,7 +15,10 @@
 # limitations under the License.
 
 import numpy as np
-import pandas as pd
+
+from physicsnemo.core.version_check import OptionalImport
+
+pd = OptionalImport("pandas")
 
 
 def insolation(
