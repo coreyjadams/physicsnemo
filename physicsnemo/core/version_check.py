@@ -217,7 +217,7 @@ _PACKAGE_HINTS: Dict[str, str] = {
     "pandas": _format_install_hint(
         "pandas",
         group="datapipes-extras",
-        direct_hint="pip install pandas  (also included in [utils-extras])",
+        direct_hint="pip install pandas  (also included in [model-extras])",
     ),
     "netCDF4": _format_install_hint(
         "netCDF4",

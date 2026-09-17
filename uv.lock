@@ -5966,7 +5966,6 @@ natten-cu13 = [
 nn-extras = [
     { name = "line-profiler" },
     { name = "mlflow" },
-    { name = "pandas" },
     { name = "scipy" },
     { name = "stl" },
     { name = "vtk" },
@@ -5987,7 +5986,6 @@ uq-extras = [
 utils-extras = [
     { name = "line-profiler" },
     { name = "mlflow" },
-    { name = "pandas" },
     { name = "stl" },
     { name = "vtk" },
     { name = "wandb" },
@@ -6047,8 +6045,6 @@ requires-dist = [
     { name = "pandas", marker = "extra == 'datapipes-extras'", specifier = ">=2.2.0" },
     { name = "pandas", marker = "extra == 'gnns'", specifier = ">=2.2.0" },
     { name = "pandas", marker = "extra == 'model-extras'", specifier = ">=2.2.0" },
-    { name = "pandas", marker = "extra == 'nn-extras'", specifier = ">=2.2.0" },
-    { name = "pandas", marker = "extra == 'utils-extras'", specifier = ">=2.2.0" },
     { name = "psutil", specifier = ">=6.0.0" },
     { name = "pylibraft-cu12", marker = "extra == 'cu12'", specifier = ">=26.2.0", index = "https://pypi.nvidia.com/" },
     { name = "pylibraft-cu13", marker = "extra == 'cu13'", specifier = ">=26.2.0", index = "https://pypi.nvidia.com/" },

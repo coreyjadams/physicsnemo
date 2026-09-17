@@ -16,10 +16,6 @@
 
 import numpy as np
 
-from physicsnemo.core.version_check import OptionalImport
-
-pd = OptionalImport("pandas")
-
 
 def insolation(
     dates, lat, lon, scale=1.0, daily=False, enforce_2d=False, clip_zero=True
@@ -71,13 +67,9 @@ def insolation(
     om = 282.7 * np.pi / 180.0
     beta = np.sqrt(1 - ecc**2.0)
 
-    # Get the day of year as a float.
-    start_years = np.array(
-        [pd.Timestamp(pd.Timestamp(d).year, 1, 1) for d in dates], dtype="datetime64"
-    )
-    days_arr = (np.array(dates, dtype="datetime64") - start_years) / np.timedelta64(
-        1, "D"
-    )
+    # Get the day of year as a float: elapsed days since Jan 1 of each date's year.
+    dates_arr = np.array(dates, dtype="datetime64")
+    days_arr = (dates_arr - dates_arr.astype("datetime64[Y]")) / np.timedelta64(1, "D")
     for d in range(n_dim):
         days_arr = np.expand_dims(days_arr, -1)
     # For daily max values, set the day to 0.5 and the longitude everywhere to 0 (this is approx noon)
