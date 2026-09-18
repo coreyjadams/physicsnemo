@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PHYSICSNEMO_DIST_TIMEOUT_S`; unset or empty configuration keeps PyTorch's
   backend default. Invalid timeouts are rejected before initialization state
   changes, allowing corrected configuration to be retried.
+- Unified external aero recipe: `NonDimensionalizeByMetadata` gains
+  `scale_geometry` so chained instances scale the geometry once; inference
+  re-dimensionalizes with the field maps of every instance.
 
 ### Changed
 
@@ -42,8 +45,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Removes `physicsnemo.utils.mesh`, deprecated since 2.1 with removal scheduled
+  for 2.2. The `vtk` and `stl` entries leave the `utils-extras` extra with it.
+  Replacements:
+  - `sdf_to_stl(field, threshold)`: `marching_cubes` from
+    `physicsnemo.mesh.generate` returns a `Mesh`; save it with `to_pyvista`
+    from `physicsnemo.mesh.io`, e.g.
+    `to_pyvista(marching_cubes(torch.as_tensor(field), threshold)).save("out.stl")`.
+  - `combine_vtp_files(files, out)`:
+    `pyvista.merge([pyvista.read(f) for f in files]).save(out)`.
+  - `convert_tesselated_files_in_directory`: `pyvista.read(src).save(dst)` per
+    file; PyVista reads and writes OBJ, VTP and STL.
+
 ### Fixed
 
+- Fixes mesh dtype handling: preserves integer-coordinate precision, normalizes
+  connectivity safely, and rejects integer `.to()` casts. Floating/complex casts
+  preserve the source mesh.
+- Fixed an issue in `Natten2DSelfAttention` and `RopeNatten2DSelfAttention`
+  with `qk_norm=True` mixing `LayerNorm` fp32 Q/K outputs with autocasted V
+  dtypes.
 - Normalizes cell, point, transformed, and partition-cluster mesh normals
   robustly across floating-point dtypes and scales. Zero vectors remain zero,
   small nonzero vectors retain unit length, and large finite vectors avoid
@@ -63,6 +84,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-write no longer leaves an unloadable truncated checkpoint. Also fixes
   `legacy_format=True`, which failed with `FileNotFoundError` on current
   fsspec versions.
+- `RandomRotateMesh` defaults to `mode="axis_aligned"` when `axes` is given.
+  Unified external aero recipe translation configs pass tensor bounds so
+  `torch.distributions.Uniform` instantiates.
+- `RenameMeshFields` and `DropMeshFields` also apply to a `DomainMesh`'s
+  domain-level `global_data`.
 
 ### Security
 
@@ -362,6 +388,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next event (the new particle's features and inter-event delay) from the
   current particle population, an optional background mesh, and the simulation
   time. Independent rollouts form an ensemble for uncertainty quantification.
+- Adds an FP-DDM domain-decomposition example (`examples/tcad/fp_ddm`): an
+  overlapping Schwarz method for steady 2-D thermal problems with a
+  physics-informed PhysicsNeMo FNO local solver, a matrix-free finite-volume
+  reference solver, and a numerical plane-stress elasticity baseline.
 
 ### Changed
 
