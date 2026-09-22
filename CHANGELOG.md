@@ -65,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Removes the opt-in `physicsnemo.compat` import-alias layer and the
+  `PHYSICSNEMO_ENABLE_COMPAT` environment variable. The layer mapped pre-v2.0
+  module paths onto their v2.0 locations; three minor releases later, callers
+  should import from the current paths listed in `v2.0-MIGRATION-GUIDE.md`.
+  Checkpoint loading is unaffected.
 - Removes `physicsnemo.utils.mesh`, deprecated since 2.1 with removal scheduled
   for 2.2. The `vtk` and `stl` entries leave the `utils-extras` extra with it.
   Replacements:
