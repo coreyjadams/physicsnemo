@@ -53,6 +53,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Refresh core, optional, development, and container dependency versions.
+  Require PyTorch 2.13 or newer and TensorDict 0.14.2 or newer;
+  use PyTorch 2.13's CUDA 12.9 wheels for the CUDA 12 backend. NATTEN
+  extras select PyTorch 2.13 to match their prebuilt kernels. Python support remains
+  3.11 through 3.14.
+
+- `physicsnemo.mesh.fields` is rebuilt around two types. `RankSpec` (`rank`,
+  `symmetric`, `parity`; `shape(n_spatial_dims)`, `numel(n_spatial_dims)`) is
+  one field's transformation law; `FieldSchema` is an insertion-ordered
+  mapping from dotted field names to `RankSpec`, parsed once at a model's
+  boundary with `FieldSchema.parse` (nested groups and dotted names flatten
+  alike) and queried with `.ranks`, `.count(rank)`, `FieldSchema.key(name)`
+  and `.check(tensordict, label=...)`. Both are read-only `dict`s, so a
+  declaration serializes to JSON as written and model checkpoints can record
+  them directly. Validation is construction, so an invalid schema cannot
+  exist. A field is declared as a `RankSpec` or a mapping of values,
+  `{"rank": n}` (YAML: `pressure: {rank: 0}`); a mapping of mappings is a
+  nested group. Integer leaves are no longer accepted.
+- GLOBE's field declarations are renamed after the schemas they hold:
+  `output_field_ranks`, `boundary_source_data_ranks` and `global_data_ranks`
+  become `output_schema`, `boundary_source_schemas` and `global_schema`
+  (kernels: `output_schema`, `source_schema`, `global_schema`), each also the
+  attribute holding the parsed `FieldSchema`. GLOBE raises
+  `NotImplementedError` for fields it does not implement (rank 2 and above,
+  pseudotensors) instead of silently dropping or misreading them. The GLOBE
+  examples and the unified external-aerodynamics recipe configs are updated.
 - Mesh integration uses a shared `_effective_measure` field for complete cell
   and point measures. Cell measures fall back to geometry; point measures are
   explicit and independent of connectivity. `Mesh.integrate_samples` evaluates
@@ -102,6 +128,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `physicsnemo.mesh.fields`: `RankSpecDict`, `flatten_rank_spec`,
+  `rank_counts`, `ranks_from_tensordict` and `validate_data_contains_ranks`,
+  replaced by `FieldSchema` (see Changed). Importing one of them from
+  `physicsnemo.mesh` or `physicsnemo.mesh.fields` raises an `ImportError` that
+  names its replacement.
 - Removes the opt-in `physicsnemo.compat` import-alias layer and the
   `PHYSICSNEMO_ENABLE_COMPAT` environment variable. The layer mapped pre-v2.0
   module paths onto their v2.0 locations; three minor releases later, callers
@@ -130,6 +161,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thin faces and their quadrature measures without Gram cancellation or
   overflow/underflow in the norm.
 
+- Unified external aero recipe: near-wall SDF normals no longer flip inward
+  from float32 roundoff. Stored signed distances are unchanged.
 - Fixes mesh dtype handling: preserves integer-coordinate precision, normalizes
   connectivity safely, and rejects integer `.to()` casts. Floating/complex casts
   preserve the source mesh.
