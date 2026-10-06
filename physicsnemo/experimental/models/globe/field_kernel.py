@@ -120,7 +120,7 @@ def _device_chunk_budget_bytes(device: torch.device) -> int:
 
 
 def _take_last(x: torch.Tensor, idx: tuple[int, ...]) -> torch.Tensor:
-    """``x[..., idx]`` from int views: no host-to-device index upload."""
+    r"""``x[..., idx]`` from int views: no host-to-device index upload."""
     return torch.stack([x[..., i] for i in idx], dim=-1) if idx else x[..., :0]
 
 
