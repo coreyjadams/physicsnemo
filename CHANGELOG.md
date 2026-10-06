@@ -152,15 +152,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Checkpoint loading resolves model weights at the selected training checkpoint's
+  filename index, preventing resumes that mix epochs. Missing required weights
+  raise before any model or training state is restored. Distributed loads validate
+  on every rank using rank 0's file lookup.
 - Mesh slicing reuses integer indices across connectivity, fields, and caches
   to avoid repeated CUDA synchronization for the same boolean mask.
   Point slicing skips mask processing when the output has no cells because
   the input has no cells or the point selection is empty.
-
 - Triangle areas use direct area components and a rescaled norm, preserving
   thin faces and their quadrature measures without Gram cancellation or
   overflow/underflow in the norm.
-
 - Unified external aero recipe: near-wall SDF normals no longer flip inward
   from float32 roundoff. Stored signed distances are unchanged.
 - Fixes mesh dtype handling: preserves integer-coordinate precision, normalizes
