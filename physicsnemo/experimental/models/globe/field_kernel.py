@@ -624,10 +624,10 @@ class Kernel(Module):
             vectors = vectors.to(dtype=dtype)
 
         ### Vector magnitude, direction, and log-magnitude features
-        r2 = self._smoothing_radius_sq  # per leaf: TD + 0-dim tensor .item()s it
         with record_function("kernel::feature_engineering"):
-            vectors_mag_squared: TensorDict = (
-                (vectors * vectors).sum(dim=-1).apply(lambda t: t + r2)
+            # Per leaf: TD + 0-dim tensor would .item() the radius (a sync).
+            vectors_mag_squared: TensorDict = (vectors * vectors).sum(dim=-1).apply(
+                lambda t: t + self._smoothing_radius_sq
             )
             vectors_mag = vectors_mag_squared.sqrt()
             vectors_hat = vectors / vectors_mag.unsqueeze(-1)
