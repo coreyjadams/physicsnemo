@@ -79,6 +79,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NotImplementedError` for fields it does not implement (rank 2 and above,
   pseudotensors) instead of silently dropping or misreading them. The GLOBE
   examples and the unified external-aerodynamics recipe configs are updated.
+- `physicsnemo.mesh.Mesh`, `DomainMesh`, `Adjacency`, `BVH`, `ClusterTree`,
+  `DualInteractionPlan`, and `SourceAggregates` now inherit directly from
+  `TensorClass` instead of using the `@tensorclass` decorator. Existing
+  constructor defaults and `Mesh[m, s]` runtime specialization remain
+  available, and nested mesh types survive memmap round trips. The memmap
+  layout is unchanged: existing `.pmsh` / `.pdmsh` files remain readable, and
+  new files are byte-identical to those written with the decorator.
 - Mesh integration uses a shared `_effective_measure` field for complete cell
   and point measures. Cell measures fall back to geometry; point measures are
   explicit and independent of connectivity. `Mesh.integrate_samples` evaluates
@@ -152,15 +159,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Checkpoint loading resolves model weights at the selected training checkpoint's
+  filename index, preventing resumes that mix epochs. Missing required weights
+  raise before any model or training state is restored. Distributed loads validate
+  on every rank using rank 0's file lookup.
 - Mesh slicing reuses integer indices across connectivity, fields, and caches
   to avoid repeated CUDA synchronization for the same boolean mask.
   Point slicing skips mask processing when the output has no cells because
   the input has no cells or the point selection is empty.
-
 - Triangle areas use direct area components and a rescaled norm, preserving
   thin faces and their quadrature measures without Gram cancellation or
   overflow/underflow in the norm.
-
 - Unified external aero recipe: near-wall SDF normals no longer flip inward
   from float32 roundoff. Stored signed distances are unchanged.
 - Fixes mesh dtype handling: preserves integer-coordinate precision, normalizes
@@ -208,6 +217,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `torch.distributions.Uniform` instantiates.
 - `RenameMeshFields` and `DropMeshFields` also apply to a `DomainMesh`'s
   domain-level `global_data`.
+- `sample_data_at_points`, `find_containing_cells`, and
+  `find_all_containing_cells` no longer miss the containing cell when a query
+  point has more than 32 BVH candidate cells (for example, near a vertex shared
+  by many triangles, or with a prebuilt BVH with `leaf_size > 1`). The BVH
+  candidate search used by these functions no longer caps candidates per point.
 
 ### Security
 
