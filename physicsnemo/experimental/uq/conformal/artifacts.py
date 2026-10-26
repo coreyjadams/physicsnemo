@@ -26,7 +26,12 @@ from tensordict import TensorDict
 from torch import Tensor
 
 from ._utils import pack_fields, validate_provenance
-from .scores import _SCORE_REGISTRY, _check_config_value, _strategy_kind
+from .scores import (
+    _SCALE_REGISTRY,
+    _SCORE_REGISTRY,
+    _check_config_value,
+    _strategy_kind,
+)
 
 _ARTIFACT_FORMAT = "physicsnemo.uq.conformal"
 _ARTIFACT_VERSION = 1
@@ -38,7 +43,7 @@ _SCHEMA_KEYS = {
     "alpha",
     "n_cal",
     "thresholds",
-    "difficulty",
+    "scale",
     "mesh_fingerprint",
     "provenance",
 }
@@ -60,7 +65,7 @@ def _check_exact_keys(value: object, expected: set[str], where: str) -> Mapping:
 
 
 def _strategy_spec(strategy: object, registry: Mapping) -> dict:
-    """Encode a registered strategy as ``{"kind", "kwargs"}``."""
+    """Encode a registered score or scale as ``{"kind", "kwargs"}``."""
     return {
         "kind": _strategy_kind(strategy, registry),
         "kwargs": {
@@ -70,7 +75,7 @@ def _strategy_spec(strategy: object, registry: Mapping) -> dict:
 
 
 def _resolve_strategy(spec: object, registry: Mapping, what: str):
-    """Rebuild a registered strategy from its saved spec."""
+    """Rebuild a registered score or scale from its saved spec."""
     spec = _check_exact_keys(spec, {"kind", "kwargs"}, f"Artifact {what} spec")
     kind = spec["kind"]
     if type(kind) is not str or kind not in registry:
@@ -135,16 +140,20 @@ def _parse_artifact(payload: object) -> dict:
         )
     payload = _check_exact_keys(payload, _SCHEMA_KEYS, "Conformal artifact")
     score = _resolve_strategy(payload["score"], _SCORE_REGISTRY, "score")
-    if payload["difficulty"] is not None:
-        raise ValueError(
-            f"Artifact difficulty must be None, got {payload['difficulty']!r}."
+    scale = (
+        None
+        if payload["scale"] is None
+        else _resolve_strategy(
+            payload["scale"], _SCALE_REGISTRY, "scale"
         )
+    )
     return {
         "tier": payload["tier"],
         "score": score,
         "alpha": payload["alpha"],
         "n_cal": payload["n_cal"],
         "thresholds": _wire_thresholds(payload["thresholds"]),
+        "scale": scale,
         "mesh_fingerprint": payload["mesh_fingerprint"],
         "provenance": payload["provenance"],
     }
@@ -152,6 +161,7 @@ def _parse_artifact(payload: object) -> dict:
 
 def _artifact_payload(state: Mapping) -> dict:
     """Encode predictor state, thresholds keyed by field, for ``torch.save``."""
+    scale = state["scale"]
     return {
         "format": _ARTIFACT_FORMAT,
         "version": _ARTIFACT_VERSION,
@@ -162,7 +172,11 @@ def _artifact_payload(state: Mapping) -> dict:
         "thresholds": {
             key: value.detach().cpu() for key, value in state["thresholds"].items()
         },
-        "difficulty": None,
+        "scale": (
+            None
+            if scale is None
+            else _strategy_spec(scale, _SCALE_REGISTRY)
+        ),
         "mesh_fingerprint": state["mesh_fingerprint"],
         "provenance": validate_provenance(state["provenance"]),
     }

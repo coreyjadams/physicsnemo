@@ -32,6 +32,9 @@ Choose the score by what your model outputs:
 
 For tensor inputs, ``aux`` maps each key to a tensor; for ``TensorDict``
 inputs, it maps each field name to such a mapping.
+
+:class:`AuxScale` is an optional per-point scale for the functional
+band calibrator.
 """
 
 import copy
@@ -41,10 +44,11 @@ import torch
 from jaxtyping import Float
 from torch import Tensor
 
-from ._utils import cast_directed, clamp_min_floor, positive_finite_float
+from ._utils import cast_directed, check_real, clamp_min_floor, positive_finite_float
 
 __all__ = [
     "AbsoluteErrorScore",
+    "AuxScale",
     "NonconformityScore",
     "NormalizedErrorScore",
     "QuantileRegressionScore",
@@ -128,6 +132,11 @@ class NonconformityScore:
         Whether scores can be negative, as for
         :class:`~physicsnemo.experimental.uq.conformal.QuantileRegressionScore`.
         Otherwise predictors reject negative thresholds.
+    scale_aux_keys : tuple[str, ...]
+        ``aux`` entries the score divides by, as ``NormalizedErrorScore``
+        divides by ``"sigma"``. Calibrators reject an
+        :class:`~physicsnemo.experimental.uq.conformal.AuxScale` that
+        reads one of them, since the interval would scale by it twice.
 
     Examples
     --------
@@ -160,6 +169,7 @@ class NonconformityScore:
     aux_keys: tuple[str, ...] = ()
     config_fields: tuple[str, ...] = ()
     signed_threshold: bool = False
+    scale_aux_keys: tuple[str, ...] = ()
     _kind: str
 
     def score(
@@ -240,9 +250,11 @@ class NonconformityScore:
         prediction : torch.Tensor
             Model output of shape :math:`(*\text{dims})`.
         threshold : torch.Tensor
-            Fitted threshold, broadcastable against ``prediction``, such as
-            the one value per element of shape :math:`(*\text{dims})` fitted
-            by the pointwise calibrator.
+            Fitted threshold, broadcastable against ``prediction``: one value
+            per element of shape :math:`(*\text{dims})` for the pointwise
+            calibrator, or a scalar (already multiplied by the per-point
+            ``AuxScale`` value, if any) for the functional band
+            calibrator.
         aux : Mapping[str, torch.Tensor], optional
             The same ``aux`` entries that :meth:`score` needs.
 
@@ -499,6 +511,7 @@ class NormalizedErrorScore(NonconformityScore):
     """
 
     aux_keys = ("sigma",)
+    scale_aux_keys = ("sigma",)  # the residual is divided by sigma
     config_fields = ("eps",)
 
     def __init__(self, eps: float = 1e-8) -> None:
@@ -601,6 +614,137 @@ class QuantileRegressionScore(NonconformityScore):
         return lo, hi
 
 
+class AuxScale:
+    r"""Per-point scale read from ``aux`` that widens the band where it is large.
+
+    Use it with
+    :class:`~physicsnemo.experimental.uq.conformal.FunctionalBandCalibrator`
+    when the model outputs a per-point uncertainty estimate (a predicted sigma,
+    MC-dropout or ensemble spread). The fitted threshold is multiplied by the
+    scale :math:`s(x)`, which is read at each point, so point sets may differ
+    between samples. Pass the same ``aux`` entry at calibration and at
+    prediction. Without an ``AuxScale`` (:math:`s = 1`), coverage still
+    holds, but bands can be wider than needed.
+
+    For an entry of shape :math:`(n_{\text{points}}, C)` or with more
+    trailing dimensions, :math:`s` is the maximum over the trailing
+    dimensions, so each point gets one scale large enough for every channel.
+
+    Parameters
+    ----------
+    key : str, optional, default="sigma"
+        Name of the ``aux`` entry to read.
+    eps : float, optional, default=1e-8
+        Smallest allowed :math:`s`; smaller values, including zero and
+        negatives, are raised to it.
+
+    Notes
+    -----
+    Do not pair ``AuxScale("sigma")`` with
+    :class:`~physicsnemo.experimental.uq.conformal.NormalizedErrorScore`: the
+    score already divides by sigma, so intervals would scale by sigma twice.
+    Calibrators and predictors raise ``ValueError`` on that pair; use
+    ``AbsoluteErrorScore`` with ``AuxScale``, or ``NormalizedErrorScore``
+    without it.
+
+    Whatever produces the scale must not see the calibration samples: fit it
+    on training data or a separate split, or the coverage guarantee no
+    longer holds.
+
+    The entry must be present on every calibration and prediction call and
+    must be a finite floating-point tensor; NaN or infinity raises an error.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from physicsnemo.experimental.uq.conformal import AuxScale
+    >>> _ = torch.manual_seed(0)
+    >>> scale = AuxScale("sigma")
+    >>> sigma = torch.rand(50, 3) + 0.1
+    >>> scale(aux={"sigma": sigma}).shape
+    torch.Size([50])
+    """
+
+    _kind = "aux"
+    config_fields = ("key", "eps")
+
+    def __init__(self, key: str = "sigma", eps: float = 1e-8) -> None:
+        if not isinstance(key, str):
+            raise TypeError(f"key must be a string, got {type(key).__name__}.")
+        self.key = key
+        self.eps = positive_finite_float(eps, "eps")
+
+    def __call__(self, aux: Mapping[str, Tensor]) -> Float[Tensor, " n_points"]:
+        r"""Return one positive scale per point from ``aux[key]``.
+
+        Calibrators and predictors call this for you; call it directly to
+        inspect the scales.
+
+        Parameters
+        ----------
+        aux : Mapping[str, torch.Tensor]
+            Must contain ``key``, a finite real floating-point tensor of
+            shape :math:`(n_{\text{points}}, *\text{dims})`.
+
+        Returns
+        -------
+        torch.Tensor
+            Positive scales of shape :math:`(n_{\text{points}},)`: the
+            maximum over trailing dimensions, clamped below by the larger of
+            ``eps`` and the dtype's smallest positive normal value.
+
+        Raises
+        ------
+        ValueError
+            If ``aux`` is ``None`` or lacks ``key``, or the entry holds NaN
+            or infinity.
+        TypeError
+            If the entry is not a floating-point tensor (for example
+            ``None``).
+        """
+        return self._scales(aux)
+
+    def _scales(
+        self, aux: Mapping[str, Tensor], pending: list[Tensor] | None = None
+    ) -> Tensor:
+        """``__call__`` that appends the finiteness flag to ``pending`` if given."""
+        if not isinstance(aux, Mapping) or self.key not in aux:
+            raise ValueError(
+                f"AuxScale requires aux entry '{self.key}' at every call; "
+                f"pass aux={{'{self.key}': tensor}}."
+            )
+        s = aux[self.key]
+        if not isinstance(s, Tensor):
+            raise TypeError(
+                f"AuxScale aux '{self.key}' must be a torch.Tensor, got "
+                f"{type(s).__name__}."
+            )
+        check_real(self.key, "AuxScale input", s, pending)
+        if s.ndim >= 2:
+            # One scale per point, large enough for every channel.
+            s = s.amax(dim=tuple(range(1, s.ndim)))
+        return clamp_min_floor(s, self.eps)
+
+
+def _check_no_double_scale(
+    score: NonconformityScore, scale: AuxScale | None
+) -> None:
+    """Raise ``ValueError`` if ``scale`` reads a key the score divides by."""
+    if scale is not None and scale.key in score.scale_aux_keys:
+        raise ValueError(
+            f"{type(score).__name__} already divides by aux "
+            f"'{scale.key}', so AuxScale('{scale.key}') would "
+            "scale by it twice. Use AbsoluteErrorScore with AuxScale, or "
+            "drop scale=."
+        )
+
+
+_SCALE_REGISTRY: dict[str, type[AuxScale]] = {
+    AuxScale._kind: AuxScale
+}
+"""Serialization names of the built-in scale types."""
+
+
 def _strategy_kind(strategy: object, registry: Mapping[str, type]) -> str | None:
     """Registered name of a strategy, or ``None`` if its exact type is not registered."""
     kind = getattr(type(strategy), "_kind", None)
@@ -611,10 +755,15 @@ def _snapshot_strategy(strategy: object, registry: Mapping[str, type], what: str
     """Deep-copy a registered strategy; raise ``TypeError`` for any other type."""
     if _strategy_kind(strategy, registry) is None:
         names = ", ".join(sorted(cls.__name__ for cls in registry.values()))
+        hint = (
+            "Register a custom class with @register_score(name); a subclass "
+            "needs its own registration."
+            if registry is _SCORE_REGISTRY
+            else "Subclasses are not supported."
+        )
         raise TypeError(
             f"{what} must be an instance of a registered class ({names}); got "
-            f"{type(strategy).__name__}. Register a custom class with "
-            "@register_score(name); a subclass needs its own registration."
+            f"{type(strategy).__name__}. {hint}"
         )
     for name in type(strategy).config_fields:
         _check_config_value(type(strategy).__name__, name, getattr(strategy, name))

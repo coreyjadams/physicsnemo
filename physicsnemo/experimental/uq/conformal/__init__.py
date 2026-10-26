@@ -22,11 +22,24 @@ calibration set to a calibrator, call its ``finalize()`` to get a predictor,
 then call ``predictor.predict_interval`` on new model outputs to get
 ``(lo, hi)`` bounds with a stated coverage level.
 
-:class:`~physicsnemo.experimental.uq.conformal.PointwiseCalibrator` covers
-each output element with probability at least :math:`1 - \alpha`. Every
-sample must have the same output layout: the same mesh, with the same points
-in the same order, or a fixed set of outputs such as scalar observables. For
-a mesh, pass the coordinates as ``points=`` on every call to check it.
+Pick the calibrator by the guarantee you need:
+
+- :class:`~physicsnemo.experimental.uq.conformal.PointwiseCalibrator`: each
+  output element is covered with probability at least :math:`1 - \alpha`.
+  Every sample must have the same output layout: the same mesh, with the
+  same points in the same order, or a fixed set of outputs such as scalar
+  observables. For a mesh, pass the coordinates as ``points=`` on every
+  call to check it. The width varies element by element: each element's
+  width is fitted from its own calibration errors, so the band follows the
+  model's local error.
+- :class:`~physicsnemo.experimental.uq.conformal.FunctionalBandCalibrator`:
+  a functional band contains every point of a field at once with
+  probability at least :math:`1 - \alpha`. Point sets may differ between
+  samples. One threshold serves the whole field; the width at a point is
+  that threshold times the per-point scale from the score (``aux["sigma"]``
+  for ``NormalizedErrorScore``) or from an ``AuxScale``, and is
+  constant across the field with ``AbsoluteErrorScore`` and no
+  ``AuxScale``.
 
 Pick the score by what the model outputs:
 :class:`~physicsnemo.experimental.uq.conformal.AbsoluteErrorScore` for a
@@ -37,9 +50,12 @@ mean plus a standard deviation in ``aux["sigma"]``, and
 quantile heads in ``aux["lo"]`` and ``aux["hi"]``. For any other score,
 subclass :class:`~physicsnemo.experimental.uq.conformal.NonconformityScore`
 and register it with
-:func:`~physicsnemo.experimental.uq.conformal.register_score`.
+:func:`~physicsnemo.experimental.uq.conformal.register_score`. The
+functional band calibrator also accepts an
+:class:`~physicsnemo.experimental.uq.conformal.AuxScale` to widen the
+band where a per-point uncertainty estimate is large.
 
-The calibrator accepts plain tensors or ``TensorDict`` containers of fields.
+All calibrators accept plain tensors or ``TensorDict`` containers of fields.
 
 Typical usage::
 
@@ -49,6 +65,16 @@ Typical usage::
     predictor = calibrator.finalize()
 
     lo, hi = predictor.predict_interval(model_output, points=points)
+
+For meshes that change between samples, use a mesh-free calibrator and drop
+``points=``::
+
+    calibrator = FunctionalBandCalibrator(AbsoluteErrorScore(), alpha=0.1)
+    for pred, target in calibration_set:
+        calibrator.update(pred, target)
+    predictor = calibrator.finalize()
+
+    lo, hi = predictor.predict_interval(model_output)
 
 Save a fitted predictor, load it elsewhere (the file loads with
 ``weights_only=True``), and check its coverage on held-out data. The
@@ -63,17 +89,21 @@ coverage report measures the same quantity the calibrator guarantees::
         accumulator.update(lo, hi, target)
     report = accumulator.finalize()
 
-The guarantee assumes the calibration and deployment samples are
+Every guarantee assumes the calibration and deployment samples are
 exchangeable, for example drawn independently from the same distribution.
 If deployment data drifts away from the calibration data, the coverage is
-no longer guaranteed.
+no longer guaranteed. Each calibrator's docstring states its guarantee.
 """
 
-from .calibrators import PointwiseCalibrator
+from .calibrators import (
+    PointwiseCalibrator,
+    FunctionalBandCalibrator,
+)
 from .diagnostics import CoverageAccumulator
 from .predictors import ConformalPredictor
 from .scores import (
     AbsoluteErrorScore,
+    AuxScale,
     NonconformityScore,
     NormalizedErrorScore,
     QuantileRegressionScore,
@@ -83,8 +113,10 @@ from .scores import (
 
 __all__ = [
     "AbsoluteErrorScore",
+    "AuxScale",
     "ConformalPredictor",
     "CoverageAccumulator",
+    "FunctionalBandCalibrator",
     "NonconformityScore",
     "NormalizedErrorScore",
     "PointwiseCalibrator",
