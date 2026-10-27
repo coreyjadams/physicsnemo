@@ -114,22 +114,25 @@ class ConformalPredictor:
     The predictor has the guarantee of the calibrator that produced it. A
     pointwise predictor works only on the calibration output shape and, if
     calibration used ``points``, only on the calibration mesh (same
-    coordinates, dtype, and point order). A functional predictor accepts any
-    mesh and may widen intervals per point with an ``AuxScale``.
+    coordinates, dtype, and point order). Functional and risk-control
+    predictors accept any mesh and may widen intervals per point with an
+    ``AuxScale``.
 
     Parameters
     ----------
-    tier : {"pointwise", "functional"}
+    tier : {"pointwise", "functional", "risk_control"}
         Calibrator that produced ``thresholds``: ``"pointwise"`` for
         :class:`~physicsnemo.experimental.uq.conformal.PointwiseCalibrator`,
         ``"functional"`` for
-        :class:`~physicsnemo.experimental.uq.conformal.FunctionalBandCalibrator`.
+        :class:`~physicsnemo.experimental.uq.conformal.FunctionalBandCalibrator`,
+        ``"risk_control"`` for
+        :class:`~physicsnemo.experimental.uq.conformal.RiskControlCalibrator`.
     score : NonconformityScore
         Score used during calibration: a built-in score or a registered
         custom one. The predictor keeps its own copy, so
         later changes to ``score`` have no effect.
     alpha : float
-        Target miscoverage level in :math:`(0, 1)`.
+        Target miscoverage (or risk) level in :math:`(0, 1)`.
     n_cal : int
         Number of calibration samples.
     thresholds : torch.Tensor | TensorDict
@@ -140,20 +143,25 @@ class ConformalPredictor:
         :class:`~physicsnemo.experimental.uq.conformal.QuantileRegressionScore`.
     scale : AuxScale, optional
         Per-point scale applied to the threshold at prediction time
-        (functional tier only).
+        (functional and risk-control tiers only).
     points : torch.Tensor, optional
         Calibration mesh coordinates of shape
         :math:`(n_{\text{points}}, n_{\text{spatial\_dims}})`, for the
         pointwise tier only. The predictor keeps only a checksum of them, and
         :meth:`predict_interval` then requires the same coordinates, dtype,
         and point order. Omit them for pointwise outputs without a mesh.
+    weighted : bool, optional, default=False
+        Whether calibration weighted the points (risk-control tier only).
+        The accumulator from :meth:`coverage_accumulator` then requires
+        ``weights`` on every update, so the report measures the weighted
+        risk the predictor guarantees.
 
     Raises
     ------
     ValueError
         If any of these hold:
 
-        - ``tier`` is not one of the two names above.
+        - ``tier`` is not one of the three names above.
         - :math:`n_{cal} < (1 - \alpha) / \alpha`: collect more samples or
           raise ``alpha``.
         - ``tier="pointwise"`` with ``scale``.
@@ -165,9 +173,10 @@ class ConformalPredictor:
         - A threshold is negative and ``score`` is not
           ``QuantileRegressionScore``.
         - ``scale`` reads the aux key that ``score`` divides by.
+        - ``weighted=True`` on a tier other than ``"risk_control"``.
     TypeError
-        If ``score`` or ``scale`` is not a built-in class, or a
-        threshold is not floating point.
+        If ``score`` or ``scale`` is not a built-in class, a threshold is
+        not floating point, or ``weighted`` is not a ``bool``.
 
     Examples
     --------
@@ -195,6 +204,7 @@ class ConformalPredictor:
         thresholds: Float[Tensor, "*dims"] | Float[Tensor, ""] | TensorDict,
         scale: AuxScale | None = None,
         points: Float[Tensor, "n_points n_spatial_dims"] | None = None,
+        weighted: bool = False,
     ) -> None:
         self._init(
             tier=tier,
@@ -204,6 +214,7 @@ class ConformalPredictor:
             thresholds=thresholds,
             scale=scale,
             mesh_fingerprint=None if points is None else points_fingerprint(points),
+            weighted=weighted,
         )
 
     @classmethod
@@ -224,9 +235,16 @@ class ConformalPredictor:
         scale: AuxScale | None = None,
         mesh_fingerprint: str | None = None,
         provenance: Mapping | None = None,
+        weighted: bool = False,
     ) -> None:
         if tier not in TIERS:
             raise ValueError(f"tier must be one of {TIERS}, got {tier!r}.")
+        if type(weighted) is not bool:
+            raise TypeError(f"weighted must be a bool, got {type(weighted).__name__}.")
+        if weighted and tier != "risk_control":
+            raise ValueError(
+                f"weighted=True applies only to the risk_control tier, not {tier!r}."
+            )
         require_feasible_alpha(n_cal, alpha)
         alpha = float(alpha)
         score_snapshot = _snapshot_strategy(score, _SCORE_REGISTRY, "score")
@@ -235,7 +253,7 @@ class ConformalPredictor:
             if scale is not None:
                 raise ValueError(
                     "A pointwise predictor does not take scale=; only "
-                    "functional predictors use AuxScale."
+                    "functional and risk_control predictors use AuxScale."
                 )
             scale_snapshot = None
             mesh_snapshot = (
@@ -275,20 +293,22 @@ class ConformalPredictor:
                     )
         self._scale = scale_snapshot
         self._mesh_fingerprint = mesh_snapshot
+        self._weighted = weighted
         self._provenance = {} if provenance is None else validate_provenance(provenance)
 
     @property
     def tier(self) -> Tier:
         r"""Calibrator that produced this predictor.
 
-        ``"pointwise"`` for ``PointwiseCalibrator`` or ``"functional"`` for
-        ``FunctionalBandCalibrator``.
+        ``"pointwise"`` for ``PointwiseCalibrator``, ``"functional"`` for
+        ``FunctionalBandCalibrator``, or ``"risk_control"`` for
+        ``RiskControlCalibrator``.
         """
         return self._tier
 
     @property
     def alpha(self) -> float:
-        r"""Target miscoverage level."""
+        r"""Target miscoverage level, or target risk for ``"risk_control"``."""
         return self._alpha
 
     @property
@@ -315,6 +335,11 @@ class ConformalPredictor:
     def _tensor_mode(self) -> bool:
         """Whether calibration used a plain tensor instead of a ``TensorDict``."""
         return set(self._thresholds_by_key) == {TENSOR_KEY}
+
+    @property
+    def weighted(self) -> bool:
+        r"""Whether calibration weighted the points (risk-control tier only)."""
+        return self._weighted
 
     @property
     def keys(self) -> list[str] | None:
@@ -397,7 +422,8 @@ class ConformalPredictor:
             require_mesh(
                 points,
                 self._mesh_fingerprint,
-                " If meshes vary, calibrate with FunctionalBandCalibrator.",
+                " If meshes vary, calibrate with FunctionalBandCalibrator or "
+                "RiskControlCalibrator.",
                 pending,
             )
         elif points is not None:
@@ -481,6 +507,8 @@ class ConformalPredictor:
             (pointwise) ``points`` describes a different mesh.
             If meshes vary between samples, calibrate with
             :class:`~physicsnemo.experimental.uq.conformal.FunctionalBandCalibrator`
+            or
+            :class:`~physicsnemo.experimental.uq.conformal.RiskControlCalibrator`
             instead.
         KeyError
             If a ``TensorDict`` prediction lacks a calibrated field.
@@ -528,12 +556,15 @@ class ConformalPredictor:
             A new, empty
             :class:`~physicsnemo.experimental.uq.conformal.CoverageAccumulator`
             set to this predictor's tier, ``alpha``, ``n_cal``, and fields.
+            For a risk-control predictor it requires ``weights`` on every
+            update if calibration used them, and rejects them otherwise.
         """
         return CoverageAccumulator(
             tier=self._tier,
             alpha=self._alpha,
             n_cal=self._n_cal,
             keys=self.keys,
+            weighted=self._weighted if self._tier == "risk_control" else None,
         )
 
     def save(self, path: Path | str, *, provenance: Mapping | None = None) -> None:
@@ -566,6 +597,7 @@ class ConformalPredictor:
             "thresholds": self._thresholds_by_key,
             "scale": self._scale,
             "mesh_fingerprint": self._mesh_fingerprint,
+            "weighted": self._weighted,
             "provenance": self._provenance if provenance is None else provenance,
         }
         _save_artifact(state, path, lambda written: self._read(written, path))

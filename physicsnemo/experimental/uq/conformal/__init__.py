@@ -40,6 +40,12 @@ Pick the calibrator by the guarantee you need:
   for ``NormalizedErrorScore``) or from an ``AuxScale``, and is
   constant across the field with ``AbsoluteErrorScore`` and no
   ``AuxScale``.
+- :class:`~physicsnemo.experimental.uq.conformal.RiskControlCalibrator`: the
+  expected fraction of points outside the band is at most :math:`\alpha`.
+  Point sets may differ between samples. The width is built like the
+  functional band's and is narrower, since only the average fraction of
+  missed points is controlled. ``weights=`` counts each point by its cell
+  area or volume.
 
 Pick the score by what the model outputs:
 :class:`~physicsnemo.experimental.uq.conformal.AbsoluteErrorScore` for a
@@ -51,7 +57,7 @@ quantile heads in ``aux["lo"]`` and ``aux["hi"]``. For any other score,
 subclass :class:`~physicsnemo.experimental.uq.conformal.NonconformityScore`
 and register it with
 :func:`~physicsnemo.experimental.uq.conformal.register_score`. The
-functional band calibrator also accepts an
+functional band and risk-control calibrators also accept an
 :class:`~physicsnemo.experimental.uq.conformal.AuxScale` to widen the
 band where a per-point uncertainty estimate is large.
 
@@ -76,6 +82,9 @@ For meshes that change between samples, use a mesh-free calibrator and drop
 
     lo, hi = predictor.predict_interval(model_output)
 
+``RiskControlCalibrator`` has the same interface and gives narrower bands
+when controlling the average fraction of missed points is enough.
+
 Save a fitted predictor, load it elsewhere (the file loads with
 ``weights_only=True``), and check its coverage on held-out data. The
 coverage report measures the same quantity the calibrator guarantees::
@@ -98,6 +107,7 @@ no longer guaranteed. Each calibrator's docstring states its guarantee.
 from .calibrators import (
     PointwiseCalibrator,
     FunctionalBandCalibrator,
+    RiskControlCalibrator,
 )
 from .diagnostics import CoverageAccumulator
 from .predictors import ConformalPredictor
@@ -121,6 +131,7 @@ __all__ = [
     "NormalizedErrorScore",
     "PointwiseCalibrator",
     "QuantileRegressionScore",
+    "RiskControlCalibrator",
     "check_score",
     "register_score",
 ]

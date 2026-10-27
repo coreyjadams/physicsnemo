@@ -23,21 +23,36 @@ import pytest
 import torch
 
 from physicsnemo.experimental.uq.conformal import (
+    AbsoluteErrorScore,
     AuxScale,
     ConformalPredictor,
     NormalizedErrorScore,
     QuantileRegressionScore,
+    RiskControlCalibrator,
 )
 from physicsnemo.experimental.uq.conformal._utils import points_fingerprint
 from test.experimental.uq.conformal._helpers import (
     TIERS,
     fit,
-    fitted_functional,
+    fitted_risk,
     make_predictor,
 )
 
 _MESH_POINTS = torch.arange(12, dtype=torch.float32).reshape(6, 2)
 _MESH = points_fingerprint(_MESH_POINTS)
+_ARTIFACT_KEYS = {
+    "format",
+    "version",
+    "tier",
+    "score",
+    "alpha",
+    "n_cal",
+    "thresholds",
+    "scale",
+    "mesh_fingerprint",
+    "weighted",
+    "provenance",
+}
 
 
 @pytest.mark.parametrize("tier", TIERS)
@@ -70,18 +85,7 @@ def test_artifact_has_one_exact_schema_and_pointwise_load_requires_the_mesh(tmp_
     ).save(path, provenance=provenance)
     payload = torch.load(path, weights_only=True)
 
-    assert set(payload) == {
-        "format",
-        "version",
-        "tier",
-        "score",
-        "alpha",
-        "n_cal",
-        "thresholds",
-        "scale",
-        "mesh_fingerprint",
-        "provenance",
-    }
+    assert set(payload) == _ARTIFACT_KEYS
     assert payload["format"] == "physicsnemo.uq.conformal"
     assert payload["version"] == 1
     assert payload["tier"] == "pointwise"
@@ -100,6 +104,36 @@ def test_artifact_has_one_exact_schema_and_pointwise_load_requires_the_mesh(tmp_
             loaded.predict_interval(prediction, points=changed)
     lo, hi = loaded.predict_interval(prediction, points=_MESH_POINTS.clone())
     assert lo.shape == hi.shape == prediction.shape
+
+
+def test_weighted_risk_control_predictor_round_trips_in_the_same_schema(tmp_path):
+    """Weights change only the fitted scalar, so the artifact format is unchanged."""
+    generator = torch.Generator().manual_seed(5)
+    calibrator = RiskControlCalibrator(AbsoluteErrorScore(), alpha=0.25)
+    for n_points in range(8, 16):
+        prediction = torch.randn(n_points, 3, generator=generator)
+        target = prediction + 0.3 * torch.randn(n_points, 3, generator=generator)
+        weights = torch.rand(n_points, generator=generator) + 0.1
+        calibrator.update(prediction, target, weights=weights)
+    predictor = calibrator.finalize()
+    prediction = torch.randn(6, 3, generator=generator)
+    lo_ref, hi_ref = predictor.predict_interval(prediction)
+
+    path = tmp_path / "weighted.pt"
+    predictor.save(path)
+    payload = torch.load(path, weights_only=True)
+    assert set(payload) == _ARTIFACT_KEYS and payload["version"] == 1
+    assert payload["weighted"] is True
+    loaded = ConformalPredictor.load(path)
+    assert loaded.weighted and torch.equal(loaded.thresholds, predictor.thresholds)
+    lo, hi = loaded.predict_interval(prediction)
+    assert torch.equal(lo, lo_ref) and torch.equal(hi, hi_ref)
+    # The loaded predictor's accumulator holds the report to the weighted risk.
+    accumulator = loaded.coverage_accumulator()
+    with pytest.raises(TypeError, match="calibrated with weights="):
+        accumulator.update(lo, hi, prediction)
+    accumulator.update(lo, hi, prediction, weights=torch.ones(6))
+    assert accumulator.finalize()["fields"]["tensor"]["n_samples"] == 1
 
 
 def test_constructor_and_threshold_access_snapshot_storage(tmp_path):
@@ -132,7 +166,7 @@ def test_provenance_is_read_only_snapshotted_and_survives_resave(tmp_path):
         "identity": {"dataset": "drivaer", "checkpoint": "/runs/x"},
         "audit": [True, None, 300, 0.25],
     }
-    predictor = fitted_functional()
+    predictor = fitted_risk()
     with pytest.raises(AttributeError, match="no setter"):
         predictor.provenance = provenance
 
@@ -151,7 +185,7 @@ def test_provenance_is_read_only_snapshotted_and_survives_resave(tmp_path):
 
 
 def test_non_json_provenance_fails_closed_without_replacing_artifact(tmp_path):
-    predictor = fitted_functional()
+    predictor = fitted_risk()
     path = tmp_path / "artifact.pt"
     predictor.save(path, provenance={"note": "valid"})
     original_bytes = path.read_bytes()
@@ -191,7 +225,7 @@ def test_all_builtin_strategies_are_standalone_artifacts(
 
 
 BASES = {
-    "functional": fitted_functional,
+    "risk": fitted_risk,
     "normalized": lambda: make_predictor(
         tier="functional", score=NormalizedErrorScore()
     ),
@@ -216,7 +250,7 @@ def _delete(key):
 
 _CTOR = "Invalid constructor arguments"
 # fmt: off
-# name: (mutator, load-error regex[, base predictor]); base defaults to "functional".
+# name: (mutator, load-error regex[, base predictor]); base defaults to "risk".
 # A mutator may return a replacement payload, otherwise it edits in place.
 CORRUPTIONS = {
     "not_an_artifact": (lambda p: {"weights": torch.ones(3)}, "[Nn]ot a conformal predictor artifact"),
@@ -232,6 +266,8 @@ CORRUPTIONS = {
     "unknown_score_kind": (_set_in("score", "kind", "bogus"), "Unknown score kind"),
     "extra_score_key": (_set_in("score", "class", "AbsoluteErrorScore"), "score spec schema is invalid"),
     "unknown_scale_kind": (_set("scale", {"kind": "bogus", "kwargs": {}}), "Unknown scale kind"),
+    "weighted_not_bool": (_set("weighted", 1), "weighted must be a bool"),
+    "weighted_on_functional": (_set("weighted", True), "applies only to the risk_control tier", "normalized"),
     "extra_scale_key": (_set("scale", {"kind": "aux", "kwargs": {"key": "s", "eps": 1e-8}, "class": "X"}), "scale spec schema is invalid"),
     "non_mapping_scale": (_set("scale", "aux"), "scale spec schema is invalid"),
     "non_json_provenance": (_set("provenance", {"tags": ("x",)}), "strict-JSON"),
@@ -254,7 +290,7 @@ CORRUPTIONS = {
 def test_corrupted_artifacts_fail_to_load_with_a_named_reason(tmp_path, corruption):
     mutate, match, *base = CORRUPTIONS[corruption]
     path = tmp_path / "artifact.pt"
-    BASES[base[0] if base else "functional"]().save(path)
+    BASES[base[0] if base else "risk"]().save(path)
     payload = torch.load(path, weights_only=True)
     payload = mutate(payload) or payload
     torch.save(payload, path)
@@ -279,7 +315,7 @@ def test_load_refuses_pickled_code(tmp_path):
 
 
 def test_atomic_save_preserves_previous_artifact(tmp_path, monkeypatch):
-    predictor = fitted_functional()
+    predictor = fitted_risk()
     path = tmp_path / "artifact.pt"
     predictor.save(path, provenance={"epoch": 1})
     original_bytes = path.read_bytes()
@@ -298,10 +334,10 @@ def test_atomic_save_preserves_previous_artifact(tmp_path, monkeypatch):
 
 def test_atomic_save_semantically_validates_before_replace(tmp_path):
     path = tmp_path / "artifact.pt"
-    fitted_functional().save(path, provenance={"epoch": 1})
+    fitted_risk().save(path, provenance={"epoch": 1})
     original_bytes = path.read_bytes()
 
-    invalid = fitted_functional(torch.Generator().manual_seed(19))
+    invalid = fitted_risk(torch.Generator().manual_seed(19))
     invalid._thresholds_by_key["__tensor__"].fill_(float("inf"))
     with pytest.raises(ValueError, match=f"at {re.escape(str(path))}: .*non-finite"):
         invalid.save(path, provenance={"epoch": 2})

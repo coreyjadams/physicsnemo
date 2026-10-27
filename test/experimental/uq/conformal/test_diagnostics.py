@@ -28,19 +28,31 @@ from physicsnemo.experimental.uq.conformal import (
     FunctionalBandCalibrator,
     PointwiseCalibrator,
     QuantileRegressionScore,
+    RiskControlCalibrator,
 )
 from test.experimental.uq.conformal._helpers import (
     TIERS,
     count_syncs,
     fit,
-    fitted_functional,
+    fitted_risk,
+    make_predictor,
 )
 
 
-def _accumulator(tier="functional", **fit_kwargs):
-    """Diagnostics for a 3-sample, alpha=0.5 predictor (fit kwargs override)."""
+def _accumulator(tier="risk_control", weighted=None, **fit_kwargs):
+    """Diagnostics for a 3-sample, alpha=0.5 predictor (fit kwargs override).
+
+    Built directly so ``weighted`` stays free unless a test fixes it.
+    """
     kwargs = {"n_samples": 3, "alpha": 0.5, "shape": (3,), **fit_kwargs}
-    return fit(tier, **kwargs)[0].coverage_accumulator()
+    predictor = fit(tier, **kwargs)[0]
+    return CoverageAccumulator(
+        tier=predictor.tier,
+        alpha=predictor.alpha,
+        n_cal=predictor.n_cal,
+        keys=predictor.keys,
+        weighted=weighted,
+    )
 
 
 def _td(**fields):
@@ -55,6 +67,49 @@ def _interval_sample(n_points, n_covered, *, n_components=1, half_width=1.0):
     if n_covered < n_points:
         target[n_covered:, 0 if n_components > 1 else ...] = 2 * half_width
     return lo, hi, target
+
+
+def test_risk_report_averages_each_sample_point_event_equally():
+    accumulator = _accumulator()
+    accumulator.update(*_interval_sample(1, 0))
+    accumulator.update(*_interval_sample(99, 99))
+    report = accumulator.finalize()
+
+    assert report["meta"] == {
+        "tier": "risk_control",
+        "alpha": 0.5,
+        "n_cal": 3,
+        "target_risk": 0.5,
+    }
+    assert report["fields"]["tensor"] == {
+        "n_samples": 2,
+        "mean_interval_width": pytest.approx(2.0),
+        "empirical_mean_risk": pytest.approx(0.5),
+    }
+    assert set(report) == {"meta", "fields"}
+    assert set(report["fields"]) == {"tensor"}
+    json.dumps(report, allow_nan=False)
+
+
+def test_weighted_risk_report_uses_the_normalized_weighted_fraction():
+    accumulator = _accumulator()
+    accumulator.update(*_interval_sample(3, 2), weights=torch.tensor([1.0, 2.0, 7.0]))
+    accumulator.update(*_interval_sample(2, 1), weights=torch.tensor([1.0, 3.0]))
+    # Missed masses 7/10 and 3/4; unweighted they would be 1/3 and 1/2.
+    report = accumulator.finalize()["fields"]["tensor"]
+    assert report["n_samples"] == 2
+    assert report["empirical_mean_risk"] == pytest.approx(0.725)
+
+
+def test_risk_coverage_reduces_trailing_components_to_point_events():
+    accumulator = _accumulator(shape=(3, 3))
+    lo = torch.full((2, 2, 3), -1.0)
+    hi = torch.full((2, 2, 3), 1.0)
+    target = torch.zeros(2, 2, 3)
+    target[1, 1, 2] = 5.0
+    accumulator.update(lo, hi, target)
+    report = accumulator.finalize()["fields"]["tensor"]
+    assert report["empirical_mean_risk"] == pytest.approx(0.5)
 
 
 def test_functional_report_counts_whole_field_containment():
@@ -145,8 +200,8 @@ def test_tensordict_fields_report_per_field_and_select_fitted_keys():
     accumulator.update(lo, hi, _td(p=torch.zeros(3), v=torch.zeros(3), w=torch.ones(3)))
     report = accumulator.finalize()
     assert set(report["fields"]) == {"p", "v"}
-    assert report["fields"]["p"]["whole_field_coverage"] == 1.0
-    assert report["fields"]["v"]["whole_field_coverage"] == 0.5
+    assert report["fields"]["p"]["empirical_mean_risk"] == 0.0
+    assert report["fields"]["v"]["empirical_mean_risk"] == 0.5
     assert report["fields"]["p"]["n_samples"] == report["fields"]["v"]["n_samples"] == 2
     json.dumps(report, allow_nan=False)
 
@@ -158,6 +213,7 @@ EMPTY_ENTRIES = {
         "fraction_at_target": None,
     },
     "functional": {"whole_field_coverage": None},
+    "risk_control": {"empirical_mean_risk": None},
 }
 
 
@@ -190,12 +246,12 @@ _WIDE = (_td(a=_Z64, b=_Z64), _td(a=_Z64 + 1, b=_BIG), _td(a=_Z64, b=_Z64))
 _WIDER = (_WIDE[0], _td(a=_Z64 + 2, b=_BIG), _WIDE[2])
 # fmt: off
 TRANSACTIONAL_REJECTIONS = [  # (id, tier, fields, warm-up update, rejected update, error, match)
-    ("hi-shape-mismatch", "functional", ["a", "b"], (_LO4, _HI4, _T4), (_LO4, _td(a=_ONES4, b=torch.ones(5)), _T4), ValueError, "shape"),
-    ("nonfinite-target", "functional", ["a", "b"], (_LO4, _HI4, _T4), (_LO4, _HI4, _td(a=0 * _ONES4, b=torch.full((4,), torch.inf))), ValueError, "non-finite"),
-    ("missing-fitted-field", "functional", ["a", "b"], (_LO4, _HI4, _T4), (_LO4, _HI4, _td(a=0 * _ONES4)), KeyError, "not present"),
-    ("width-overflow", "functional", None, _PLAIN, tuple(torch.tensor([v], dtype=_F64) for v in (-1e308, 1e308, 0.0)), ValueError, "width overflows"),
-    ("empty-target", "functional", None, _PLAIN, (torch.empty(0),) * 3, ValueError, "Plain tensor: empty"),
-    ("container-mode-mismatch", "functional", None, _PLAIN, (_td(value=0 * _ONES3),) * 3, TypeError, "calibrated on a plain tensor; pass lo as a tensor"),
+    ("hi-shape-mismatch", "risk_control", ["a", "b"], (_LO4, _HI4, _T4), (_LO4, _td(a=_ONES4, b=torch.ones(5)), _T4), ValueError, "shape"),
+    ("nonfinite-target", "risk_control", ["a", "b"], (_LO4, _HI4, _T4), (_LO4, _HI4, _td(a=0 * _ONES4, b=torch.full((4,), torch.inf))), ValueError, "non-finite"),
+    ("missing-fitted-field", "risk_control", ["a", "b"], (_LO4, _HI4, _T4), (_LO4, _HI4, _td(a=0 * _ONES4)), KeyError, "not present"),
+    ("width-overflow", "risk_control", None, _PLAIN, tuple(torch.tensor([v], dtype=_F64) for v in (-1e308, 1e308, 0.0)), ValueError, "width overflows"),
+    ("empty-target", "risk_control", None, _PLAIN, (torch.empty(0),) * 3, ValueError, "Plain tensor: empty"),
+    ("container-mode-mismatch", "risk_control", None, _PLAIN, (_td(value=0 * _ONES3),) * 3, TypeError, "calibrated on a plain tensor; pass lo as a tensor"),
     ("pointwise-second-field-fails", "pointwise", ["a", "b"], (_LO3, _HI3, _T3), (_LO3, _HI3, _td(a=0 * _ONES3, b=0 * _ONES4)), ValueError, "shape"),
     ("width-sum-within-sample", "pointwise", ["a", "b"], (_LO3, _HI3, _T3), (_WIDE[0], _td(a=_Z64 + 2, b=_BIG.roll(1) + _BIG), _WIDE[2]), ValueError, "Field 'b'.*width sum.*[Rr]escale"),
     ("width-sum-cross-call", "pointwise", ["a", "b"], _WIDE, _WIDER, ValueError, "Field 'b'.*width sum.*[Rr]escale"),
@@ -231,6 +287,54 @@ def test_update_rejections_are_transactional(
                 after_map if key is None else after_map[key],
                 before_map if key is None else before_map[key],
             )
+
+
+@pytest.mark.parametrize("tier", ["pointwise", "functional"])
+def test_weights_are_rejected_on_coverage_tiers(tier):
+    accumulator = _accumulator(tier)
+    with pytest.raises(TypeError, match="only to the risk_control tier"):
+        accumulator.update(*_PLAIN, weights=_ONES3)
+    assert accumulator.finalize()["fields"]["tensor"]["n_samples"] == 0
+
+
+@pytest.mark.parametrize(
+    "first_weighted", [True, False], ids=["weighted-first", "unweighted-first"]
+)
+def test_accumulator_weights_are_all_or_none_across_calls(first_weighted):
+    accumulator = _accumulator()
+    weighted, plain = {"weights": _ONES3}, {}
+    first, second = (weighted, plain) if first_weighted else (plain, weighted)
+    accumulator.update(*_PLAIN, **first)
+    before = accumulator.finalize()
+    had = "had" if first_weighted else "did not have"
+    with pytest.raises(TypeError, match=f"first held-out sample {had} weights="):
+        accumulator.update(*_PLAIN, **second)
+    assert accumulator.finalize() == before
+
+
+# fmt: off
+WEIGHT_REJECTIONS = [  # (id, weights, error, match)
+    ("nan", torch.tensor([1.0, torch.nan, 1.0]), ValueError, "non-finite"),
+    ("negative", torch.tensor([1.0, -1.0, 1.0]), ValueError, "nonnegative"),
+    ("all-zero", torch.zeros(3), ValueError, "all zero"),
+    ("wrong-length", torch.ones(4), ValueError, r"Field 'a' \(target\).*weights has 4"),
+    ("2d", torch.ones(3, 1), ValueError, r"shape \(n_points,\)"),
+    ("integer", torch.ones(3, dtype=torch.int64), TypeError, "floating-point"),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize(
+    "weights,error,match",
+    [pytest.param(*row[1:], id=row[0]) for row in WEIGHT_REJECTIONS],
+)
+def test_weighted_update_rejections_are_transactional(weights, error, match):
+    accumulator = _accumulator(fields=["a", "b"])
+    accumulator.update(_LO3, _HI3, _T3, weights=_ONES3)
+    before = accumulator.finalize()
+    with pytest.raises(error, match=match):
+        accumulator.update(_LO3, _HI3, _T3, weights=weights)
+    assert accumulator.finalize() == before
 
 
 def test_infinite_prediction_bounds_require_recomputing_in_wider_dtype():
@@ -279,6 +383,28 @@ def test_update_syncs_once_and_accepts_a_second_device(monkeypatch, device, tier
     assert accumulator.finalize() == reference.finalize()
 
 
+def test_weighted_update_syncs_once_and_accepts_a_second_device(monkeypatch, device):
+    """The weight checks join the one host sync; weights follow the fields."""
+    accumulator = _accumulator(fields=["a", "b"])
+    reference = _accumulator(fields=["a", "b"])
+    weights = torch.tensor([1.0, 2.0, 7.0])
+    samples = [
+        tuple(_td(a=t, b=2 * t) for t in _interval_sample(3, n_covered))
+        for n_covered in (3, 1)
+    ]
+    calls = count_syncs(monkeypatch)
+    accumulator.update(*(t.to(device) for t in samples[0]), weights=weights.to(device))
+    assert calls == ["tolist"]
+    accumulator.update(*samples[1], weights=weights)
+    monkeypatch.undo()
+    for sample in samples:
+        reference.update(*sample, weights=weights)
+    report = accumulator.finalize()
+    assert report == reference.finalize()
+    # The second sample covers only the 0.1-mass point: risks 0 and 0.9.
+    assert report["fields"]["a"]["empirical_mean_risk"] == pytest.approx(0.45)
+
+
 def test_update_does_not_keep_the_autograd_graph():
     accumulator = _accumulator()
     prediction = torch.zeros(3, requires_grad=True) * 2.0
@@ -324,26 +450,26 @@ def test_accumulator_constructor_rejects_unknown_tier():
 
 def test_report_metadata_is_private():
     accumulator = _accumulator()
-    for name, value in (("tier", "pointwise"), ("alpha", 0.1), ("n_cal", 99)):
+    for name, value in (("tier", "functional"), ("alpha", 0.1), ("n_cal", 99)):
         setattr(accumulator, name, value)
     accumulator.keys = ("other",)
     assert accumulator.finalize()["meta"] == {
-        "tier": "functional",
+        "tier": "risk_control",
         "alpha": 0.5,
         "n_cal": 3,
-        "target_coverage": 0.5,
+        "target_risk": 0.5,
     }
 
 
 def _calibrator_finalizer():
-    calibrator = FunctionalBandCalibrator(AbsoluteErrorScore(), alpha=0.5)
+    calibrator = RiskControlCalibrator(AbsoluteErrorScore(), alpha=0.5)
     for _ in range(3):
         calibrator.update(torch.zeros(2), torch.zeros(2))
     return calibrator.finalize
 
 
 def _accumulator_finalizer():
-    accumulator = fitted_functional().coverage_accumulator()
+    accumulator = fitted_risk().coverage_accumulator()
     accumulator.update(*_PLAIN)
     return accumulator.finalize
 
@@ -367,3 +493,27 @@ def test_finalizers_run_per_process_in_multi_rank_job(finalizer, fake_multi_rank
     finalize = FINALIZERS[finalizer]()
     fake_multi_rank()
     assert finalize() is not None
+
+
+def test_predictor_accumulator_fixes_the_weighted_mode():
+    unweighted = make_predictor()
+    accumulator = unweighted.coverage_accumulator()
+    with pytest.raises(TypeError, match="calibrated without weights="):
+        accumulator.update(
+            -torch.ones(3), torch.ones(3), torch.zeros(3), weights=torch.ones(3)
+        )
+    weighted = make_predictor(weighted=True)
+    assert weighted.weighted
+    accumulator = weighted.coverage_accumulator()
+    with pytest.raises(TypeError, match="calibrated with weights="):
+        accumulator.update(-torch.ones(3), torch.ones(3), torch.zeros(3))
+    accumulator.update(
+        -torch.ones(3), torch.ones(3), torch.zeros(3), weights=torch.ones(3)
+    )
+    assert accumulator.finalize()["fields"]["tensor"]["empirical_mean_risk"] == 0.0
+    with pytest.raises(ValueError, match="applies only to the risk_control tier"):
+        make_predictor(tier="functional", weighted=True)
+    with pytest.raises(TypeError, match="weighted must be a bool"):
+        make_predictor(weighted=1)
+    with pytest.raises(ValueError, match="applies only to the risk_control tier"):
+        CoverageAccumulator(tier="functional", alpha=0.5, n_cal=3, weighted=True)
