@@ -99,6 +99,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ClusterTree.merge` joins trees into one forest, whose `root_ids` list the
   root of each tree. Every traversal starts from all of them, so one
   traversal plans a tree against every tree of a forest, on either side.
+- `ClusterTree.from_points`, the new `ClusterTree.from_point_groups` (one tree
+  per group of points, and their forest) and
+  `ClusterTree.find_point_interaction_pairs` run in Warp kernels on CUDA by
+  default (`implementation=`), with one host synchronization instead of one per
+  tree level, and give the same trees and plans. The point plans now list each
+  target's entries together, and `count_only=True` counts them without making
+  the plan.
 - `radius_search` accepts points with 1 or 2 coordinates, as well as 3, with
   both backends. The torch backend accepts any number of coordinates, and
   points with more than 3 use it by default.
