@@ -22,8 +22,8 @@ import torch
 
 pytest.importorskip("torch_geometric")
 
+from physicsnemo.testing.pytest_plugin import requires_module
 from test import common
-from test.conftest import requires_module
 from test.models.meshgraphnet.utils import rand_graph
 
 

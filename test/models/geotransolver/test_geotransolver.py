@@ -32,6 +32,7 @@ from physicsnemo.models.geotransolver.geotransolver import (
     GeoTransolver,
 )
 from physicsnemo.nn import GALE
+from physicsnemo.testing.pytest_plugin import requires_module
 from test.common import (  # noqa E402
     validate_amp,
     validate_checkpoint,
@@ -40,7 +41,6 @@ from test.common import (  # noqa E402
     validate_forward_accuracy,
     validate_jit,
 )
-from test.conftest import requires_module
 
 # =============================================================================
 # GeoTransolver End-to-End Model Tests

@@ -20,9 +20,6 @@ import random
 
 import pytest
 import torch
-
-from physicsnemo.core.module import Module
-from physicsnemo.models.transolver import Transolver
 from test.common import (
     check_ort_version,
     validate_amp,
@@ -34,7 +31,10 @@ from test.common import (
     validate_onnx_export,
     validate_onnx_runtime,
 )
-from test.conftest import requires_module
+
+from physicsnemo.core.module import Module
+from physicsnemo.models.transolver import Transolver
+from physicsnemo.testing.pytest_plugin import requires_module
 
 
 def _assert_parameter_gradients_close(

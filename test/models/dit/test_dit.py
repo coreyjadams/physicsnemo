@@ -27,8 +27,8 @@ from physicsnemo.nn.module.dit_layers import (
     DetokenizerModuleBase,
     TokenizerModuleBase,
 )
+from physicsnemo.testing.pytest_plugin import requires_module
 from test import common
-from test.conftest import requires_module
 
 # --- Tests ---
 

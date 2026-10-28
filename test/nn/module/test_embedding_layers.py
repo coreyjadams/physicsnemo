@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 import torch
+from test.common import validate_forward_accuracy
 
 from physicsnemo.nn import (
     FourierEmbedding,
@@ -27,7 +28,6 @@ from physicsnemo.nn import (
     PositionalEmbedding,
     SinusoidalTimestepEmbedding,
 )
-from test.common import validate_forward_accuracy
 
 # ---------------------------------------------------------------------------
 # PositionalEmbedding – reference-data accuracy (existing tests)

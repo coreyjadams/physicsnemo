@@ -20,8 +20,8 @@ import torch
 
 pytest.importorskip("torch_geometric")
 
+from physicsnemo.testing.pytest_plugin import requires_module
 from test import common
-from test.conftest import requires_module
 
 
 @requires_module("torch_geometric")

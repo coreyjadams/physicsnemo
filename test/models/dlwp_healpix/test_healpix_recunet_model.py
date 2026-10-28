@@ -20,8 +20,8 @@ import pytest
 import torch
 
 from physicsnemo.models.dlwp_healpix import HEALPixRecUNet
+from physicsnemo.testing.pytest_plugin import requires_module
 from test import common
-from test.conftest import requires_module
 from test.models.graphcast.utils import fix_random_seeds
 
 # HEALPixRecUNet parses ``delta_time`` / ``reset_cycle`` with ``pandas.Timedelta``,

@@ -31,8 +31,8 @@ from physicsnemo.experimental.models.strata.layers import (
     Natten3DSelfAttention,
     StrataPixel3DBlock,
 )
+from physicsnemo.testing.pytest_plugin import requires_module
 from test.common import validate_checkpoint
-from test.conftest import requires_module
 
 _DATA = Path(__file__).parent / "data"
 
