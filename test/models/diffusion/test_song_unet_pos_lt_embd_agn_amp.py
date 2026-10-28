@@ -19,8 +19,8 @@ import pytest
 import torch
 
 from physicsnemo.models.diffusion_unets import SongUNetPosLtEmbd
+from physicsnemo.testing import common
 from physicsnemo.testing.pytest_plugin import requires_module
-from test import common
 
 
 @requires_module("apex")

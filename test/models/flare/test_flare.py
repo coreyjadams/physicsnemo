@@ -21,7 +21,12 @@ from pathlib import Path
 
 import pytest
 import torch
-from test.common import (
+
+from physicsnemo.core.module import Module
+from physicsnemo.core.warnings import LegacyFeatureWarning
+from physicsnemo.models.flare import FLARE, FLAREPlusPlus
+from physicsnemo.nn import FLAREPlusPlus as FLAREPlusPlusAttention
+from physicsnemo.testing.common import (
     check_ort_version,
     validate_amp,
     validate_checkpoint,
@@ -32,11 +37,6 @@ from test.common import (
     validate_onnx_export,
     validate_onnx_runtime,
 )
-
-from physicsnemo.core.module import Module
-from physicsnemo.core.warnings import LegacyFeatureWarning
-from physicsnemo.models.flare import FLARE, FLAREPlusPlus
-from physicsnemo.nn import FLAREPlusPlus as FLAREPlusPlusAttention
 from physicsnemo.testing.pytest_plugin import requires_module
 
 

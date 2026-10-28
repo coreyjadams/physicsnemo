@@ -19,8 +19,8 @@ import torch
 from torch.testing import assert_close
 
 import physicsnemo
+from physicsnemo.testing import common
 from physicsnemo.testing.pytest_plugin import requires_module
-from test import common
 
 # Default test configuration
 IN_C = 3

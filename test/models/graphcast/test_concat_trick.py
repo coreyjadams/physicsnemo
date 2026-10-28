@@ -20,8 +20,8 @@ import pytest
 import torch
 from utils import fix_random_seeds
 
+from physicsnemo.testing import common
 from physicsnemo.testing.pytest_plugin import requires_module
-from test import common
 
 
 @requires_module(["torch_geometric", "torch_sparse"])

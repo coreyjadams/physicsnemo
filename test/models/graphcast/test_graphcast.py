@@ -23,8 +23,8 @@ sys.path.append(os.path.join(os.path.dirname(script_path), ".."))
 import pytest
 from graphcast.utils import create_random_input, fix_random_seeds
 
+from physicsnemo.testing import common
 from physicsnemo.testing.pytest_plugin import requires_module
-from test import common
 
 
 # Disable flash attention, specify minimum te version

@@ -30,8 +30,8 @@ from physicsnemo.nn.module.rope import (
     apply_rotary_pos_emb,
     build_axial_rope_cos_sin_2d,
 )
+from physicsnemo.testing import common
 from physicsnemo.testing.pytest_plugin import requires_module
-from test import common
 
 # --- TimmSelfAttention tests ---
 

@@ -21,8 +21,8 @@ import torch
 import physicsnemo
 from physicsnemo.core.registry import ModelRegistry
 from physicsnemo.core.version_check import check_version_spec
+from physicsnemo.testing import common
 from physicsnemo.testing.pytest_plugin import requires_module
-from test import common
 
 # TODO: Makani will have to switch to PhysicsNeMo 2.0. Since we don't have a
 # wheel released yet, this is not possible and this breaks this circular dependency

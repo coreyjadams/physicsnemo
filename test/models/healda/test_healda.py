@@ -17,8 +17,8 @@ import pytest
 import torch
 
 from physicsnemo.experimental.models.healda import HealDA
+from physicsnemo.testing import common
 from physicsnemo.testing.pytest_plugin import requires_module
-from test import common
 
 from .test_point_embed import _build_flattened_obs
 

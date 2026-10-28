@@ -20,7 +20,10 @@ from pathlib import Path
 
 import pytest
 import torch
-from test.common import (
+
+from physicsnemo import Module
+from physicsnemo.experimental.models.smart import SMART
+from physicsnemo.testing.common import (
     validate_amp,
     validate_checkpoint,
     validate_combo_optims,
@@ -28,9 +31,6 @@ from test.common import (
     validate_forward_accuracy,
     validate_jit,
 )
-
-from physicsnemo import Module
-from physicsnemo.experimental.models.smart import SMART
 
 _DEFAULT_CONFIG = dict(
     surface_channels=1,

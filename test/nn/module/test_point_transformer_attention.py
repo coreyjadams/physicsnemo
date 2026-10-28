@@ -17,7 +17,6 @@
 import pytest
 import torch
 import torch.nn as nn
-from test.common import validate_checkpoint, validate_forward_accuracy
 
 from physicsnemo.nn import (
     AdaLNResidualMLP,
@@ -26,6 +25,7 @@ from physicsnemo.nn import (
 )
 from physicsnemo.nn.module import layer_norm as _layer_norm
 from physicsnemo.nn.module.point_transformer_attention import _dilated_knn
+from physicsnemo.testing.common import validate_checkpoint, validate_forward_accuracy
 
 # The blocks normalize with the TE-aware ``LayerNorm``, which resolves once at
 # import to Transformer Engine's CUDA-only LayerNorm whenever TE + CUDA are
