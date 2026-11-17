@@ -14,16 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""GeoTransolverPP: a rotation- and translation-equivariant FLARE++ model.
+r"""GeoTransolverPP: GeoTransolver in the canonical frame of the geometry.
 
 ``GeoTransolverPP`` is a working name. Like GeoTransolver, the model routes
 mesh points through latent tokens and conditions them on an encoded context.
-Here the context is the boundary (geometry plus boundary conditions), and
-every feature the network sees is invariant to rotation and translation.
+Here the context is the boundary: every boundary condition is a named set of
+samples with its own fields. The model expects positions and vectors in the
+canonical, non-dimensional frame of the geometry
+(:class:`~physicsnemo.datapipes.transforms.mesh.CanonicalFrameMesh`), so it
+reads plain coordinates and components and is itself an ordinary network.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -35,11 +39,7 @@ from jaxtyping import Float
 from physicsnemo.core.meta import ModelMetaData
 from physicsnemo.core.module import Module
 from physicsnemo.nn import Mlp
-from physicsnemo.nn.functional import knn
-
-# Floor on the nearest-boundary distance, in units of the reference length,
-# so the neighbor weights stay finite for points that lie on the boundary.
-_MIN_DISTANCE = 1e-3
+from physicsnemo.nn.functional import radius_search
 
 
 @dataclass
@@ -138,29 +138,93 @@ class _Block(nn.Module):
         return x + self.mlp(self.norm_mlp(x, cond))
 
 
+class _NeighborAttention(nn.Module):
+    r"""Each point attends over the boundary tokens within ``radius`` of it.
+
+    Keys and values are the boundary tokens plus an encoding of the offset
+    from token to point. The scores carry the log of each token's measure, so
+    the result is a quadrature-weighted average over the boundary in range
+    and does not depend on the order or density of the boundary samples. When
+    more than ``n_neighbors`` tokens are in range the search keeps a subset.
+    A point with no token in range is left unchanged.
+    """
+
+    def __init__(
+        self, dim: int, heads: int, radius: float, n_neighbors: int, act: str
+    ) -> None:
+        super().__init__()
+        self.heads = heads
+        self.radius = radius
+        self.n_neighbors = n_neighbors
+        self.norm = nn.LayerNorm(dim)
+        self.to_q = nn.Linear(dim, dim)
+        self.to_kv = nn.Linear(dim, 2 * dim)
+        self.edge = Mlp(4, dim, 2 * dim, act_layer=act)
+        self.out = nn.Linear(dim, dim)
+
+    def forward(
+        self,
+        x: Float[torch.Tensor, "B N C"],
+        points: Float[torch.Tensor, "B N 3"],
+        tokens: Float[torch.Tensor, "B M C"],
+        token_points: Float[torch.Tensor, "B M 3"],
+        token_log_measure: Float[torch.Tensor, "B M"],
+    ) -> Float[torch.Tensor, "B N C"]:
+        k = min(self.n_neighbors, token_points.shape[1])
+        index = radius_search(token_points, points, self.radius, max_points=k).long()
+        # Unused slots hold index 0: keep token 0 once, and only if in range.
+        padded = index <= 0
+        index = index.clamp_min(0)
+        batch = torch.arange(points.shape[0], device=points.device)[:, None, None]
+        offsets = (points[:, :, None] - token_points[batch, index]) / self.radius
+        distance = offsets.norm(dim=-1, keepdim=True)
+        valid = (distance[..., 0] <= 1) & (~padded | (padded.cumsum(dim=-1) == 1))
+        in_range = valid.any(dim=-1, keepdim=True)
+
+        key_value = self.to_kv(tokens)[batch, index] + self.edge(
+            torch.cat([offsets, distance], dim=-1)
+        )
+        key, value = (
+            rearrange(t, "b n k (h d) -> b n h k d", h=self.heads)
+            for t in key_value.chunk(2, dim=-1)
+        )
+        query = rearrange(
+            self.to_q(self.norm(x)), "b n (h d) -> b n h 1 d", h=self.heads
+        )
+        # A point with nothing in range attends to its padding and is zeroed.
+        bias = token_log_measure[batch, index].masked_fill(
+            ~(valid | ~in_range), -torch.inf
+        )
+        y = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=bias[:, :, None, None].to(key.dtype)
+        )
+        return x + in_range * self.out(rearrange(y, "b n h 1 d -> b n (h d)"))
+
+
 class GeoTransolverPP(Module):
-    r"""Rotation- and translation-equivariant FLARE++ model for boundary-driven PDEs.
+    r"""GeoTransolver for boundary-driven PDEs, in the geometry's canonical frame.
 
-    The boundary is a model input: sampled points carrying a normal, a
-    measure (area), and boundary-condition scalars and vectors. The model
-    builds an origin, a reference length and an orthonormal frame from the
-    boundary and the global vectors, and expresses every position and vector
-    in that frame. A boundary encoder turns the boundary samples into context
-    tokens. The mesh points are then processed by FLARE++ blocks whose latent
-    tokens cross-attend to that context. Vector outputs are predicted as
-    components in the frame and rotated back.
+    The boundary is a model input: each boundary condition is a named set of
+    samples with a position, a normal, a measure (area) and that condition's
+    own feature channels. Each condition has its own input layer, so
+    conditions may carry different fields. A boundary encoder turns all
+    samples into context tokens. Each mesh point first attends over the
+    boundary tokens near it, and is then processed by FLARE++ blocks whose
+    latent tokens cross-attend to the whole context.
 
-    Symmetries that hold by construction:
+    Positions, normals and vector features are expected in the canonical,
+    non-dimensional frame of the geometry, as
+    :class:`~physicsnemo.datapipes.transforms.mesh.CanonicalFrameMesh` with
+    ``rescale=True`` produces. A vector is then three ordinary feature
+    channels. With such inputs:
 
-    - Rotation and translation of the whole problem: scalar outputs are
-      unchanged and vector outputs rotate with the problem.
-    - Uniform rescaling of all positions (the reference length is derived
-      from the boundary).
+    - Rotating, translating or uniformly rescaling the whole problem leaves
+      the inputs, and so the outputs, unchanged. Vector outputs are
+      components in the canonical frame: ``v = v_canonical @ axes`` maps
+      them back.
     - Points and boundary samples enter the attention only through
       measure-weighted averages, so refining or resampling the mesh changes
-      predictions only by quadrature error.
-
-    Parity (reflection) is deliberately not built in.
+      predictions only by quadrature error, and their order does not matter.
 
     Parameters
     ----------
@@ -168,19 +232,13 @@ class GeoTransolverPP(Module):
         Number of scalar output fields.
     out_vectors : int
         Number of vector output fields.
-    boundary_scalars : int, optional
-        Number of scalar features per boundary sample, such as
-        boundary-condition type and values. Default is 0.
-    boundary_vectors : int, optional
-        Number of vector features per boundary sample, such as wall
-        velocity. Default is 0.
-    global_scalars : int, optional
-        Number of global scalar conditions, such as Reynolds number.
-        Default is 0.
-    global_vectors : int, optional
-        Number of global vector conditions, such as the freestream velocity.
-        The first two define the frame. If fewer than two are given, the
-        missing frame vectors are learned from the boundary. Default is 0.
+    boundary_features : Mapping[str, int]
+        Number of feature channels per sample for each boundary condition,
+        by name. ``0`` for a condition with no fields, such as a no-slip
+        wall.
+    global_features : int, optional
+        Number of global condition channels, such as a Reynolds number or
+        the components of a freestream direction. Default is 0.
     n_hidden : int, optional
         Hidden dimension. Default is 256.
     n_layers : int, optional
@@ -193,9 +251,12 @@ class GeoTransolverPP(Module):
         Number of latent tokens per head. Default is 64.
     mlp_ratio : int, optional
         Ratio of MLP hidden dimension to ``n_hidden``. Default is 4.
+    radius : float, optional
+        Range of the neighbor attention, in canonical units (the geometry's
+        RMS radius). Default is 0.5.
     n_neighbors : int, optional
-        Number of nearest boundary samples that describe the boundary near
-        each point. Default is 8.
+        Most boundary samples a point attends to within ``radius``.
+        Default is 32.
     act : str, optional
         Activation function name. Default is ``"gelu"``.
 
@@ -203,21 +264,14 @@ class GeoTransolverPP(Module):
     -------
     points : torch.Tensor
         Mesh points to predict at, of shape :math:`(B, N, 3)`.
-    boundary_points : torch.Tensor
-        Boundary sample positions of shape :math:`(B, M, 3)`.
-    boundary_normals : torch.Tensor
-        Unit normals of shape :math:`(B, M, 3)`.
-    boundary_measure : torch.Tensor
-        Positive area per boundary sample, of shape :math:`(B, M)`. Only
-        relative values matter.
-    boundary_scalars : torch.Tensor | None, optional
-        Shape :math:`(B, M, C_s)`. Required if ``boundary_scalars > 0``.
-    boundary_vectors : torch.Tensor | None, optional
-        Shape :math:`(B, M, K_v, 3)`. Required if ``boundary_vectors > 0``.
-    global_scalars : torch.Tensor | None, optional
-        Shape :math:`(B, C_g)`. Required if ``global_scalars > 0``.
-    global_vectors : torch.Tensor | None, optional
-        Shape :math:`(B, K_g, 3)`. Required if ``global_vectors > 0``.
+    boundaries : Mapping[str, Mapping[str, torch.Tensor]]
+        For each condition given (any non-empty subset of the declared
+        names): ``"points"`` of shape :math:`(B, M, 3)`, unit ``"normals"``
+        of shape :math:`(B, M, 3)`, positive ``"measure"`` of shape
+        :math:`(B, M)`, and ``"features"`` of shape :math:`(B, M, C)` if the
+        condition declares any. Only relative measures matter.
+    global_features : torch.Tensor | None, optional
+        Shape :math:`(B, C_g)`. Required if ``global_features > 0``.
     point_measure : torch.Tensor | None, optional
         Positive cell volume (or area) per point, of shape :math:`(B, N)`.
         Only relative values matter. Default is uniform.
@@ -230,24 +284,28 @@ class GeoTransolverPP(Module):
 
     Notes
     -----
-    Known limits of this first version: the frame is undefined when its two
-    defining vectors are parallel or, for learned vectors, when the boundary
-    is too symmetric to define a direction; positions enter the embedding
-    MLPs as raw frame coordinates; there is a single point stream;
-    Transformer Engine and token-sharded inputs are not supported.
+    Known limits of this first version: the canonical frame jumps between
+    nearly symmetric geometries; a point farther than ``radius`` from the
+    boundary sees it only through the latent tokens; there is a single
+    point stream; Transformer Engine and token-sharded inputs are not
+    supported.
 
     Examples
     --------
     >>> import torch
     >>> model = GeoTransolverPP(
-    ...     out_scalars=1, out_vectors=1, global_vectors=1, n_hidden=32,
-    ...     n_layers=2, n_head=4, n_latents=8,
+    ...     out_scalars=1, out_vectors=1, boundary_features={"wall": 0, "inlet": 3},
+    ...     n_hidden=32, n_layers=2, n_head=4, n_latents=8,
     ... )
-    >>> boundary = torch.randn(1, 64, 3)
-    >>> normals = torch.nn.functional.normalize(torch.randn(1, 64, 3), dim=-1)
+    >>> def samples(m, channels):
+    ...     out = {
+    ...         "points": torch.randn(1, m, 3),
+    ...         "normals": torch.nn.functional.normalize(torch.randn(1, m, 3), dim=-1),
+    ...         "measure": torch.rand(1, m) + 0.1,
+    ...     }
+    ...     return out | ({"features": torch.randn(1, m, channels)} if channels else {})
     >>> scalars, vectors = model(
-    ...     torch.randn(1, 100, 3), boundary, normals, torch.rand(1, 64) + 0.1,
-    ...     global_vectors=torch.tensor([[[1.0, 0.0, 0.0]]]),
+    ...     torch.randn(1, 100, 3), {"wall": samples(64, 0), "inlet": samples(16, 3)}
     ... )
     >>> scalars.shape, vectors.shape
     (torch.Size([1, 100, 1]), torch.Size([1, 100, 1, 3]))
@@ -257,17 +315,16 @@ class GeoTransolverPP(Module):
         self,
         out_scalars: int,
         out_vectors: int,
-        boundary_scalars: int = 0,
-        boundary_vectors: int = 0,
-        global_scalars: int = 0,
-        global_vectors: int = 0,
+        boundary_features: Mapping[str, int],
+        global_features: int = 0,
         n_hidden: int = 256,
         n_layers: int = 8,
         n_encoder_layers: int = 2,
         n_head: int = 8,
         n_latents: int = 64,
         mlp_ratio: int = 4,
-        n_neighbors: int = 8,
+        radius: float = 0.5,
+        n_neighbors: int = 32,
         act: str = "gelu",
     ) -> None:
         super().__init__(meta=GeoTransolverPPMetaData())
@@ -277,36 +334,19 @@ class GeoTransolverPP(Module):
             )
         self.out_scalars = out_scalars
         self.out_vectors = out_vectors
-        self.n_boundary_scalars = boundary_scalars
-        self.n_boundary_vectors = boundary_vectors
-        self.n_global_scalars = global_scalars
-        self.n_global_vectors = global_vectors
-        self.n_neighbors = n_neighbors
+        self.n_global_features = global_features
 
-        # Frame vectors the global conditions do not supply are learned as
-        # invariant-weighted sums of boundary offsets and normals.
-        self.n_learned_frame_vectors = max(0, 2 - global_vectors)
-        if self.n_learned_frame_vectors > 0:
-            self.frame_net = Mlp(
-                2 + 2 * global_vectors + boundary_scalars,
-                n_hidden,
-                2 * self.n_learned_frame_vectors,
-                act_layer=act,
-            )
-
-        # Normal, scalars and vectors of a boundary sample, in the frame.
-        boundary_feature_dim = 3 + boundary_scalars + 3 * boundary_vectors
-        self.boundary_embed = Mlp(
-            3 + boundary_feature_dim, 2 * n_hidden, n_hidden, act_layer=act
+        # One input layer per condition: position, normal, its own fields.
+        # The layer's bias tells the conditions apart.
+        self.boundary_embed = nn.ModuleDict(
+            {
+                name: Mlp(6 + channels, 2 * n_hidden, n_hidden, act_layer=act)
+                for name, channels in sorted(boundary_features.items())
+            }
         )
-        # Position, offset to the boundary, distance, nearby boundary features.
-        self.point_embed = Mlp(
-            3 + 3 + 1 + boundary_feature_dim, 2 * n_hidden, n_hidden, act_layer=act
-        )
+        self.point_embed = Mlp(3, 2 * n_hidden, n_hidden, act_layer=act)
         # The constant 1 keeps the condition defined when there are no globals.
-        self.cond_embed = Mlp(
-            1 + global_scalars + 3 * global_vectors, n_hidden, n_hidden, act_layer=act
-        )
+        self.cond_embed = Mlp(1 + global_features, n_hidden, n_hidden, act_layer=act)
 
         def block(use_context: bool) -> _Block:
             return _Block(
@@ -314,162 +354,72 @@ class GeoTransolverPP(Module):
             )
 
         self.encoder = nn.ModuleList([block(False) for _ in range(n_encoder_layers)])
+        self.neighbors = _NeighborAttention(n_hidden, n_head, radius, n_neighbors, act)
         self.blocks = nn.ModuleList([block(True) for _ in range(n_layers)])
         self.out_norm = nn.LayerNorm(n_hidden)
         self.out = nn.Linear(n_hidden, out_scalars + 3 * out_vectors)
 
-    def _frame(
-        self,
-        offsets: Float[torch.Tensor, "B M 3"],
-        normals: Float[torch.Tensor, "B M 3"],
-        weights: Float[torch.Tensor, "B M"],
-        boundary_scalars: Float[torch.Tensor, "B M Cs"],
-        global_vectors: Float[torch.Tensor, "B Kg 3"],
-    ) -> Float[torch.Tensor, "B 3 3"]:
-        r"""Right-handed orthonormal frame whose rows rotate with the problem."""
-        candidates = global_vectors
-        if self.n_learned_frame_vectors > 0:
-            offset_dir = F.normalize(offsets, dim=-1)
-            global_dir = F.normalize(global_vectors, dim=-1)
-            invariants = torch.cat(
-                [
-                    offsets.norm(dim=-1, keepdim=True),
-                    (normals * offset_dir).sum(dim=-1, keepdim=True),
-                    torch.einsum("bmd,bkd->bmk", offset_dir, global_dir),
-                    torch.einsum("bmd,bkd->bmk", normals, global_dir),
-                    boundary_scalars,
-                ],
-                dim=-1,
-            )
-            on_offsets, on_normals = self.frame_net(invariants).chunk(2, dim=-1)
-            learned = torch.einsum(
-                "bm,bmk,bmd->bkd", weights, on_offsets, offsets
-            ) + torch.einsum("bm,bmk,bmd->bkd", weights, on_normals, normals)
-            candidates = torch.cat([global_vectors, learned], dim=1)
-
-        e1 = F.normalize(candidates[:, 0], dim=-1)
-        e2 = candidates[:, 1]
-        e2 = F.normalize(e2 - (e2 * e1).sum(dim=-1, keepdim=True) * e1, dim=-1)
-        e3 = torch.linalg.cross(e1, e2)
-        return torch.stack([e1, e2, e3], dim=1)
-
-    def _embed_points(
-        self,
-        points: Float[torch.Tensor, "B N 3"],
-        boundary_points: Float[torch.Tensor, "B M 3"],
-        boundary_features: Float[torch.Tensor, "B M F"],
-        boundary_weights: Float[torch.Tensor, "B M"],
-    ) -> Float[torch.Tensor, "B N C"]:
-        r"""Embed frame-space points with a smooth summary of the nearby boundary."""
-        k = min(self.n_neighbors, boundary_points.shape[1])
-        index = torch.stack(
-            [knn(b, p, k)[0] for b, p in zip(boundary_points, points)]
-        )  # (B, N, k)
-        batch = torch.arange(points.shape[0], device=points.device)[:, None, None]
-        offsets = points[:, :, None] - boundary_points[batch, index]  # (B, N, k, 3)
-        distance = offsets.norm(dim=-1)
-        nearest = distance.amin(dim=-1, keepdim=True)
-        # Close to the boundary only the nearest samples count; far away the
-        # neighbors are averaged by measure.
-        weights = boundary_weights[batch, index] * torch.exp(
-            -(((distance - nearest) / (nearest + _MIN_DISTANCE)) ** 2)
-        )
-        weights = weights / weights.sum(dim=-1, keepdim=True)
-        offset = (weights[..., None] * offsets).sum(dim=2)
-        features = (weights[..., None] * boundary_features[batch, index]).sum(dim=2)
-        return self.point_embed(
-            torch.cat(
-                [points, offset, offset.norm(dim=-1, keepdim=True), features], dim=-1
-            )
-        )
-
     def forward(
         self,
         points: Float[torch.Tensor, "B N 3"],
-        boundary_points: Float[torch.Tensor, "B M 3"],
-        boundary_normals: Float[torch.Tensor, "B M 3"],
-        boundary_measure: Float[torch.Tensor, "B M"],
-        boundary_scalars: Float[torch.Tensor, "B M Cs"] | None = None,
-        boundary_vectors: Float[torch.Tensor, "B M Kv 3"] | None = None,
-        global_scalars: Float[torch.Tensor, "B Cg"] | None = None,
-        global_vectors: Float[torch.Tensor, "B Kg 3"] | None = None,
+        boundaries: Mapping[str, Mapping[str, torch.Tensor]],
+        global_features: Float[torch.Tensor, "B Cg"] | None = None,
         point_measure: Float[torch.Tensor, "B N"] | None = None,
     ) -> tuple[Float[torch.Tensor, "B N S"], Float[torch.Tensor, "B N V 3"]]:
         r"""Predict scalar and vector fields at ``points``."""
-        n_batch, n_boundary = boundary_points.shape[:2]
-        if boundary_scalars is None:
-            boundary_scalars = boundary_points.new_zeros(n_batch, n_boundary, 0)
-        if boundary_vectors is None:
-            boundary_vectors = boundary_points.new_zeros(n_batch, n_boundary, 0, 3)
-        if global_scalars is None:
-            global_scalars = boundary_points.new_zeros(n_batch, 0)
-        if global_vectors is None:
-            global_vectors = boundary_points.new_zeros(n_batch, 0, 3)
+        unknown = set(boundaries) - set(self.boundary_embed)
+        if unknown or not boundaries:
+            raise ValueError(
+                f"Expected boundaries from {sorted(self.boundary_embed)}, "
+                f"got {sorted(boundaries)}"
+            )
+        if global_features is None:
+            global_features = points.new_zeros(points.shape[0], 0)
+        if global_features.shape[-1] != self.n_global_features:
+            raise ValueError(
+                f"Expected {self.n_global_features} global_features, "
+                f"got {global_features.shape[-1]}"
+            )
         if point_measure is None:
             point_measure = points.new_ones(points.shape[:2])
-        if not torch.compiler.is_compiling():
-            for name, tensor, expected in (
-                ("boundary_scalars", boundary_scalars, self.n_boundary_scalars),
-                ("boundary_vectors", boundary_vectors[..., 0], self.n_boundary_vectors),
-                ("global_scalars", global_scalars, self.n_global_scalars),
-                ("global_vectors", global_vectors[..., 0], self.n_global_vectors),
-            ):
-                if tensor.shape[-1] != expected:
-                    raise ValueError(
-                        f"Expected {expected} {name}, got {tensor.shape[-1]}"
-                    )
-
-        # Origin, reference length and frame: all derived from the boundary,
-        # all measure-weighted so they do not depend on the boundary mesh.
-        weights = boundary_measure / boundary_measure.sum(dim=-1, keepdim=True)
-        origin = torch.einsum("bm,bmd->bd", weights, boundary_points)[:, None]
-        offsets = boundary_points - origin
-        length = torch.einsum("bm,bm->b", weights, offsets.square().sum(dim=-1)).sqrt()
-        length = length[:, None, None]
-        frame = self._frame(
-            offsets / length,
-            boundary_normals,
-            weights,
-            boundary_scalars,
-            global_vectors,
-        )
-
-        def to_frame(vectors: torch.Tensor) -> torch.Tensor:
-            return torch.einsum("b...d,bkd->b...k", vectors, frame)
-
-        boundary_xyz = to_frame(offsets / length)
-        boundary_features = torch.cat(
-            [
-                to_frame(boundary_normals),
-                boundary_scalars,
-                to_frame(boundary_vectors).flatten(-2),
-            ],
-            dim=-1,
-        )
-        cond = self.cond_embed(
-            torch.cat(
-                [
-                    global_scalars.new_ones(n_batch, 1),
-                    global_scalars,
-                    to_frame(global_vectors).flatten(-2),
-                ],
-                dim=-1,
-            )
-        )
 
         # Boundary encoder: geometry and boundary conditions become context.
-        boundary_log_measure = weights.log()
-        context = self.boundary_embed(
-            torch.cat([boundary_xyz, boundary_features], dim=-1)
+        names = sorted(boundaries)
+        context = torch.cat(
+            [
+                self.boundary_embed[name](
+                    torch.cat(
+                        [
+                            boundaries[name][key]
+                            for key in ("points", "normals", "features")
+                            if key in boundaries[name]
+                        ],
+                        dim=-1,
+                    )
+                )
+                for name in names
+            ],
+            dim=1,
+        )
+        boundary_points = torch.cat(
+            [boundaries[name]["points"] for name in names], dim=1
+        )
+        measure = torch.cat([boundaries[name]["measure"] for name in names], dim=1)
+        boundary_log_measure = (measure / measure.sum(dim=-1, keepdim=True)).log()
+        cond = self.cond_embed(
+            torch.cat(
+                [global_features.new_ones(points.shape[0], 1), global_features], dim=-1
+            )
         )
         for block in self.encoder:
             context = block(context, boundary_log_measure, cond)
 
-        x = self._embed_points(
-            to_frame((points - origin) / length),
-            boundary_xyz,
-            boundary_features,
-            weights,
+        x = self.neighbors(
+            self.point_embed(points),
+            points,
+            context,
+            boundary_points,
+            boundary_log_measure,
         )
         log_measure = (point_measure / point_measure.sum(dim=-1, keepdim=True)).log()
         for block in self.blocks:
@@ -477,7 +427,5 @@ class GeoTransolverPP(Module):
 
         out = self.out(self.out_norm(x))
         scalars = out[..., : self.out_scalars]
-        components = out[..., self.out_scalars :].unflatten(-1, (self.out_vectors, 3))
-        # Vector outputs are components in the frame; rotate them back.
-        vectors = torch.einsum("bnvk,bkd->bnvd", components, frame)
+        vectors = out[..., self.out_scalars :].unflatten(-1, (self.out_vectors, 3))
         return scalars, vectors

@@ -460,9 +460,10 @@ class CanonicalFrameMesh(MeshTransform):
 
     Translates and rotates the mesh so the frame from :func:`canonical_frame`
     becomes the origin and coordinate axes. The frame is area-weighted when
-    the geometry has cells. Place it after non-dimensionalization, so the
-    frame is built from non-dimensional coordinates, and before any
-    subsampling: on a subsample the axes can flip.
+    the geometry has cells. With ``rescale`` the geometry's RMS radius becomes
+    the unit of length, so positions are non-dimensional with no reference
+    length from outside the sample. Place it before any subsampling: on a
+    subsample the axes can flip.
 
     For a :class:`DomainMesh` the geometry is the body: the boundary
     ``boundary_name``, or the cells of ``wall_names`` that are detached from
@@ -482,10 +483,15 @@ class CanonicalFrameMesh(MeshTransform):
         Boundary name to the ``cell_data`` key of a vector field whose
         area-weighted mean direction is a tie-breaker (an inlet's prescribed
         velocity).
+    rescale : bool, optional
+        Divide positions by the RMS distance of the geometry from its
+        centroid. Fields keep their units. Default is ``False``.
     store_frame_as : str, optional
         Store the frame in ``global_data`` as ``<name>_origin``,
-        ``<name>_axes`` and ``<name>_source`` so results can be mapped back:
-        ``x = x_canonical @ axes + origin`` and ``v = v_canonical @ axes``.
+        ``<name>_axes``, ``<name>_length`` (1 without ``rescale``) and
+        ``<name>_source`` so results can be mapped back:
+        ``x = length * x_canonical @ axes + origin`` and
+        ``v = v_canonical @ axes``.
         ``<name>_source`` marks arbitrary axes, see :func:`canonical_frame`.
     transform_point_data, transform_cell_data, transform_global_data
         Which vector fields rotate with the geometry, as in
@@ -497,6 +503,7 @@ class CanonicalFrameMesh(MeshTransform):
         boundary_name: str | None = None,
         wall_names: Sequence[str] | None = None,
         direction_fields: Mapping[str, str | Sequence[str]] | None = None,
+        rescale: bool = False,
         store_frame_as: str | None = None,
         transform_point_data: bool | dict = False,
         transform_cell_data: bool | dict = False,
@@ -506,6 +513,7 @@ class CanonicalFrameMesh(MeshTransform):
         self.boundary_name = boundary_name
         self.wall_names = wall_names
         self.direction_fields = dict(direction_fields or {})
+        self.rescale = rescale
         self.store_frame_as = store_frame_as
         self.transform_point_data = transform_point_data
         self.transform_cell_data = transform_cell_data
@@ -521,19 +529,31 @@ class CanonicalFrameMesh(MeshTransform):
         origin, axes, source = canonical_frame(points, weights, tie_breakers)
         dtype = target.points.dtype if isinstance(target, Mesh) else None
         dtype = dtype or target.interior.points.dtype
+        length = torch.ones((), dtype=dtype)
+        if self.rescale:
+            r2 = (points - origin).square().sum(-1)
+            mean_r2 = (
+                r2.mean() if weights is None else (weights * r2).sum() / weights.sum()
+            )
+            length = mean_r2.sqrt().to(dtype)
         origin, axes = origin.to(dtype), axes.to(dtype)
-        out = target.translate(-origin).transform(
-            axes,
-            transform_point_data=self.transform_point_data,
-            transform_cell_data=self.transform_cell_data,
-            transform_global_data=self.transform_global_data,
-            assume_invertible=True,
-            assume_similarity=True,
+        out = (
+            target.translate(-origin)
+            .scale(1 / length.item())
+            .transform(
+                axes,
+                transform_point_data=self.transform_point_data,
+                transform_cell_data=self.transform_cell_data,
+                transform_global_data=self.transform_global_data,
+                assume_invertible=True,
+                assume_similarity=True,
+            )
         )
         if self.store_frame_as is not None:
             global_data = out.global_data.copy()
             global_data[f"{self.store_frame_as}_origin"] = origin
             global_data[f"{self.store_frame_as}_axes"] = axes
+            global_data[f"{self.store_frame_as}_length"] = length
             global_data[f"{self.store_frame_as}_source"] = source
             out.global_data = global_data
         return out

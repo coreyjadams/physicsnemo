@@ -16,17 +16,32 @@
 
 """Shared helpers for the equivariance notebooks.
 
-Synthetic bodies with exact normals and area weights, the transformations a
-symmetric model must respect, and the error measure the notebooks report.
+Synthetic bodies with exact normals and area weights, the pipeline under
+test (canonical frame of the body, then ``GeoTransolverPP``), the
+transformations it must respect, and the error measure the notebooks report.
+AeroZoo samples are used where a notebook asks for real data.
 """
+
+import os
+from pathlib import Path
 
 import torch
 from torch.nn.functional import normalize
 
+from physicsnemo.datapipes.transforms.mesh import CanonicalFrameMesh
+from physicsnemo.datapipes.transforms.mesh.transforms import canonical_frame
 from physicsnemo.experimental.models.geotransolver_pp import GeoTransolverPP
 
-POSITIONS = ("points", "boundary_points")
-VECTORS = ("boundary_normals", "boundary_vectors", "global_vectors")
+# Inputs that must rotate with the problem, as (boundary, key) or a global key.
+VECTORS = (
+    ("body", "normals"),
+    ("body", "vectors"),
+    ("inlet", "normals"),
+    ("inlet", "vectors"),
+    "global_vectors",
+)
+AEROZOO = Path(os.environ.get("AEROZOO_DIR", "~/datasets/AeroZoo/samples")).expanduser()
+AEROZOO_VELOCITY = ("prescribed", "dirichlet", "velocity")
 
 
 def _car(p):
@@ -95,12 +110,14 @@ def make_problem(
     boundary_seed=None,
     refine=1,
     dtype=torch.float64,
+    min_component=1e-3,
 ):
-    """Inputs of :class:`GeoTransolverPP` (batch of 1) for one body.
+    """One problem in the lab frame: a body, an inlet patch and query points.
 
-    Boundary conditions are functions of position on the body, so resampling
-    the boundary (``boundary_seed``, ``refine``) describes the same problem.
-    The query points depend only on ``seed``.
+    Boundary conditions are functions of position, so resampling the
+    boundaries (``boundary_seed``, ``refine``) describes the same problem.
+    The query points depend only on ``seed``. ``min_component`` is the
+    tie-break threshold of the frame (see ``canonical_frame``).
     """
     seed_b = seed if boundary_seed is None else boundary_seed
     xb, nb, measure = sample_surface(geometry, n_boundary, seed_b, refine, dtype)
@@ -110,18 +127,35 @@ def make_problem(
     globals_ = torch.tensor(
         [[1.0, 0.1, 0.0], [0.0, 0.0, 1.0], [0.3, 1.0, 0.0]], dtype=dtype
     )
-    inputs = {
+    # Inlet: a 4 x 4 patch upstream of the body with a sheared velocity.
+    n_inlet = max(16, n_boundary // 4)
+    gi = torch.Generator().manual_seed(seed_b + 2000)
+    yz = 4 * torch.rand(n_inlet, 2, dtype=dtype, generator=gi) - 2
+    xi = torch.cat([torch.full((n_inlet, 1), -4.0, dtype=dtype), yz], dim=-1)
+    return {
         "points": shell * (1.05 + torch.rand(n_points, 1, dtype=dtype, generator=g)),
-        "boundary_points": xb,
-        "boundary_normals": nb,
-        "boundary_measure": measure,
-        "boundary_scalars": torch.stack([torch.tanh(xb[:, 0]), nb[:, 2]], dim=-1),
-        "boundary_vectors": torch.linalg.cross(nb, up.expand_as(nb))[:, None],
+        "point_measure": torch.rand(n_points, dtype=dtype, generator=g) + 0.1,
+        "boundaries": {
+            "body": {
+                "points": xb,
+                "normals": nb,
+                "measure": measure,
+                "scalars": torch.stack([torch.tanh(xb[:, 0]), nb[:, 2]], dim=-1),
+                "vectors": torch.linalg.cross(nb, up.expand_as(nb))[:, None],
+            },
+            "inlet": {
+                "points": xi,
+                "normals": torch.tensor([1.0, 0.0, 0.0], dtype=dtype).expand(
+                    n_inlet, 3
+                ),
+                "measure": torch.full((n_inlet,), 16.0 / n_inlet, dtype=dtype),
+                "vectors": (globals_[0] * (1 + 0.2 * yz[:, :1]))[:, None],
+            },
+        },
         "global_scalars": torch.tensor([0.3], dtype=dtype),
         "global_vectors": globals_[:global_vectors],
-        "point_measure": torch.rand(n_points, dtype=dtype, generator=g) + 0.1,
+        "min_component": min_component,
     }
-    return {k: v[None] for k, v in inputs.items()}
 
 
 def randomize_zero_init(module, seed=0):
@@ -138,21 +172,26 @@ def randomize_zero_init(module, seed=0):
     return module
 
 
-def make_model(global_vectors=1, n_hidden=32, seed=0, dtype=torch.float64):
-    """Small untrained model matching :func:`make_problem`."""
+def make_model(
+    global_vectors=1, n_hidden=32, seed=0, dtype=torch.float64, n_neighbors=8192
+):
+    """Small untrained model matching :func:`make_problem`.
+
+    ``n_neighbors`` is large so the neighbor attention sees every boundary
+    sample in range; notebook 3 shows what a smaller limit does.
+    """
     torch.manual_seed(seed)
     model = GeoTransolverPP(
         out_scalars=2,
         out_vectors=2,
-        boundary_scalars=2,
-        boundary_vectors=1,
-        global_scalars=1,
-        global_vectors=global_vectors,
+        boundary_features={"body": 2 + 3, "inlet": 3},
+        global_features=1 + 3 * global_vectors,
         n_hidden=n_hidden,
         n_layers=2,
         n_head=4,
         n_latents=8,
-        n_neighbors=4,
+        radius=1.0,
+        n_neighbors=n_neighbors,
     )
     return randomize_zero_init(model, seed).to(dtype).eval()
 
@@ -165,49 +204,129 @@ def random_rotation(seed=0, dtype=torch.float64):
     return q * torch.linalg.det(q).sign()
 
 
-def move(inputs, matrix=None, shift=None, scale=1.0):
-    """Apply ``x -> scale * x @ matrix.T + shift`` to a whole problem."""
-    out = dict(inputs)
-    for name in POSITIONS:
-        x = scale * inputs[name]
+def body_frame(problem):
+    """Origin, axes, length and axis sources of the body's canonical frame.
+
+    Ties in the body's shape go to the global vectors, then to the offset of
+    all boundaries' centroid from the body's.
+    """
+    body = problem["boundaries"]["body"]
+    x = torch.cat([b["points"] for b in problem["boundaries"].values()])
+    w = torch.cat([b["measure"] for b in problem["boundaries"].values()])
+    center = (w[:, None] * x).sum(0) / w.sum()
+    size = ((w * (x - center).square().sum(-1)).sum() / w.sum()).sqrt()
+    wb = body["measure"] / body["measure"].sum()
+    offset = (center - (wb[:, None] * body["points"]).sum(0)) / size
+    tie_breakers = [*normalize(problem["global_vectors"], dim=-1), offset]
+    origin, axes, source = canonical_frame(
+        body["points"],
+        body["measure"],
+        tie_breakers,
+        min_component=problem["min_component"],
+    )
+    length = (wb * (body["points"] - origin).square().sum(-1)).sum().sqrt()
+    return origin, axes, length, source
+
+
+def canonical(problem):
+    """Model inputs (batch of 1) in the body's frame, and the frame's axes."""
+    origin, axes, length, _ = body_frame(problem)
+
+    def position(x):
+        return ((x - origin) @ axes.T / length)[None]
+
+    boundaries = {}
+    for name, b in problem["boundaries"].items():
+        features = [b["scalars"]] if "scalars" in b else []
+        features.append((b["vectors"] @ axes.T).flatten(-2))
+        boundaries[name] = {
+            "points": position(b["points"]),
+            "normals": (b["normals"] @ axes.T)[None],
+            "measure": b["measure"][None],
+            "features": torch.cat(features, dim=-1)[None],
+        }
+    inputs = {
+        "points": position(problem["points"]),
+        "boundaries": boundaries,
+        "global_features": torch.cat(
+            [problem["global_scalars"], (problem["global_vectors"] @ axes.T).flatten()]
+        )[None],
+        "point_measure": problem["point_measure"][None],
+    }
+    return inputs, axes
+
+
+def predict(model, problem):
+    """Scalars and lab-frame vectors of the pipeline: frame, then model."""
+    inputs, axes = canonical(problem)
+    scalars, vectors = model(**inputs)
+    return scalars[0], vectors[0] @ axes
+
+
+def move(problem, matrix=None, shift=None, scale=1.0, skip=None):
+    """Apply ``x -> scale * x @ matrix.T + shift`` to a whole problem.
+
+    ``skip`` names one entry of :data:`VECTORS` to leave unrotated.
+    """
+
+    def position(x):
+        x = scale * x
         x = x if matrix is None else x @ matrix.T
-        out[name] = x if shift is None else x + shift
-    if matrix is not None:
-        for name in VECTORS:
-            out[name] = inputs[name] @ matrix.T
-    out["boundary_measure"] = scale**2 * inputs["boundary_measure"]
+        return x if shift is None else x + shift
+
+    def vector(x, name):
+        return x if matrix is None or name == skip else x @ matrix.T
+
+    out = dict(problem, points=position(problem["points"]), boundaries={})
+    out["global_vectors"] = vector(problem["global_vectors"], "global_vectors")
+    for name, b in problem["boundaries"].items():
+        out["boundaries"][name] = dict(
+            b,
+            points=position(b["points"]),
+            normals=vector(b["normals"], (name, "normals")),
+            vectors=vector(b["vectors"], (name, "vectors")),
+            measure=scale**2 * b["measure"],
+        )
     return out
 
 
-def _token_keys(which):
+def _tokens(problem, which):
+    """The per-token tensors of the query points or of one boundary."""
     if which == "points":
-        return ["points", "point_measure"]
-    return [
-        f"boundary_{k}" for k in ("points", "normals", "measure", "scalars", "vectors")
-    ]
+        return {k: problem[k] for k in ("points", "point_measure")}
+    return problem["boundaries"][which]
 
 
-def permute(inputs, which, seed=0):
-    """Shuffle the points or the boundary samples. Returns (inputs, restore)."""
-    keys = _token_keys(which)
-    order = torch.randperm(
-        inputs[keys[0]].shape[1], generator=torch.Generator().manual_seed(seed)
-    )
-    out = dict(inputs, **{k: inputs[k][:, order] for k in keys})
+def _with_tokens(problem, which, tokens):
+    if which == "points":
+        return dict(problem, **tokens)
+    return dict(problem, boundaries=dict(problem["boundaries"], **{which: tokens}))
+
+
+def permute(problem, which, seed=0):
+    """Shuffle the points or one boundary's samples. Returns (problem, restore)."""
+    tokens = _tokens(problem, which)
+    n = len(next(iter(tokens.values())))
+    order = torch.randperm(n, generator=torch.Generator().manual_seed(seed))
+    out = _with_tokens(problem, which, {k: v[order] for k, v in tokens.items()})
     return out, (order.argsort() if which == "points" else None)
 
 
-def duplicate(inputs, which, count):
+def duplicate(problem, which, count):
     """Repeat the first ``count`` tokens, splitting their measure in two."""
-    keys = _token_keys(which)
-    out = dict(inputs)
-    for k in keys:
-        x = inputs[k]
-        if k.endswith("measure"):
-            x = torch.cat([x[:, :count] / 2, x[:, count:]], dim=1)
-        out[k] = torch.cat([x, x[:, :count]], dim=1)
-    n = inputs[keys[0]].shape[1]
+    tokens = dict(_tokens(problem, which))
+    key = "point_measure" if which == "points" else "measure"
+    n = len(tokens[key])
+    tokens[key] = torch.cat([tokens[key][:count] / 2, tokens[key][count:]])
+    tokens = {k: torch.cat([v, v[:count]]) for k, v in tokens.items()}
+    out = _with_tokens(problem, which, tokens)
     return out, (torch.arange(n) if which == "points" else None)
+
+
+def axes_moved_deg(problem, reference):
+    """Largest angle between matching frame axes of two problems, in degrees."""
+    cos = (body_frame(problem)[1] * body_frame(reference)[1]).sum(dim=-1)
+    return torch.rad2deg(torch.acos(cos.clamp(-1, 1))).max().item()
 
 
 def rel_err(actual, expected):
@@ -217,22 +336,155 @@ def rel_err(actual, expected):
 
 
 @torch.no_grad()
-def compare(model, inputs, moved, matrix=None, restore=None):
+def compare(model, problem, moved, matrix=None, restore=None):
     """Errors of (scalars, vectors) on ``moved`` against the expected result.
 
     Scalars must not change; vectors must rotate by ``matrix``. ``restore``
     indexes the moved outputs back to the original point order.
     """
-    scalars, vectors = model(**inputs)
-    moved_scalars, moved_vectors = model(**moved)
+    scalars, vectors = predict(model, problem)
+    moved_scalars, moved_vectors = predict(model, moved)
     if restore is not None:
-        moved_scalars, moved_vectors = (
-            moved_scalars[:, restore],
-            moved_vectors[:, restore],
-        )
+        moved_scalars, moved_vectors = moved_scalars[restore], moved_vectors[restore]
     if matrix is not None:
         vectors = vectors @ matrix.T
     return rel_err(moved_scalars, scalars), rel_err(moved_vectors, vectors)
+
+
+def aerozoo_cases(limit=None):
+    """Downloaded AeroZoo samples, smallest first (empty if there are none)."""
+    cases = sorted(AEROZOO.glob("*/domain.pdmsh"), key=lambda p: p.stat().st_size)
+    return cases[:limit]
+
+
+def aerozoo_transform():
+    """Body frame of an AeroZoo sample, from benchmark-legal inputs only."""
+    return CanonicalFrameMesh(
+        wall_names=["no_slip", "slip"],
+        direction_fields={"inlet": AEROZOO_VELOCITY},
+        rescale=True,
+        store_frame_as="frame",
+        transform_point_data=True,
+        transform_cell_data=True,
+    )
+
+
+def load_aerozoo(path, stride=1000):
+    """An AeroZoo sample with every ``stride``-th interior point."""
+    from physicsnemo.mesh import DomainMesh
+
+    domain = DomainMesh.load(path)
+    keep = torch.arange(0, domain.interior.n_points, stride)
+    return DomainMesh(
+        interior=domain.interior.slice_points(keep), boundaries=domain.boundaries
+    )
+
+
+def aerozoo_inputs(domain, n_boundary=2048, n_points=512, seed=0):
+    """``GeoTransolverPP`` inputs from a canonical-frame AeroZoo sample.
+
+    Each boundary gives up to ``n_boundary`` random cells whose measures are
+    scaled to the boundary's full area. The inlet velocity is divided by its
+    area-weighted RMS speed, a scale taken from the sample itself.
+    """
+    g = torch.Generator().manual_seed(seed)
+    boundaries = {}
+    for name, mesh in domain.boundaries.items():
+        if mesh.n_cells == 0:
+            continue
+        keep = torch.randperm(mesh.n_cells, generator=g)[:n_boundary]
+        area = mesh.cell_areas
+        boundaries[name] = {
+            "points": mesh.cell_centroids[keep][None],
+            "normals": mesh.cell_normals[keep][None],
+            "measure": (area[keep] * area.sum() / area[keep].sum())[None],
+        }
+        if name == "inlet":
+            v = mesh.cell_data[AEROZOO_VELOCITY]
+            speed = ((area * v.square().sum(-1)).sum() / area.sum()).sqrt()
+            boundaries[name]["features"] = (v[keep] / speed)[None]
+    keep = torch.randperm(domain.interior.n_points, generator=g)[:n_points]
+    volume = domain.interior.point_data["_target_quadrature_measure"]
+    return {
+        "points": domain.interior.points[keep][None],
+        "boundaries": boundaries,
+        "point_measure": volume[keep].reshape(1, -1),
+    }
+
+
+def aerozoo_moved(domain, rotation):
+    """The sample rotated, shifted by about half its size, and three times as large.
+
+    A larger shift costs float32 digits of the positions near the body."""
+    size = domain.interior.points.abs().max()
+    return (
+        domain.translate(0.1 * size * torch.tensor([3.0, -2.0, 5.0]))
+        .transform(rotation, transform_point_data=True, transform_cell_data=True)
+        .scale(3.0)
+    )
+
+
+def aerozoo_isla(n_hidden=32, seed=0):
+    """Small untrained ISLA interior model on the same boundaries, for reference."""
+    from physicsnemo.experimental.models.isla import ISLA
+
+    torch.manual_seed(seed)
+    return ISLA(
+        output_schema={"pressure": {"rank": 0}, "velocity": {"rank": 1}},
+        boundary_schemas={
+            "inlet": {".".join(AEROZOO_VELOCITY): {"rank": 1}},
+            "outlet": {},
+            "no_slip": {},
+            "slip": {},
+        },
+        interior=True,
+        hidden=n_hidden,
+        n_layers=2,
+        n_slices=8,
+        n_boundary_tokens=2048,
+    ).eval()
+
+
+def isla_predict(model, domain, n_points=512):
+    """ISLA's (pressure, velocity) at the first interior points, lab frame.
+
+    ISLA takes the sample as it is: it needs no canonical frame.
+    """
+    from physicsnemo.mesh import Mesh
+
+    meshes = {}
+    for name, mesh in domain.boundaries.items():
+        if mesh.n_cells == 0:
+            continue
+        data = {}
+        if name == "inlet":
+            data = {
+                "prescribed": {
+                    "dirichlet": {"velocity": mesh.cell_data[AEROZOO_VELOCITY]}
+                }
+            }
+        meshes[name] = Mesh(points=mesh.points, cells=mesh.cells, cell_data=data)
+    out = model(
+        boundary_meshes=meshes, prediction_points=domain.interior.points[:n_points]
+    )
+    return out.point_data["pressure"], out.point_data["velocity"]
+
+
+def aerozoo_model(n_hidden=32, seed=0):
+    """Small untrained model for :func:`aerozoo_inputs`."""
+    torch.manual_seed(seed)
+    model = GeoTransolverPP(
+        out_scalars=1,
+        out_vectors=1,
+        boundary_features={"inlet": 3, "outlet": 0, "no_slip": 0, "slip": 0},
+        n_hidden=n_hidden,
+        n_layers=2,
+        n_head=4,
+        n_latents=8,
+        radius=1.0,
+        n_neighbors=64,
+    )
+    return randomize_zero_init(model, seed).eval()
 
 
 def show(mo, title, rows):

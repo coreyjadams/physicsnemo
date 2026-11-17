@@ -176,5 +176,62 @@ def _(axis_drift_deg, frame, geometry, h, mo, seed, torch):
     return
 
 
+@app.cell
+def _(mo):
+    mo.md("""
+    ## AeroZoo samples
+
+    Real flow problems. The body is not a separate mesh there: it is the
+    wall cells not connected to any other boundary, which
+    `CanonicalFrameMesh` finds. Ties in the body's shape go to the mean
+    inlet velocity (1), then to the offset of the enclosure from the body
+    (2). The frame is computed from every boundary cell, in float64.
+
+    - `axes fixed by`: 0 third moment, 1 inlet velocity, 2 enclosure offset,
+      -1 right-hand rule, -2 nothing (arbitrary).
+    - `moved`: change in canonical interior coordinates, over the domain
+      size, after the whole sample is rotated, shifted and scaled. The data
+      are float32, so about 1e-6 is round-off.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    n_cases = mo.ui.slider(1, 16, value=4, label="AeroZoo samples (smallest first)")
+    n_cases
+    return (n_cases,)
+
+
+@app.cell
+def _(h, mo, n_cases, seed, torch):
+    def aerozoo_rows():
+        transform = h.aerozoo_transform()
+        rotation = h.random_rotation(seed.value + 1, torch.float32)
+        rows = []
+        for path in h.aerozoo_cases(n_cases.value):
+            domain = h.load_aerozoo(path)
+            moved = h.aerozoo_moved(domain, rotation)
+            a, b = transform.apply_to_domain(domain), transform.apply_to_domain(moved)
+            rows.append(
+                {
+                    "sample": path.parent.name[-12:],
+                    "body RMS radius (m)": f"{a.global_data['frame_length'].item():.3g}",
+                    "domain size / body": f"{a.interior.points.abs().max().item():.1f}",
+                    "axes fixed by": str(a.global_data["frame_source"].tolist()),
+                    "moved": f"{h.rel_err(b.interior.points, a.interior.points):.1e}",
+                }
+            )
+        return rows
+
+    _rows = aerozoo_rows()
+    (
+        h.show(mo, "AeroZoo: body frame from the boundaries", _rows)
+        if _rows
+        else mo.md(f"No AeroZoo samples under `{h.AEROZOO}`; set `AEROZOO_DIR`.")
+    )
+    return
+
+
 if __name__ == "__main__":
     app.run()

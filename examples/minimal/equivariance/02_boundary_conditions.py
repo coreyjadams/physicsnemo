@@ -22,7 +22,6 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
-    import math
     import sys
 
     import marimo as mo
@@ -31,7 +30,7 @@ def _():
     sys.path.insert(0, str(mo.notebook_dir()))
     import equivariance_harness as h
 
-    return h, math, mo, torch
+    return h, mo, torch
 
 
 @app.cell
@@ -39,18 +38,20 @@ def _(mo):
     mo.md("""
     # 2. Boundary conditions
 
-    The model takes boundary conditions as inputs: scalars and vectors on
-    each boundary sample, plus global scalars and vectors. Global vectors
-    also define the frame. This notebook checks:
+    Each boundary condition is a named set of samples with its own fields:
+    here a `body` (two scalars and a vector per sample) and an `inlet` (a
+    velocity vector per sample), plus global scalars and vectors. The
+    pipeline puts everything in the body's canonical frame, where a vector
+    is three ordinary feature channels, and then runs the model. This
+    notebook checks:
 
-    - **Symmetry** with 0, 1 and 2 global vectors (learned frame, mixed,
-      fully given).
+    - **Symmetry** with 0, 1 and 2 global vectors.
     - **Controls.** Forgetting to rotate one input must break the result.
       If it does not, the model is ignoring that input.
     - **Sensitivity.** Changing each boundary condition must change the
       output.
-    - **Frame conditioning.** What happens as the two global vectors that
-      define the frame become parallel.
+    - **Tie-breakers.** What fixes each axis of the frame, per body, as
+      boundary information is taken away.
     """)
     return
 
@@ -72,13 +73,13 @@ def _(dtype, geometry, h, seed, torch):
 
     def setup(global_vectors):
         model = h.make_model(global_vectors, seed=seed.value, dtype=precision)
-        inputs = h.make_problem(
+        problem = h.make_problem(
             geometry.value,
             global_vectors=global_vectors,
             seed=seed.value,
             dtype=precision,
         )
-        return model, inputs
+        return model, problem
 
     def fmt(errors):
         return {"scalars": f"{errors[0]:.1e}", "vectors": f"{errors[1]:.1e}"}
@@ -90,12 +91,11 @@ def _(dtype, geometry, h, seed, torch):
 def _(fmt, h, mo, rotation, setup, shift):
     def symmetry_rows():
         rows = []
-        for k, frame in ((0, "learned"), (1, "one given, one learned"), (2, "given")):
-            model, inputs = setup(k)
-            moved = h.move(inputs, rotation, shift)
+        for k in (0, 1, 2):
+            model, problem = setup(k)
+            moved = h.move(problem, rotation, shift)
             rows.append(
-                {"global vectors": k, "frame": frame}
-                | fmt(h.compare(model, inputs, moved, rotation))
+                {"global vectors": k} | fmt(h.compare(model, problem, moved, rotation))
             )
         return rows
 
@@ -106,14 +106,14 @@ def _(fmt, h, mo, rotation, setup, shift):
 @app.cell
 def _(fmt, h, mo, rotation, setup, shift):
     def control_rows():
-        model, inputs = setup(2)
+        model, problem = setup(2)
         rows = []
         for name in h.VECTORS:
-            moved = h.move(inputs, rotation, shift)
-            moved[name] = inputs[name]  # left behind
+            moved = h.move(problem, rotation, shift, skip=name)
+            label = name if isinstance(name, str) else " ".join(name)
             rows.append(
-                {"input not rotated": name}
-                | fmt(h.compare(model, inputs, moved, rotation))
+                {"input not rotated": label}
+                | fmt(h.compare(model, problem, moved, rotation))
             )
         return rows
 
@@ -125,22 +125,33 @@ def _(fmt, h, mo, rotation, setup, shift):
 def _(fmt, h, mo, setup, torch):
     @torch.no_grad()
     def sensitivity_rows():
-        model, inputs = setup(2)
-        reference = model(**inputs)
-        rows = []
-        for name in (
-            "boundary_scalars",
-            "boundary_vectors",
-            "global_scalars",
-            "global_vectors",
-        ):
-            changed = dict(inputs, **{name: 1.1 * inputs[name]})
-            out = model(**changed)
-            rows.append(
-                {"input scaled by 1.1": name}
-                | fmt([h.rel_err(a, b) for a, b in zip(out, reference)])
-            )
-        return rows
+        model, problem = setup(2)
+        reference = h.predict(model, problem)
+
+        def scaled(boundary, key):
+            fields = dict(problem["boundaries"][boundary])
+            fields[key] = 1.1 * fields[key]
+            return dict(problem, boundaries=problem["boundaries"] | {boundary: fields})
+
+        cases = {
+            "body scalars": scaled("body", "scalars"),
+            "body vectors": scaled("body", "vectors"),
+            "inlet vectors": scaled("inlet", "vectors"),
+            "global_scalars": dict(
+                problem, global_scalars=1.1 * problem["global_scalars"]
+            ),
+            "global_vectors": dict(
+                problem, global_vectors=1.1 * problem["global_vectors"]
+            ),
+            "inlet removed": dict(
+                problem, boundaries={"body": problem["boundaries"]["body"]}
+            ),
+        }
+        return [
+            {"change": name}
+            | fmt([h.rel_err(a, b) for a, b in zip(h.predict(model, case), reference)])
+            for name, case in cases.items()
+        ]
 
     h.show(
         mo,
@@ -153,41 +164,49 @@ def _(fmt, h, mo, setup, torch):
 @app.cell
 def _(mo):
     mo.md("""
-    `global_vectors` scaled by 1.1 keeps the directions, so the frame is
-    unchanged; any output change comes from the magnitude reaching the
-    network.
+    The first five rows scale an input by 1.1. Scaling `global_vectors`
+    keeps the directions, so the frame is unchanged; the output change comes
+    from the magnitude reaching the network.
 
-    ## Frame conditioning
+    ## Tie-breakers
 
-    With two global vectors the frame is built from them by Gram-Schmidt.
-    Below, the second vector is tilted toward the first. The error should
-    stay at round-off until the vectors are nearly parallel, then grow.
+    The frame is the body's principal axes. What the shape leaves open is
+    settled by a fixed list: the body's third moment (0), then each global
+    vector (1, 2), then the offset of all boundaries' centroid from the
+    body's (the last number). `-1` is the right-hand rule and `-2` means
+    nothing fixed the axis, so it is arbitrary and the error is not
+    round-off. The bodies are random samples, so even the ellipsoid and the
+    spheroid are slightly lopsided; with few samples that noise is what the
+    third moment picks up.
     """)
     return
 
 
 @app.cell
-def _(fmt, h, math, mo, precision, rotation, setup, shift, torch):
-    def conditioning_rows():
-        model, inputs = setup(2)
-        first = torch.tensor([1.0, 0.0, 0.0], dtype=precision)
-        second = torch.tensor([0.0, 0.0, 1.0], dtype=precision)
+def _(fmt, h, mo, precision, rotation, seed, shift):
+    def tie_break_rows():
         rows = []
-        for degrees in (90, 10, 1, 1e-2, 1e-4, 1e-6, 0):
-            angle = math.radians(degrees)
-            vectors = torch.stack(
-                [first, math.cos(angle) * first + math.sin(angle) * second]
-            )[None]
-            case = dict(inputs, global_vectors=vectors)
-            rows.append(
-                {"angle between vectors (deg)": degrees}
-                | fmt(h.compare(model, case, h.move(case, rotation, shift), rotation))
-            )
+        for name in h.GEOMETRIES:
+            for k, inlet in ((1, True), (0, True), (0, False)):
+                model = h.make_model(k, seed=seed.value, dtype=precision)
+                problem = h.make_problem(
+                    name, global_vectors=k, seed=seed.value, dtype=precision
+                )
+                if not inlet:
+                    problem["boundaries"].pop("inlet")
+                moved = h.move(problem, rotation, shift)
+                rows.append(
+                    {
+                        "body": name,
+                        "global vectors": k,
+                        "inlet": inlet,
+                        "axes fixed by": str(h.body_frame(problem)[3].tolist()),
+                    }
+                    | fmt(h.compare(model, problem, moved, rotation))
+                )
         return rows
 
-    h.show(
-        mo, "Rotation + translation error vs frame conditioning", conditioning_rows()
-    )
+    h.show(mo, "What fixes the frame, and the rotation error", tie_break_rows())
     return
 
 

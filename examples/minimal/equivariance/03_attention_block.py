@@ -33,11 +33,14 @@ def _():
     from physicsnemo.experimental.models.geotransolver_pp.geotransolver_pp import (
         _Block as Block,
     )
+    from physicsnemo.experimental.models.geotransolver_pp.geotransolver_pp import (
+        _NeighborAttention as NeighborAttention,
+    )
     from physicsnemo.models.geotransolver.context_projector import (
         GeometricFeatureProcessor,
     )
 
-    return Block, GeometricFeatureProcessor, h, mo, torch
+    return Block, GeometricFeatureProcessor, NeighborAttention, h, mo, torch
 
 
 @app.cell
@@ -55,7 +58,13 @@ def _(mo):
       measure must change nothing. With the measure ignored (control),
       it must change something.
 
-    The last table runs the same order test on GeoTransolver's current
+    The second table does the same for the neighbor attention that
+    replaces GeoTransolver's ball query + MLP: each point attends over the
+    boundary tokens within a radius. It is exact while every token in range
+    fits in the neighbor limit. Above the limit the search keeps a subset,
+    and which subset depends on the order of the tokens.
+
+    The last table runs the order test on GeoTransolver's current
     ball-query feature layer for comparison.
     """)
     return
@@ -115,7 +124,7 @@ def _(Block, dim, dtype, h, n_context, n_tokens, seed, torch):
             ),
         )
 
-    return context, context_measure, measure, run, split, x
+    return context, context_measure, measure, precision, run, split, x
 
 
 @app.cell
@@ -176,6 +185,100 @@ def _(context, context_measure, h, measure, mo, run, split, torch, x):
         ]
 
     h.show(mo, "Measure-weighted FLARE++ block", block_rows())
+    return
+
+
+@app.cell
+def _(
+    NeighborAttention, dim, h, mo, n_context, n_tokens, precision, seed, split, torch
+):
+    @torch.no_grad()
+    def neighbor_rows():
+        n, m = n_tokens.value, n_context.value
+        g = torch.Generator().manual_seed(seed.value)
+
+        def rand(*shape):
+            return torch.rand(*shape, dtype=precision, generator=g)
+
+        x, tokens = rand(1, n, dim.value), rand(1, m, dim.value)
+        points, token_points = rand(1, n, 3), rand(1, m, 3)
+        points[:, 0] += 10  # one point with no boundary in range
+        measure = rand(1, m) + 0.1
+
+        def layer(limit):
+            torch.manual_seed(seed.value)
+            return (
+                NeighborAttention(dim.value, 4, 0.5, limit, "gelu").to(precision).eval()
+            )
+
+        def run(
+            layer, tokens, token_points, measure, use_measure=True, points=points, x=x
+        ):
+            measure = measure if use_measure else torch.ones_like(measure)
+            log_measure = (measure / measure.sum(dim=-1, keepdim=True)).log()
+            return layer(x, points, tokens, token_points, log_measure)
+
+        full, limited = layer(2 * m), layer(8)
+        order, point_order = (
+            torch.randperm(m, generator=g),
+            torch.randperm(n, generator=g),
+        )
+        shuffled = (tokens[:, order], token_points[:, order], measure[:, order])
+        tokens2, measure2 = split(tokens, measure, m // 4)
+        doubled = (
+            tokens2,
+            torch.cat([token_points, token_points[:, : m // 4]], 1),
+            measure2,
+        )
+        reference = run(full, tokens, token_points, measure)
+        cases = [
+            ("tokens shuffled", "round-off", run(full, *shuffled), reference),
+            (
+                "tokens split, measure shared",
+                "round-off",
+                run(full, *doubled),
+                reference,
+            ),
+            (
+                "points shuffled",
+                "round-off",
+                run(
+                    full,
+                    tokens,
+                    token_points,
+                    measure,
+                    points=points[:, point_order],
+                    x=x[:, point_order],
+                ),
+                reference[:, point_order],
+            ),
+            (
+                "point with nothing in range",
+                "zero (unchanged)",
+                reference[:, 0],
+                x[:, 0],
+            ),
+            (
+                "control: tokens split, measure ignored",
+                "large",
+                run(full, *doubled, use_measure=False),
+                run(full, tokens, token_points, measure, use_measure=False),
+            ),
+            (
+                "tokens shuffled, limit of 8 neighbors",
+                "depends on the subset kept",
+                run(limited, *shuffled),
+                run(limited, tokens, token_points, measure),
+            ),
+        ]
+        return [
+            {"change": name, "expected": expected, "error": f"{h.rel_err(a, b):.1e}"}
+            for name, expected, a, b in cases
+        ]
+
+    h.show(
+        mo, "Neighbor attention over boundary tokens within a radius", neighbor_rows()
+    )
     return
 
 

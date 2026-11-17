@@ -165,11 +165,16 @@ def test_domain_finds_detached_body_among_walls():
         return CanonicalFrameMesh(
             wall_names=["no_slip"],
             direction_fields={"inlet": "velocity"},
+            rescale=True,
             store_frame_as="frame",
         ).apply_to_domain(domain)
 
     a = run(torch.eye(3), torch.zeros(3))
-    b = run(_rotation(5).float(), torch.tensor([1.0, 2.0, 3.0]))
+    # Moved, rotated and three times the size: same canonical coordinates.
+    b = run(3 * _rotation(5).float(), torch.tensor([1.0, 2.0, 3.0]))
+    torch.testing.assert_close(
+        b.global_data["frame_length"], 3 * a.global_data["frame_length"]
+    )
     # The origin is the body's centroid, not the enclosure's.
     torch.testing.assert_close(
         a.global_data["frame_origin"], torch.tensor([0.5, 0.2, 0.0]), atol=1e-5, rtol=0
