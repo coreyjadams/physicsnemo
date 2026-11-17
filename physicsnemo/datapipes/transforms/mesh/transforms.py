@@ -294,6 +294,213 @@ class CenterMesh(MeshTransform):
         return ", ".join(parts)
 
 
+def canonical_frame(
+    points: Float[torch.Tensor, "n_points spatial_dims"],
+    weights: Float[torch.Tensor, " n_points"] | None = None,
+    tie_breakers: Sequence[Float[torch.Tensor, " spatial_dims"]] = (),
+    min_gap: float = 1e-2,
+    min_component: float = 1e-9,
+) -> tuple[
+    Float[torch.Tensor, " spatial_dims"],
+    Float[torch.Tensor, "spatial_dims spatial_dims"],
+    torch.Tensor,
+]:
+    r"""Origin and right-handed principal axes of a weighted point set.
+
+    The origin is the weighted centroid. The axes are the eigenvectors of the
+    weighted covariance, largest variance first, one per row, so canonical
+    coordinates are ``(points - origin) @ axes.T``. Moving or rotating the
+    points moves and rotates the frame with them, so canonical coordinates do
+    not change. With measure weights (cell areas) the frame converges under
+    mesh refinement instead of following point density.
+
+    What the covariance leaves open is settled by a fixed list of vectors
+    that rotate with the problem: first the shape's third moment
+    :math:`\sum_i w_i |r_i|^2 r_i` (it points to the lopsided side), then
+    ``tie_breakers`` in order.
+
+    - Axes with equal variance can sit at any angle in their plane. The first
+      vector with a usable component in that plane becomes the axis.
+    - Every other axis is pointed along the first vector with a usable
+      component on it.
+    - The axis with the weakest such component (zero across a symmetry
+      plane) is instead pointed by the right-hand rule, so a mirrored shape
+      gets a mirrored description: reflections are not factored out.
+
+    Parameters
+    ----------
+    points : torch.Tensor
+        Point coordinates, shape :math:`(N, S)`.
+    weights : torch.Tensor, optional
+        Non-negative measure per point, shape :math:`(N,)`. Uniform if omitted.
+    tie_breakers : Sequence[torch.Tensor], optional
+        Dimensionless vectors of shape :math:`(S,)` that rotate with the
+        problem (a body offset over the size of the shape, a mean flow
+        direction), most trusted first.
+    min_gap : float
+        Eigenvalues closer than this, relative to the largest, count as equal.
+    min_component : float
+        Smallest usable component of a vector. The third moment is divided by
+        the RMS radius cubed before this test. The default is just above
+        float64 roundoff, so only an exactly symmetric shape is skipped.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ``origin`` of shape :math:`(S,)`, ``axes`` of shape :math:`(S, S)`,
+        and ``source`` of shape :math:`(S,)` saying what fixed each axis:
+        ``0`` the third moment, ``i`` for ``tie_breakers[i - 1]``, ``-1`` the
+        right-hand rule, ``-2`` nothing. An axis marked ``-2`` is arbitrary:
+        the problem is symmetric as far as the vectors can tell, and
+        canonical coordinates are not rotation invariant along it.
+
+    Notes
+    -----
+    The frame is deterministic but not continuous: it jumps where a variance
+    gap or a component crosses its threshold. Computed in float64 whatever
+    the input precision; ``origin`` and ``axes`` come back in the dtype of
+    ``points``.
+    """
+    dtype, points = points.dtype, points.double()
+    tie_breakers = [v.double() for v in tie_breakers]
+    if weights is None:
+        weights = points.new_ones(points.shape[0])
+    w = (weights.double() / weights.double().sum()).unsqueeze(-1)
+    origin = (w * points).sum(dim=0)
+    r = points - origin
+    evals, evecs = torch.linalg.eigh((w * r).T @ r)  # ascending
+    evals, axes = evals.flip(0), evecs.T.flip(0).clone()
+    n = len(evals)
+    third_moment = (w * r.square().sum(-1, keepdim=True) * r).sum(dim=0)
+    vectors = [third_moment / evals.sum() ** 1.5, *tie_breakers]
+    source = [-2] * n
+    strength = [0.0] * n  # component that fixed the axis; 0 = not fixed
+    free = [False] * n  # axis in a plane no vector could pin down
+
+    # Pin the angle inside each run of equal variances.
+    equal = ((evals[:-1] - evals[1:]) < min_gap * evals[0]).tolist()
+    start = 0
+    for stop in range(1, n + 1):
+        if stop < n and equal[stop - 1]:
+            continue
+        plane, chosen = axes[start:stop], []
+        for i, v in enumerate(vectors if stop - start > 1 else ()):
+            p = (plane @ v) @ plane
+            for c in chosen:
+                p = p - (p @ c) * c
+            if p.norm() >= min_component:
+                source[start + len(chosen)] = i
+                strength[start + len(chosen)] = p.norm().item()
+                chosen.append(p / p.norm())
+                if len(chosen) == stop - start - 1:
+                    break
+        n_rest = stop - start - len(chosen)
+        if chosen:
+            c = torch.stack(chosen)
+            rest = torch.linalg.svd(plane - plane @ c.T @ c).Vh[:n_rest]
+            axes[start:stop] = torch.cat([c, rest])
+        if n_rest > 1:
+            free[stop - n_rest : stop] = [True] * n_rest
+        start = stop
+
+    # Point the remaining axes.
+    for a in range(n):
+        if strength[a] or free[a]:
+            continue
+        for i, v in enumerate(vectors):
+            component = axes[a] @ v
+            if component.abs() >= min_component:
+                axes[a] = axes[a] * component.sign()
+                source[a], strength[a] = i, component.abs().item()
+                break
+
+    # Right-hand rule on the weakest axis that is not in a free plane.
+    pinned = [a for a in range(n) if not free[a]]
+    weakest = min(pinned or range(n), key=lambda a: strength[a])
+    axes[weakest] = axes[weakest] * torch.linalg.det(axes).sign()
+    if pinned:
+        source[weakest] = -1
+    return origin.to(dtype), axes.to(dtype), torch.tensor(source)
+
+
+@register()
+class CanonicalFrameMesh(MeshTransform):
+    r"""Express a mesh in the canonical frame of its geometry.
+
+    Translates and rotates the mesh so the frame from :func:`canonical_frame`
+    becomes the origin and coordinate axes. The frame is area-weighted when
+    the geometry has cells. Place it after non-dimensionalization, so the
+    frame is built from non-dimensional coordinates.
+
+    Parameters
+    ----------
+    boundary_name : str, optional
+        For a :class:`DomainMesh`, the boundary that defines the frame (the
+        body). Required for domains; ignored for a single :class:`Mesh`.
+    store_frame_as : str, optional
+        Store the frame in ``global_data`` as ``<name>_origin``,
+        ``<name>_axes`` and ``<name>_source`` so results can be mapped back:
+        ``x = x_canonical @ axes + origin`` and ``v = v_canonical @ axes``.
+        ``<name>_source`` marks arbitrary axes, see :func:`canonical_frame`.
+    transform_point_data, transform_cell_data, transform_global_data
+        Which vector fields rotate with the geometry, as in
+        :class:`RotateMesh`.
+    """
+
+    def __init__(
+        self,
+        boundary_name: str | None = None,
+        store_frame_as: str | None = None,
+        transform_point_data: bool | dict = False,
+        transform_cell_data: bool | dict = False,
+        transform_global_data: bool | dict = False,
+    ) -> None:
+        super().__init__()
+        self.boundary_name = boundary_name
+        self.store_frame_as = store_frame_as
+        self.transform_point_data = transform_point_data
+        self.transform_cell_data = transform_cell_data
+        self.transform_global_data = transform_global_data
+
+    def _apply(self, target: Mesh | DomainMesh, geometry: Mesh) -> Mesh | DomainMesh:
+        if geometry.n_cells > 0:
+            origin, axes, source = canonical_frame(
+                geometry.cell_centroids, geometry.cell_areas
+            )
+        else:
+            origin, axes, source = canonical_frame(geometry.points)
+        out = target.translate(-origin).transform(
+            axes,
+            transform_point_data=self.transform_point_data,
+            transform_cell_data=self.transform_cell_data,
+            transform_global_data=self.transform_global_data,
+            assume_invertible=True,
+            assume_similarity=True,
+        )
+        if self.store_frame_as is not None:
+            global_data = out.global_data.copy()
+            global_data[f"{self.store_frame_as}_origin"] = origin
+            global_data[f"{self.store_frame_as}_axes"] = axes
+            global_data[f"{self.store_frame_as}_source"] = source
+            out.global_data = global_data
+        return out
+
+    def __call__(self, mesh: Mesh) -> Mesh:
+        return self._apply(mesh, mesh)
+
+    def apply_to_domain(self, domain: DomainMesh) -> DomainMesh:
+        """Put the interior and every boundary in the frame of ``boundary_name``."""
+        if self.boundary_name is None:
+            raise ValueError(
+                "CanonicalFrameMesh needs boundary_name to pick the geometry "
+                f"of a DomainMesh; available: {list(domain.boundaries.keys())}"
+            )
+        return self._apply(domain, domain.boundaries[self.boundary_name])
+
+    def extra_repr(self) -> str:
+        return f"boundary_name={self.boundary_name!r}"
+
+
 def _compact_points(mesh: Mesh) -> Mesh:
     """Remove unreferenced points and remap cell indices."""
     if mesh.n_cells == 0:
