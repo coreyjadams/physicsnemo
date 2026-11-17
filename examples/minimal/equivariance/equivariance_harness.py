@@ -28,7 +28,10 @@ from pathlib import Path
 import torch
 from torch.nn.functional import normalize
 
-from physicsnemo.datapipes.transforms.mesh import CanonicalFrameMesh
+from physicsnemo.datapipes.transforms.mesh import (
+    CanonicalFrameMesh,
+    SplitDetachedCells,
+)
 from physicsnemo.datapipes.transforms.mesh.transforms import canonical_frame
 from physicsnemo.experimental.models.geotransolver_pp import GeoTransolverPP
 
@@ -183,8 +186,7 @@ def make_model(
     """
     torch.manual_seed(seed)
     model = GeoTransolverPP(
-        out_scalars=2,
-        out_vectors=2,
+        out_dim=8,  # two scalars and two vectors
         boundary_features={"body": 2 + 3, "inlet": 3},
         global_features=1 + 3 * global_vectors,
         n_hidden=n_hidden,
@@ -260,8 +262,8 @@ def canonical(problem):
 def predict(model, problem):
     """Scalars and lab-frame vectors of the pipeline: frame, then model."""
     inputs, axes = canonical(problem)
-    scalars, vectors = model(**inputs)
-    return scalars[0], vectors[0] @ axes
+    out = model(**inputs)[0]
+    return out[:, :2], out[:, 2:].unflatten(-1, (2, 3)) @ axes
 
 
 def move(problem, matrix=None, shift=None, scale=1.0, skip=None):
@@ -359,9 +361,29 @@ def aerozoo_cases(limit=None):
 
 
 def aerozoo_transform():
-    """Body frame of an AeroZoo sample, from benchmark-legal inputs only."""
+    """Body frame of an AeroZoo sample, from benchmark-legal inputs only.
+
+    The body's cells are first moved out of the wall boundaries into
+    ``body_no_slip`` and ``body_slip``.
+    """
+    return _Chain(SplitDetachedCells(["no_slip", "slip"]), _aerozoo_frame())
+
+
+class _Chain:
+    """Apply domain transforms in order."""
+
+    def __init__(self, *transforms):
+        self.transforms = transforms
+
+    def apply_to_domain(self, domain):
+        for transform in self.transforms:
+            domain = transform.apply_to_domain(domain)
+        return domain
+
+
+def _aerozoo_frame():
     return CanonicalFrameMesh(
-        wall_names=["no_slip", "slip"],
+        boundary_name=["body_no_slip", "body_slip"],
         direction_fields={"inlet": AEROZOO_VELOCITY},
         rescale=True,
         store_frame_as="frame",
@@ -506,9 +528,15 @@ def aerozoo_model(n_hidden=32, seed=0):
     """Small untrained model for :func:`aerozoo_inputs`."""
     torch.manual_seed(seed)
     model = GeoTransolverPP(
-        out_scalars=1,
-        out_vectors=1,
-        boundary_features={"inlet": 3, "outlet": 0, "no_slip": 0, "slip": 0},
+        out_dim=4,  # a scalar and a vector
+        boundary_features={
+            "inlet": 3,
+            "outlet": 0,
+            "no_slip": 0,
+            "slip": 0,
+            "body_no_slip": 0,
+            "body_slip": 0,
+        },
         n_hidden=n_hidden,
         n_layers=2,
         n_head=4,

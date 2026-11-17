@@ -70,6 +70,7 @@ if _SRC_DIR not in sys.path:
 ### side-effect `import`s also register datapipe components.
 import merge_global_data  # noqa: F401, E402  (registers MeshReaderWithGlobalData)
 import nondim  # noqa: F401, E402  (registers NonDimensionalizeByMetadata)
+import aerozoo  # noqa: F401, E402  (registers the AeroZoo transforms)
 import sdf  # noqa: F401, E402  (registers ComputeSDFFromBoundary, DropBoundary)
 from collate import build_collate_fn  # noqa: E402
 from metrics import MetricName  # noqa: E402

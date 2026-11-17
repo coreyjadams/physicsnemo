@@ -250,8 +250,7 @@ def _(h, mo, n_cases, seed, torch):
                 {
                     "sample": path.parent.name[-12:],
                     "axes fixed by": str(a.global_data["frame_source"].tolist()),
-                    "scalars": f"{h.rel_err(out_b[0], out_a[0]):.1e}",
-                    "vectors (canonical)": f"{h.rel_err(out_b[1], out_a[1]):.1e}",
+                    "outputs (canonical)": f"{h.rel_err(out_b, out_a):.1e}",
                     "ISLA scalars": f"{h.rel_err(isla_b[0], isla_a[0]):.1e}",
                     "ISLA vectors": f"{h.rel_err(isla_b[1], isla_a[1] @ rotation.T):.1e}",
                 }
@@ -313,11 +312,8 @@ def _(h, mo, n_cases, seed, torch):
                             systematic=systematic,
                         )
                     )
-                    worst = max(h.rel_err(a, b) for a, b in zip(out, reference))
-                    rms = max(
-                        ((a - b).norm() / b.norm()).item()
-                        for a, b in zip(out, reference)
-                    )
+                    worst = h.rel_err(out, reference)
+                    rms = ((out - reference).norm() / reference.norm()).item()
                     row[f"{m} tokens: max / rms"] = f"{worst:.3f} / {rms:.3f}"
                 rows.append(row)
         return rows

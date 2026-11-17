@@ -455,6 +455,53 @@ def _detached_cells(domain: DomainMesh, wall_names: Sequence[str]) -> torch.Tens
 
 
 @register()
+class SplitDetachedCells(MeshTransform):
+    r"""Move the cells of a body out of the wall boundaries that hold it.
+
+    Some datasets store a body and the walls of its enclosure in the same
+    boundaries, one per boundary condition. The body is the part of
+    ``wall_names`` that no path along wall cells joins to any other
+    boundary. For each wall boundary ``w`` this adds a boundary
+    ``prefix + w`` with the body's cells and their ``cell_data`` and leaves
+    the rest in ``w``. Either may end up with no cells. Boundaries must
+    share their seam points exactly.
+
+    Parameters
+    ----------
+    wall_names : Sequence[str]
+        Wall boundaries that may hold a body.
+    prefix : str, optional
+        Prefix of the new boundaries. Default is ``"body_"``.
+    """
+
+    def __init__(self, wall_names: Sequence[str], prefix: str = "body_") -> None:
+        super().__init__()
+        self.wall_names = list(wall_names)
+        self.prefix = prefix
+
+    def __call__(self, mesh: Mesh) -> Mesh:
+        raise TypeError("SplitDetachedCells needs a DomainMesh, not a Mesh")
+
+    def apply_to_domain(self, domain: DomainMesh) -> DomainMesh:
+        """Split each wall boundary into its body cells and the rest."""
+        detached = _detached_cells(domain, self.wall_names)
+        boundaries = {name: domain.boundaries[name] for name in domain.boundary_names}
+        counts = [boundaries[name].n_cells for name in self.wall_names]
+        for name, mask in zip(self.wall_names, detached.split(counts)):
+            wall = boundaries[name]
+            boundaries[name] = wall.slice_cells((~mask).nonzero()[:, 0])
+            boundaries[self.prefix + name] = wall.slice_cells(mask.nonzero()[:, 0])
+        return DomainMesh(
+            interior=domain.interior,
+            boundaries=boundaries,
+            global_data=domain.global_data,
+        )
+
+    def extra_repr(self) -> str:
+        return f"wall_names={self.wall_names}, prefix={self.prefix!r}"
+
+
+@register()
 class CanonicalFrameMesh(MeshTransform):
     r"""Express a mesh in the canonical frame of its geometry.
 
@@ -465,24 +512,25 @@ class CanonicalFrameMesh(MeshTransform):
     length from outside the sample. Place it before any subsampling: on a
     subsample the axes can flip.
 
-    For a :class:`DomainMesh` the geometry is the body: the boundary
-    ``boundary_name``, or the cells of ``wall_names`` that are detached from
-    every other boundary. A domain with no such cells uses all boundaries.
-    Axes the body's shape leaves open are settled by, in order, the mean
-    direction of each of ``direction_fields`` and the offset of the
-    boundaries' centroid from the body's.
+    For a :class:`DomainMesh` the geometry is the body, the boundaries
+    ``boundary_name`` together. If they have no cells (a domain with no
+    body) the geometry is all boundaries. Axes the body's shape leaves open
+    are settled by, in order, the mean direction of each of
+    ``direction_fields`` and the offset of the boundaries' centroid from the
+    body's.
 
     Parameters
     ----------
-    boundary_name : str, optional
-        The boundary that is the body.
-    wall_names : Sequence[str], optional
-        Wall boundaries that hold the body among other walls. Give this or
-        ``boundary_name`` for a domain; both are ignored for a :class:`Mesh`.
+    boundary_name : str or Sequence[str], optional
+        The boundary, or boundaries, that make up the body. Required for a
+        domain; ignored for a :class:`Mesh`.
     direction_fields : Mapping[str, str | Sequence[str]], optional
-        Boundary name to the ``cell_data`` key of a vector field whose
+        Boundary name to the ``cell_data`` field of a vector whose
         area-weighted mean direction is a tie-breaker (an inlet's prescribed
-        velocity).
+        velocity). A ``"."`` addresses a nested field.
+    rotate : bool, optional
+        Rotate to the canonical axes. ``False`` only moves the origin (and
+        rescales), and stores identity axes. Default is ``True``.
     rescale : bool, optional
         Divide positions by the RMS distance of the geometry from its
         centroid. Fields keep their units. Default is ``False``.
@@ -500,9 +548,9 @@ class CanonicalFrameMesh(MeshTransform):
 
     def __init__(
         self,
-        boundary_name: str | None = None,
-        wall_names: Sequence[str] | None = None,
+        boundary_name: str | Sequence[str] | None = None,
         direction_fields: Mapping[str, str | Sequence[str]] | None = None,
+        rotate: bool = True,
         rescale: bool = False,
         store_frame_as: str | None = None,
         transform_point_data: bool | dict = False,
@@ -510,9 +558,11 @@ class CanonicalFrameMesh(MeshTransform):
         transform_global_data: bool | dict = False,
     ) -> None:
         super().__init__()
-        self.boundary_name = boundary_name
-        self.wall_names = wall_names
+        if isinstance(boundary_name, str):
+            boundary_name = [boundary_name]
+        self.boundary_name = None if boundary_name is None else list(boundary_name)
         self.direction_fields = dict(direction_fields or {})
+        self.rotate = rotate
         self.rescale = rescale
         self.store_frame_as = store_frame_as
         self.transform_point_data = transform_point_data
@@ -537,10 +587,9 @@ class CanonicalFrameMesh(MeshTransform):
             )
             length = mean_r2.sqrt().to(dtype)
         origin, axes = origin.to(dtype), axes.to(dtype)
-        out = (
-            target.translate(-origin)
-            .scale(1 / length.item())
-            .transform(
+        out = target.translate(-origin).scale(1 / length.item())
+        if self.rotate:
+            out = out.transform(
                 axes,
                 transform_point_data=self.transform_point_data,
                 transform_cell_data=self.transform_cell_data,
@@ -548,7 +597,8 @@ class CanonicalFrameMesh(MeshTransform):
                 assume_invertible=True,
                 assume_similarity=True,
             )
-        )
+        else:
+            axes = torch.eye(len(origin), dtype=dtype)
         if self.store_frame_as is not None:
             global_data = out.global_data.copy()
             global_data[f"{self.store_frame_as}_origin"] = origin
@@ -563,48 +613,41 @@ class CanonicalFrameMesh(MeshTransform):
 
     def apply_to_domain(self, domain: DomainMesh) -> DomainMesh:
         """Put the interior and every boundary in the frame of the body."""
-        boundaries = domain.boundaries
-        if self.boundary_name is not None:
-            body = boundaries[self.boundary_name]
-            x, w = _faces(body)
-            if body.n_cells == 0:  # a point cloud has no neighbors to compare to
-                return self._apply(domain, x, w)
-            others = [n for n in boundaries.keys() if n != self.boundary_name]
-            faces = [(x, w), *(_faces(boundaries[n]) for n in others)]
-            faces = [f for f in faces if f[1] is not None]
-            is_body = torch.zeros(sum(len(f[1]) for f in faces), dtype=torch.bool)
-            is_body[: len(w)] = True
-        elif self.wall_names is not None:
-            others = [n for n in boundaries.keys() if n not in self.wall_names]
-            faces = [_faces(boundaries[n]) for n in [*self.wall_names, *others]]
-            faces = [f for f in faces if f[1] is not None]
-            is_body = torch.zeros(sum(len(f[1]) for f in faces), dtype=torch.bool)
-            detached = _detached_cells(domain, self.wall_names)
-            is_body[: len(detached)] = detached
-        else:
+        if self.boundary_name is None:
             raise ValueError(
-                "CanonicalFrameMesh needs boundary_name or wall_names to find "
-                f"the body of a DomainMesh; available: {list(boundaries.keys())}"
+                "CanonicalFrameMesh needs boundary_name to find the body of a "
+                f"DomainMesh; available: {domain.boundary_names}"
             )
+        boundaries = domain.boundaries
+        body = [boundaries[n] for n in self.boundary_name]
+        if all(b.n_cells == 0 for b in body) and any(b.n_points for b in body):
+            # A point-cloud body has no areas and no neighbors to compare to.
+            return self._apply(
+                domain, torch.cat([b.points.double() for b in body]), None
+            )
+        others = [n for n in domain.boundary_names if n not in self.boundary_name]
+        faces = [_faces(b) for b in [*body, *(boundaries[n] for n in others)]]
+        n_body = sum(b.n_cells for b in body)
+        faces = [f for f in faces if f[1] is not None and len(f[1])]
         x, w = torch.cat([f[0] for f in faces]), torch.cat([f[1] for f in faces])
 
         tie_breakers = []
         for name, key in self.direction_fields.items():
-            key = key if isinstance(key, str) else tuple(key)
+            key = as_nested_key(key) if isinstance(key, str) else tuple(key)
             v, a = boundaries[name].cell_data[key].double(), _faces(boundaries[name])[1]
             tie_breakers.append(
                 (a[:, None] * v).sum(0) / (a * v.norm(dim=-1)).sum().clamp_min(1e-300)
             )
-        if not is_body.any():
+        if n_body == 0:
             return self._apply(domain, x, w, tie_breakers)
         center = (w[:, None] * x).sum(0) / w.sum()
         size = ((w * (x - center).square().sum(-1)).sum() / w.sum()).sqrt()
-        xb, wb = x[is_body], w[is_body]
+        xb, wb = x[:n_body], w[:n_body]
         tie_breakers.append((center - (wb[:, None] * xb).sum(0) / wb.sum()) / size)
         return self._apply(domain, xb, wb, tie_breakers)
 
     def extra_repr(self) -> str:
-        return f"boundary_name={self.boundary_name!r}, wall_names={self.wall_names!r}"
+        return f"boundary_name={self.boundary_name!r}, rescale={self.rescale}"
 
 
 def _compact_points(mesh: Mesh) -> Mesh:
@@ -1392,6 +1435,9 @@ class BoundaryCellsToPoints(MeshTransform):
     offset : float, default 0.0
         Distance off the cell along its unit normal, in the coordinates'
         units; 0 puts the points at the centroids.
+    normals_field : str, optional
+        Store each drawn cell's unit normal on its point under this
+        ``point_data`` name.
 
     Raises
     ------
@@ -1429,6 +1475,7 @@ class BoundaryCellsToPoints(MeshTransform):
         fields: Mapping[str, str],
         n_cells: int | None = None,
         offset: float = 0.0,
+        normals_field: str | None = None,
     ) -> None:
         super().__init__()
         self.source = str(source)
@@ -1436,6 +1483,7 @@ class BoundaryCellsToPoints(MeshTransform):
         self.fields = _parse_key_mapping(dict(fields))
         self.n_cells = n_cells
         self.offset = float(offset)
+        self.normals_field = normals_field
         self._generator: torch.Generator | None = None
 
     def __call__(self, mesh: Mesh) -> Mesh:
@@ -1477,6 +1525,8 @@ class BoundaryCellsToPoints(MeshTransform):
                 drawn.cell_data.select(*self.fields), self.fields, strict=True
             ),
         )
+        if self.normals_field is not None:
+            new.point_data[self.normals_field] = drawn.cell_normals
         set_point_measures(new, cell_measures(drawn), dimension=drawn.n_manifold_dims)
         boundaries = dict(domain.boundaries.items())
         boundaries[self.source] = source.with_data(

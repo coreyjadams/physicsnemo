@@ -1,0 +1,145 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# AeroZoo interior task (DomainMesh), https://huggingface.co/datasets/nvidia/AeroZoo
+# Each sample is samples/<case_id>/domain.pdmsh in SI units: the interior
+# cell centers with the mean fields, and four triangle boundary meshes named
+# by boundary condition (inlet, outlet, no_slip, slip). The body is not a
+# separate mesh; its cells are part of no_slip and slip.
+#
+# Only benchmark-legal inputs are used: the boundary meshes, their
+# prescribed values, density and viscosity. Every scale comes from the
+# sample itself:
+#   length  the RMS radius of the body (of all boundaries if there is none)
+#   speed   the area-weighted RMS prescribed inlet speed
+#
+# Splits: run datasets/aerozoo_manifest.py once to write manifest.json, then
+# pass e.g. train_split=full_train val_split=full_val.
+
+train_datadir: ${dataset_paths.aerozoo}
+
+# Boundary cells drawn per boundary condition (six conditions).
+boundary_tokens: 4096
+# false keeps the stored axes: only the origin and the length are set by the
+# body. Use it to train a model without the canonical rotation.
+canonical_axes: true
+
+pipeline:
+  reader:
+    _target_: ${dp:DomainMeshReader}
+    path: ${train_datadir}
+    pattern: "samples/*/domain.pdmsh"
+    # Read whole: the frame needs every boundary cell, and the files store
+    # interior points in solver order, so a block read is one patch of the
+    # domain. SubsampleInteriorPoints below draws the points at random.
+    subsample_n_points: null
+    subsample_n_cells: null
+    drop_in_file_boundaries: false
+  transforms:
+    - _target_: ${dp:RenameMeshFields}
+      point_data:
+        solution.velocity: velocity
+        solution.gauge_pressure: pressure
+    - _target_: ${dp:SubsampleInteriorPoints}
+      n_points: ${sampling_resolution}
+      # cell volume: weights the loss and the metrics, never a model input
+      volume_field: _target_quadrature_measure
+    # The body: wall cells not connected to any other boundary.
+    - _target_: ${dp:SplitDetachedCells}
+      wall_names: [no_slip, slip]
+    # Origin, axes and unit of length from the body. Axes the body's shape
+    # leaves open go to the mean inlet velocity, then the enclosure offset.
+    - _target_: ${dp:CanonicalFrameMesh}
+      boundary_name: [body_no_slip, body_slip]
+      direction_fields:
+        inlet: prescribed.dirichlet.velocity
+      rotate: ${canonical_axes}
+      rescale: true
+      store_frame_as: frame
+      transform_point_data: true
+      transform_cell_data: true
+    - _target_: ${dp:NonDimensionalizeByInlet}
+      interior_fields:
+        velocity: velocity
+        pressure: pressure
+      boundary_velocities:
+        inlet: prescribed.dirichlet.velocity
+        no_slip: prescribed.dirichlet.velocity
+        body_no_slip: prescribed.dirichlet.velocity
+    # Distance and direction from each interior point to the nearest wall.
+    - _target_: ${dp:ComputeSDFFromBoundary}
+      boundary_name: [no_slip, slip, body_no_slip, body_slip]
+      sdf_field: sdf
+      normals_field: sdf_normals
+      # The boundaries' orientation does not say which side is the fluid.
+      unsigned: true
+      use_winding_number: false
+    # Boundary tokens: drawn cells of each condition, as point clouds with
+    # each point's share of the area.
+    - _target_: ${dp:BoundaryCellsToPoints}
+      source: inlet
+      name: inlet_tokens
+      n_cells: ${boundary_tokens}
+      normals_field: normals
+      fields: {prescribed.dirichlet.velocity: velocity}
+    - _target_: ${dp:BoundaryCellsToPoints}
+      source: outlet
+      name: outlet_tokens
+      n_cells: ${boundary_tokens}
+      normals_field: normals
+      fields: {}
+    - _target_: ${dp:BoundaryCellsToPoints}
+      source: no_slip
+      name: no_slip_tokens
+      n_cells: ${boundary_tokens}
+      normals_field: normals
+      fields: {prescribed.dirichlet.velocity: velocity}
+    - _target_: ${dp:BoundaryCellsToPoints}
+      source: slip
+      name: slip_tokens
+      n_cells: ${boundary_tokens}
+      normals_field: normals
+      fields: {}
+    - _target_: ${dp:BoundaryCellsToPoints}
+      source: body_no_slip
+      name: body_no_slip_tokens
+      n_cells: ${boundary_tokens}
+      normals_field: normals
+      fields: {prescribed.dirichlet.velocity: velocity}
+    - _target_: ${dp:BoundaryCellsToPoints}
+      source: body_slip
+      name: body_slip_tokens
+      n_cells: ${boundary_tokens}
+      normals_field: normals
+      fields: {}
+    - _target_: ${dp:DropBoundary}
+      names: [inlet, outlet, no_slip, slip, body_no_slip, body_slip]
+    # All tokens as one set, for models that read the boundary that way:
+    # features = normal (3), velocity (3), one-hot condition (6).
+    - _target_: ${dp:MergeBoundaryPoints}
+      sources:
+        - inlet_tokens
+        - outlet_tokens
+        - no_slip_tokens
+        - slip_tokens
+        - body_no_slip_tokens
+        - body_slip_tokens
+      fields: {normals: 3, velocity: 3}
+      name: tokens
+
+targets:
+  velocity: vector
+  pressure: scalar

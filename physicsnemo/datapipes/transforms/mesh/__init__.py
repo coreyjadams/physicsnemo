@@ -44,6 +44,7 @@ from physicsnemo.datapipes.transforms.mesh.transforms import (
     RotateMesh,
     ScaleMesh,
     SetGlobalField,
+    SplitDetachedCells,
     SubsampleMesh,
     TranslateMesh,
 )
@@ -59,6 +60,7 @@ __all__ = [
     "RotateMesh",
     "CanonicalFrameMesh",
     "CenterMesh",
+    "SplitDetachedCells",
     "SubsampleMesh",
     "DropMeshFields",
     "RenameMeshFields",

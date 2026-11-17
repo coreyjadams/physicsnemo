@@ -19,7 +19,10 @@
 import pytest
 import torch
 
-from physicsnemo.datapipes.transforms.mesh import CanonicalFrameMesh
+from physicsnemo.datapipes.transforms.mesh import (
+    CanonicalFrameMesh,
+    SplitDetachedCells,
+)
 from physicsnemo.datapipes.transforms.mesh.transforms import canonical_frame
 from physicsnemo.mesh import DomainMesh, Mesh
 
@@ -162,8 +165,11 @@ def test_domain_finds_detached_body_among_walls():
                 "no_slip": Mesh(points=wall_points @ rot.T + shift, cells=wall_cells),
             },
         )
+        domain = SplitDetachedCells(["no_slip"]).apply_to_domain(domain)
+        assert domain.boundaries["body_no_slip"].n_cells == body.n_cells
+        assert domain.boundaries["no_slip"].n_cells == int((~front).sum())
         return CanonicalFrameMesh(
-            wall_names=["no_slip"],
+            boundary_name=["body_no_slip"],
             direction_fields={"inlet": "velocity"},
             rescale=True,
             store_frame_as="frame",
@@ -181,3 +187,34 @@ def test_domain_finds_detached_body_among_walls():
     )
     assert -2 not in a.global_data["frame_source"].tolist()
     torch.testing.assert_close(a.interior.points, b.interior.points, atol=1e-4, rtol=0)
+
+
+def test_domain_without_body_uses_all_boundaries():
+    from physicsnemo.mesh.primitives.surfaces import sphere_icosahedral
+
+    shell = sphere_icosahedral.load(subdivisions=2)
+    shell = Mesh(points=shell.points * torch.tensor([4.0, 2.0, 1.0]), cells=shell.cells)
+    front = shell.cell_centroids[:, 0] < 0
+    domain = DomainMesh(
+        interior=Mesh(points=torch.randn(10, 3)),
+        boundaries={
+            "inlet": Mesh(points=shell.points, cells=shell.cells[front]),
+            "no_slip": Mesh(points=shell.points, cells=shell.cells[~front]),
+        },
+    )
+    domain = SplitDetachedCells(["no_slip"]).apply_to_domain(domain)
+    assert domain.boundaries["body_no_slip"].n_cells == 0
+    plain = CanonicalFrameMesh(
+        boundary_name="body_no_slip", rotate=False, rescale=True, store_frame_as="frame"
+    ).apply_to_domain(domain)
+    # Origin and size come from the whole shell; the axes are left alone.
+    torch.testing.assert_close(
+        plain.global_data["frame_origin"], torch.zeros(3), atol=1e-5, rtol=0
+    )
+    torch.testing.assert_close(plain.global_data["frame_axes"], torch.eye(3))
+    torch.testing.assert_close(
+        plain.interior.points * plain.global_data["frame_length"],
+        domain.interior.points,
+        atol=1e-5,
+        rtol=0,
+    )

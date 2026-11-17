@@ -306,8 +306,8 @@ Available models and datasets:
 
 | Group | Files |
 |---|---|
-| `model/` (`conf/model/*.yaml`) | `geotransolver_{surface,volume,volume_highlift}`, `transolver_{surface,volume}`, `flare_{surface,volume}`, `smart_{surface,volume}`, `globe_{surface,volume}`, `isla_{surface,volume,volume_joint}`, `domino_{surface,volume}`, `ab_upt_{surface,volume,joint}` |
-| `dataset/` (`datasets/*.yaml`) | `drivaer_ml_{surface,volume}`, `highlift_{surface,volume}`, `shift_suv_{estate,fastback}_surface`, `drivaer_ml_{surface,volume,joint}_point_sets` |
+| `model/` (`conf/model/*.yaml`) | `geotransolver_{surface,volume,volume_highlift}`, `geotransolver_volume_aerozoo`, `geotransolver_bc_volume_aerozoo`, `geotransolver_pp_volume_aerozoo`, `transolver_{surface,volume}`, `flare_{surface,volume}`, `smart_{surface,volume}`, `globe_{surface,volume}`, `isla_{surface,volume,volume_joint}`, `domino_{surface,volume}`, `ab_upt_{surface,volume,joint}` |
+| `dataset/` (`datasets/*.yaml`) | `drivaer_ml_{surface,volume}`, `highlift_{surface,volume}`, `shift_suv_{estate,fastback}_surface`, `drivaer_ml_{surface,volume,joint}_point_sets`, `aerozoo_volume` |
 
 Pick one of each on the CLI:
 
@@ -852,6 +852,68 @@ coefficients keep their sign. All three use the `warmup_cosine` schedule,
 a learning rate of 3.75e-4, and `compile: false` with the model's own
 per-block compile (`model.compile_blocks: true`). Its fast paths on CUDA
 need Triton.
+
+### AeroZoo
+
+`dataset=aerozoo_volume` trains the interior task of
+[AeroZoo](https://huggingface.co/datasets/nvidia/AeroZoo): velocity and
+gauge pressure at the interior points. It is experimental, and it has no
+inference path yet (`infer.py` cannot map these predictions back to SI
+units or compute the benchmark's metrics).
+
+Setup:
+
+```bash
+# 1. Unpack the samples as <root>/samples/<case_id>/domain.pdmsh, next to
+#    the dataset's splits/ and release-v1.3.json.
+# 2. Point datasets/dataset_paths.yaml at <root>:   aerozoo: /path/to/AeroZoo
+# 3. Write <root>/manifest.json (benchmark rules: mean_stable cases only)
+python datasets/aerozoo_manifest.py /path/to/AeroZoo
+
+# GeoTransolver++ (experimental)
+python src/train.py model=geotransolver_pp_volume_aerozoo dataset=aerozoo_volume \
+    train_split=full_train val_split=full_val
+
+# GeoTransolver, boundary conditions as one global token
+python src/train.py model=geotransolver_volume_aerozoo dataset=aerozoo_volume \
+    train_split=full_train val_split=full_val
+
+# GeoTransolver, per-cell boundary conditions on the geometry tokens
+python src/train.py model=geotransolver_bc_volume_aerozoo dataset=aerozoo_volume \
+    train_split=full_train val_split=full_val
+
+# Any of them without the canonical rotation
+python src/train.py model=geotransolver_volume_aerozoo dataset=aerozoo_volume \
+    train_split=full_train val_split=full_val +dataset_overrides.canonical_axes=false
+```
+
+The dataset pipeline uses only the inputs the benchmark allows (the four
+boundary meshes, their prescribed values, density and viscosity), and every
+scale comes from the sample itself:
+
+| Step | What it does |
+|---|---|
+| `SplitDetachedCells` | AeroZoo stores the body inside the `no_slip` and `slip` boundaries. The wall cells not connected to any other boundary are the body; they move to `body_no_slip` and `body_slip`. |
+| `CanonicalFrameMesh` | Origin at the body's centroid, axes along its principal axes, lengths in units of its RMS radius. A sample with no body uses all boundaries. Axes the shape leaves open go to the mean inlet velocity, then to the offset of the enclosure from the body. |
+| `NonDimensionalizeByInlet` | Velocities over the area-weighted RMS inlet speed `U`, pressures over `0.5 rho U^2`. Adds `global_data.conditions`: `log10(U L / nu)` and the mean inlet velocity over `U`. |
+| `ComputeSDFFromBoundary` | Distance and direction from each interior point to the nearest wall. |
+| `BoundaryCellsToPoints` | `boundary_tokens` random cells of each of the six conditions, as point clouds with normals, the prescribed velocity where the condition has one, and each point's share of the area. |
+| `MergeBoundaryPoints` | The same tokens as one set (`boundaries.tokens`) with a one-hot code of the condition, for GeoTransolver. |
+
+Things to know:
+
+- **IO.** The files store interior points in solver order, so the reader
+  cannot take a contiguous block: each sample's interior is read whole and
+  subsampled at random. Shuffling the files once would make this much
+  cheaper.
+- **Cell volume.** The benchmark withholds it from model inputs. It weights
+  the loss and the metrics only.
+- **Metrics.** The logged errors are relative L2 in the units above, not
+  the benchmark's `epsilon_U` and `epsilon_p`.
+- **GeoTransolver++ memory.** Its neighbor attention gathers
+  `n_neighbors` boundary tokens per interior point, so memory grows with
+  `sampling_resolution * n_neighbors * n_hidden`. The config uses 50,000
+  points per case.
 
 ### Dataset config anatomy
 

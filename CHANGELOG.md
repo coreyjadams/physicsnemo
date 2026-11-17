@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unequal surface/volume point counts.
 
 - The unified external aerodynamics recipe adds experimental SMART surface and volume templates.
+- The unified external aerodynamics recipe adds an experimental AeroZoo
+  interior dataset (`aerozoo_volume`) with GeoTransolver and GeoTransolver++
+  configs. Every scale comes from the sample's own boundaries.
+- Adds `physicsnemo.experimental.models.geotransolver_pp.GeoTransolverPP`, a
+  GeoTransolver variant that reads each boundary condition as its own set of
+  measure-weighted tokens, in the canonical frame of the geometry.
+- Adds the `CanonicalFrameMesh` and `SplitDetachedCells` mesh transforms to
+  `physicsnemo.datapipes`, and a `normals_field` option to
+  `BoundaryCellsToPoints`.
 - The unified external aerodynamics recipe adds experimental ISLA configs on
   DrivAerML (`isla_surface`, `isla_volume` and `isla_volume_joint`) and a
   `scheduler` config group. Each ISLA config reads the whole flow-domain

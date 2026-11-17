@@ -261,23 +261,24 @@ class GeoTransolverPP(Module):
     channels. With such inputs:
 
     - Rotating, translating or uniformly rescaling the whole problem leaves
-      the inputs, and so the outputs, unchanged. Vector outputs are
-      components in the canonical frame: ``v = v_canonical @ axes`` maps
-      them back.
+      the inputs, and so the outputs, unchanged. A vector output is three
+      output channels, its components in the canonical frame:
+      ``v = v_canonical @ axes`` maps them back.
     - Points and boundary samples enter the attention only through
       measure-weighted averages, so refining or resampling the mesh changes
       predictions only by quadrature error, and their order does not matter.
 
     Parameters
     ----------
-    out_scalars : int
-        Number of scalar output fields.
-    out_vectors : int
-        Number of vector output fields.
+    out_dim : int
+        Number of output channels.
     boundary_features : Mapping[str, int]
         Number of feature channels per sample for each boundary condition,
         by name. ``0`` for a condition with no fields, such as a no-slip
         wall.
+    point_features : int, optional
+        Number of feature channels per mesh point besides its position,
+        such as a wall distance and its direction. Default is 0.
     global_features : int, optional
         Number of global condition channels, such as a Reynolds number or
         the components of a freestream direction. Default is 0.
@@ -313,17 +314,21 @@ class GeoTransolverPP(Module):
         :math:`(B, M)`, and ``"features"`` of shape :math:`(B, M, C)` if the
         condition declares any. Measures are areas in canonical units
         (after the rescaling of positions).
+    point_features : torch.Tensor | None, optional
+        Shape :math:`(B, N, C_p)`. Required if ``point_features > 0``.
     global_features : torch.Tensor | None, optional
         Shape :math:`(B, C_g)`. Required if ``global_features > 0``.
     point_measure : torch.Tensor | None, optional
         Positive cell volume (or area) per point, of shape :math:`(B, N)`.
         Only relative values matter. Default is uniform.
 
+    Measures and ``global_features`` may carry extra singleton axes, such as
+    :math:`(B, M, 1)` or :math:`(B, 1, C_g)`.
+
     Outputs
     -------
-    tuple[torch.Tensor, torch.Tensor]
-        Scalars of shape :math:`(B, N, \text{out\_scalars})` and vectors of
-        shape :math:`(B, N, \text{out\_vectors}, 3)`.
+    torch.Tensor
+        Shape :math:`(B, N, \text{out\_dim})`.
 
     Notes
     -----
@@ -337,7 +342,7 @@ class GeoTransolverPP(Module):
     --------
     >>> import torch
     >>> model = GeoTransolverPP(
-    ...     out_scalars=1, out_vectors=1, boundary_features={"wall": 0, "inlet": 3},
+    ...     out_dim=4, boundary_features={"wall": 0, "inlet": 3},
     ...     n_hidden=32, n_layers=2, n_head=4, n_latents=8,
     ... )
     >>> def samples(m, channels):
@@ -347,18 +352,17 @@ class GeoTransolverPP(Module):
     ...         "measure": torch.rand(1, m) + 0.1,
     ...     }
     ...     return out | ({"features": torch.randn(1, m, channels)} if channels else {})
-    >>> scalars, vectors = model(
+    >>> model(
     ...     torch.randn(1, 100, 3), {"wall": samples(64, 0), "inlet": samples(16, 3)}
-    ... )
-    >>> scalars.shape, vectors.shape
-    (torch.Size([1, 100, 1]), torch.Size([1, 100, 1, 3]))
+    ... ).shape
+    torch.Size([1, 100, 4])
     """
 
     def __init__(
         self,
-        out_scalars: int,
-        out_vectors: int,
+        out_dim: int,
         boundary_features: Mapping[str, int],
+        point_features: int = 0,
         global_features: int = 0,
         n_hidden: int = 256,
         n_layers: int = 8,
@@ -375,8 +379,6 @@ class GeoTransolverPP(Module):
             raise ValueError(
                 f"n_hidden must be divisible by n_head, got {n_hidden} and {n_head}"
             )
-        self.out_scalars = out_scalars
-        self.out_vectors = out_vectors
         self.n_global_features = global_features
 
         # One input layer per condition: position, normal, its own fields.
@@ -387,7 +389,9 @@ class GeoTransolverPP(Module):
                 for name, channels in sorted(boundary_features.items())
             }
         )
-        self.point_embed = Mlp(3, 2 * n_hidden, n_hidden, act_layer=act)
+        self.point_embed = Mlp(
+            3 + point_features, 2 * n_hidden, n_hidden, act_layer=act
+        )
         # The constant 1 keeps the condition defined when there are no globals.
         self.cond_embed = Mlp(1 + global_features, n_hidden, n_hidden, act_layer=act)
 
@@ -401,16 +405,17 @@ class GeoTransolverPP(Module):
         self.neighbors = _NeighborAttention(n_hidden, n_head, radius, n_neighbors, act)
         self.blocks = nn.ModuleList([block(True) for _ in range(n_layers)])
         self.out_norm = nn.LayerNorm(n_hidden)
-        self.out = nn.Linear(n_hidden, out_scalars + 3 * out_vectors)
+        self.out = nn.Linear(n_hidden, out_dim)
 
     def forward(
         self,
         points: Float[torch.Tensor, "B N 3"],
         boundaries: Mapping[str, Mapping[str, torch.Tensor]],
+        point_features: Float[torch.Tensor, "B N Cp"] | None = None,
         global_features: Float[torch.Tensor, "B Cg"] | None = None,
         point_measure: Float[torch.Tensor, "B N"] | None = None,
-    ) -> tuple[Float[torch.Tensor, "B N S"], Float[torch.Tensor, "B N V 3"]]:
-        r"""Predict scalar and vector fields at ``points``."""
+    ) -> Float[torch.Tensor, "B N out_dim"]:
+        r"""Predict the output channels at ``points``."""
         unknown = set(boundaries) - set(self.boundary_embed)
         if unknown or not boundaries:
             raise ValueError(
@@ -419,6 +424,7 @@ class GeoTransolverPP(Module):
             )
         if global_features is None:
             global_features = points.new_zeros(points.shape[0], 0)
+        global_features = global_features.flatten(1)
         if global_features.shape[-1] != self.n_global_features:
             raise ValueError(
                 f"Expected {self.n_global_features} global_features, "
@@ -426,6 +432,10 @@ class GeoTransolverPP(Module):
             )
         if point_measure is None:
             point_measure = points.new_ones(points.shape[:2])
+        point_measure = point_measure.flatten(1)
+        point_inputs = points
+        if point_features is not None:
+            point_inputs = torch.cat([points, point_features], dim=-1)
 
         # Boundary encoder: geometry and boundary conditions become context.
         names = sorted(boundaries)
@@ -448,7 +458,9 @@ class GeoTransolverPP(Module):
         boundary_points = torch.cat(
             [boundaries[name]["points"] for name in names], dim=1
         )
-        measure = torch.cat([boundaries[name]["measure"] for name in names], dim=1)
+        measure = torch.cat(
+            [boundaries[name]["measure"].flatten(1) for name in names], dim=1
+        )
         boundary_log_measure = (measure / measure.sum(dim=-1, keepdim=True)).log()
         log_area = measure.log()
         cond = self.cond_embed(
@@ -463,13 +475,10 @@ class GeoTransolverPP(Module):
             context = block(context, boundary_log_measure, cond)
 
         x = self.neighbors(
-            self.point_embed(points), points, context, boundary_points, log_area
+            self.point_embed(point_inputs), points, context, boundary_points, log_area
         )
         log_measure = (point_measure / point_measure.sum(dim=-1, keepdim=True)).log()
         for block in self.blocks:
             x = block(x, log_measure, cond, context, boundary_log_measure)
 
-        out = self.out(self.out_norm(x))
-        scalars = out[..., : self.out_scalars]
-        vectors = out[..., self.out_scalars :].unflatten(-1, (self.out_vectors, 3))
-        return scalars, vectors
+        return self.out(self.out_norm(x))

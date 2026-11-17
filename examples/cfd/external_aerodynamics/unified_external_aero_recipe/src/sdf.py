@@ -64,8 +64,10 @@ class ComputeSDFFromBoundary(MeshTransform):
 
     Parameters
     ----------
-    boundary_name : str
-        Key of the boundary mesh to use as the SDF surface.
+    boundary_name : str or list[str]
+        Key of the boundary mesh to use as the SDF surface. A list takes
+        the boundaries together as one surface, skipping those with no
+        cells.
     sdf_field : str
         Name for the SDF field in ``interior.point_data``.
     normals_field : str or None
@@ -73,15 +75,19 @@ class ComputeSDFFromBoundary(MeshTransform):
     use_winding_number : bool
         Whether to use winding-number sign computation.  Required for
         non-watertight meshes; slightly slower.
+    unsigned : bool
+        Store the distance without a sign, for surfaces whose orientation
+        does not say which side is the fluid.
     """
 
     def __init__(
         self,
-        boundary_name: str = "stl_geometry",
+        boundary_name: str | list[str] = "stl_geometry",
         sdf_field: str = "sdf",
         normals_field: str | None = "sdf_normals",
         *,
         use_winding_number: bool = True,
+        unsigned: bool = False,
     ) -> None:
         super().__init__()
         self.boundary_name = boundary_name
@@ -91,6 +97,7 @@ class ComputeSDFFromBoundary(MeshTransform):
             as_nested_key(normals_field) if normals_field is not None else None
         )
         self.use_winding_number = use_winding_number
+        self.unsigned = unsigned
 
     def __call__(self, mesh: Mesh) -> Mesh:
         # Single-mesh path is not meaningful for SDF (we need a separate
@@ -112,19 +119,28 @@ class ComputeSDFFromBoundary(MeshTransform):
             Domain with SDF (and optionally normals) injected into
             ``interior.point_data``.
         """
-        if self.boundary_name not in domain.boundaries:
+        names = (
+            [self.boundary_name]
+            if isinstance(self.boundary_name, str)
+            else list(self.boundary_name)
+        )
+        missing = [n for n in names if n not in domain.boundaries]
+        if missing:
             raise KeyError(
-                f"Boundary {self.boundary_name!r} not found. "
-                f"Available: {domain.boundary_names}"
+                f"Boundary {missing} not found. Available: {domain.boundary_names}"
             )
-
-        surface = domain.boundaries[self.boundary_name]
-
-        if surface.n_cells == 0:
+        parts = [domain.boundaries[n] for n in names]
+        parts = [m for m in parts if m.n_cells > 0]
+        if not parts:
             raise ValueError(
                 f"Boundary {self.boundary_name!r} has no cell connectivity "
                 f"(required for SDF computation)"
             )
+        surface = (
+            parts[0]
+            if len(parts) == 1
+            else Mesh.merge([Mesh(points=m.points, cells=m.cells) for m in parts])
+        )
 
         query_points = domain.interior.points.float()
 
@@ -136,6 +152,8 @@ class ComputeSDFFromBoundary(MeshTransform):
 
         # Build updated point_data with SDF (N, 1)
         new_pd = domain.interior.point_data.clone()
+        if self.unsigned:
+            sdf_values = sdf_values.abs()
         new_pd[self.sdf_field] = sdf_values.unsqueeze(-1)
 
         # Optionally compute approximate normals from closest-point direction

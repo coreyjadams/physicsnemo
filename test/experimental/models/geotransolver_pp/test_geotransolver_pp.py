@@ -28,8 +28,8 @@ FLOW = torch.tensor([1.0, 0.2, 0.1], dtype=torch.float64)
 def _model() -> GeoTransolverPP:
     torch.manual_seed(0)
     model = GeoTransolverPP(
-        out_scalars=2,
-        out_vectors=2,
+        out_dim=8,
+        point_features=1,
         boundary_features={"wall": 1, "inlet": 3},
         global_features=4,
         n_hidden=32,
@@ -115,15 +115,18 @@ def _predict(model: GeoTransolverPP, problem: dict):
         ]
         return out | {"features": torch.cat(features, dim=-1)[None]}
 
-    scalars, vectors = model(
+    position = ((problem["points"] - origin) @ axes.T / length)[None]
+    out = model(
         ((problem["points"] - origin) @ axes.T / length)[None],
         {name: boundary(problem[name]) for name in ("wall", "inlet")},
         global_features=torch.cat([FLOW.new_tensor([0.3]), problem["flow"] @ axes.T])[
             None
         ],
-        point_measure=problem["point_measure"][None],
-    )
-    return scalars[0], vectors[0] @ axes
+        point_measure=problem["point_measure"][None, :, None],
+        # Singleton axes, as the recipe's collate gives them.
+        point_features=position.norm(dim=-1, keepdim=True),
+    )[0]
+    return out[:, :2], out[:, 2:].unflatten(-1, (2, 3)) @ axes
 
 
 def _random_rotation() -> torch.Tensor:
