@@ -59,10 +59,18 @@ def _(mo):
       it must change something.
 
     The second table does the same for the neighbor attention that
-    replaces GeoTransolver's ball query + MLP: each point attends over the
-    boundary tokens within a radius. It is exact while every token in range
-    fits in the neighbor limit. Above the limit the search keeps a subset,
-    and which subset depends on the order of the tokens.
+    replaces GeoTransolver's ball query + MLP. It follows DeFormer's kNN
+    attention block, with the tokens' measures added to the scores: each
+    point attends over its nearest boundary tokens within a radius. The
+    neighbors are the nearest ones, so the order of the tokens never
+    matters. Refinement changes nothing while every token in range fits in
+    the neighbor limit. Above the limit the copies of a split token use up
+    neighbor slots, so the result changes.
+
+    The attention also has one extra slot with score 0 and no message, and a
+    window that falls to zero at the radius. A token entering the range
+    then changes the result gradually (last rows). With a plain softmax the
+    first token in range would get weight 1 however far away it is.
 
     The last table runs the order test on GeoTransolver's current
     ball-query feature layer for comparison.
@@ -219,6 +227,14 @@ def _(
             return layer(x, points, tokens, token_points, log_measure)
 
         full, limited = layer(2 * m), layer(8)
+
+        def one_token(distance):
+            """Change of point 0's state from one token ``distance`` away."""
+            at = points[:, :1] + torch.tensor([distance, 0.0, 0.0], dtype=precision)
+            out = run(full, tokens[:, :1], at, measure[:, :1])
+            return out[:, 0] - x[:, 0]
+
+        far = one_token(10.0)
         order, point_order = (
             torch.randperm(m, generator=g),
             torch.randperm(n, generator=g),
@@ -253,23 +269,32 @@ def _(
                 reference[:, point_order],
             ),
             (
-                "point with nothing in range",
-                "zero (unchanged)",
-                reference[:, 0],
-                x[:, 0],
-            ),
-            (
                 "control: tokens split, measure ignored",
                 "large",
                 run(full, *doubled, use_measure=False),
                 run(full, tokens, token_points, measure, use_measure=False),
             ),
             (
-                "tokens shuffled, limit of 8 neighbors",
-                "depends on the subset kept",
+                "limit of 8 neighbors: tokens shuffled",
+                "round-off",
                 run(limited, *shuffled),
                 run(limited, tokens, token_points, measure),
             ),
+            (
+                "limit of 8 neighbors: tokens split, measure shared",
+                "not zero",
+                run(limited, *doubled),
+                run(limited, tokens, token_points, measure),
+            ),
+        ]
+        cases += [
+            (
+                f"one token at {d} x radius, vs none in range",
+                "0 beyond the radius, growing inside",
+                one_token(d * 0.5),
+                far,
+            )
+            for d in (1.01, 0.99, 0.9, 0.5)
         ]
         return [
             {"change": name, "expected": expected, "error": f"{h.rel_err(a, b):.1e}"}

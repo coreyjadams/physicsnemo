@@ -27,6 +27,7 @@ reads plain coordinates and components and is itself an ordinary network.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -39,7 +40,7 @@ from jaxtyping import Float
 from physicsnemo.core.meta import ModelMetaData
 from physicsnemo.core.module import Module
 from physicsnemo.nn import Mlp
-from physicsnemo.nn.functional import radius_search
+from physicsnemo.nn.functional import knn
 
 
 @dataclass
@@ -139,28 +140,60 @@ class _Block(nn.Module):
 
 
 class _NeighborAttention(nn.Module):
-    r"""Each point attends over the boundary tokens within ``radius`` of it.
+    r"""Each point attends over its nearest tokens within ``radius``.
 
-    Keys and values are the boundary tokens plus an encoding of the offset
-    from token to point. The scores carry the log of each token's measure, so
-    the result is a quadrature-weighted average over the boundary in range
-    and does not depend on the order or density of the boundary samples. When
-    more than ``n_neighbors`` tokens are in range the search keeps a subset.
-    A point with no token in range is left unchanged.
+    The update follows DeFormer's ``KNNAttentionBlock``: the encoded offset
+    from token to point enters the attention scores as a per-head bias and
+    the message as an attention-weighted edge aggregate, and one MLP updates
+    the point from its normalized state, the message, the edge aggregate and
+    the log-sum-exp of the scores. Two things differ. The tokens are a
+    second set (cross-attention; pass the same set twice for
+    self-attention), and the attention is a quadrature over the boundary in
+    range, not an average over whichever tokens are there:
+
+    - the scores carry the log of each token's measure, in units of
+      ``radius`` squared, and of a window that falls smoothly to zero at
+      ``radius``;
+    - the softmax has one extra slot with score 0 and an empty message.
+
+    So the message fades in as boundary enters the range. Without the extra
+    slot a single token at the edge of the range would count as much as a
+    full neighborhood.
+
+    The neighbors are the ``n_neighbors`` nearest tokens, dropped beyond
+    ``radius``, so they do not depend on the order of the tokens. While
+    every token in range fits in ``n_neighbors`` the result does not depend
+    on the token density either; above that the nearest ones stand for the
+    rest. The log-sum-exp is the log of one plus the integral in range.
     """
 
     def __init__(
-        self, dim: int, heads: int, radius: float, n_neighbors: int, act: str
+        self,
+        dim: int,
+        heads: int,
+        radius: float,
+        n_neighbors: int,
+        act: str,
+        edge_dim: int = 32,
     ) -> None:
         super().__init__()
         self.heads = heads
         self.radius = radius
         self.n_neighbors = n_neighbors
         self.norm = nn.LayerNorm(dim)
+        self.token_norm = nn.LayerNorm(dim)
         self.to_q = nn.Linear(dim, dim)
-        self.to_kv = nn.Linear(dim, 2 * dim)
-        self.edge = Mlp(4, dim, 2 * dim, act_layer=act)
-        self.out = nn.Linear(dim, dim)
+        self.to_k = nn.Linear(dim, dim)
+        self.to_v = nn.Linear(dim, dim, bias=False)
+        # Offset and distance, in units of the radius.
+        self.edge = nn.Sequential(
+            Mlp(4, edge_dim, edge_dim, act_layer=act), nn.LayerNorm(edge_dim)
+        )
+        self.edge_bias = nn.Linear(edge_dim, heads, bias=False)
+        self.update = nn.Sequential(
+            Mlp(2 * dim + heads * edge_dim + heads, 2 * dim, dim, act_layer=act),
+            nn.LayerNorm(dim),
+        )
 
     def forward(
         self,
@@ -171,34 +204,41 @@ class _NeighborAttention(nn.Module):
         token_log_measure: Float[torch.Tensor, "B M"],
     ) -> Float[torch.Tensor, "B N C"]:
         k = min(self.n_neighbors, token_points.shape[1])
-        index = radius_search(token_points, points, self.radius, max_points=k).long()
-        # Unused slots hold index 0: keep token 0 once, and only if in range.
-        padded = index <= 0
-        index = index.clamp_min(0)
+        index = torch.stack(
+            [knn(t, p, k)[0] for t, p in zip(token_points, points)]
+        ).long()  # (B, N, k)
         batch = torch.arange(points.shape[0], device=points.device)[:, None, None]
         offsets = (points[:, :, None] - token_points[batch, index]) / self.radius
         distance = offsets.norm(dim=-1, keepdim=True)
-        valid = (distance[..., 0] <= 1) & (~padded | (padded.cumsum(dim=-1) == 1))
-        in_range = valid.any(dim=-1, keepdim=True)
+        # Smooth window: 1 at the point, 0 from the radius on.
+        window = (1 - distance[..., 0].square()).clamp_min(0).square()
+        edge = self.edge(torch.cat([offsets, distance], dim=-1))  # (B, N, k, E)
 
-        key_value = self.to_kv(tokens)[batch, index] + self.edge(
-            torch.cat([offsets, distance], dim=-1)
+        normalized = self.norm(x)
+        query = rearrange(self.to_q(normalized), "b n (h d) -> b n h d", h=self.heads)
+        key = rearrange(
+            self.to_k(self.token_norm(tokens))[batch, index],
+            "b n k (h d) -> b n k h d",
+            h=self.heads,
         )
-        key, value = (
-            rearrange(t, "b n k (h d) -> b n h k d", h=self.heads)
-            for t in key_value.chunk(2, dim=-1)
+        value = rearrange(
+            self.to_v(tokens)[batch, index], "b n k (h d) -> b n k h d", h=self.heads
         )
-        query = rearrange(
-            self.to_q(self.norm(x)), "b n (h d) -> b n h 1 d", h=self.heads
+        logits = torch.einsum("bnhd,bnkhd->bnhk", query, key) * key.shape[-1] ** -0.5
+        logits = logits + self.edge_bias(edge).transpose(-1, -2)
+        bias = (
+            token_log_measure[batch, index] - 2 * math.log(self.radius) + window.log()
         )
-        # A point with nothing in range attends to its padding and is zeroed.
-        bias = token_log_measure[batch, index].masked_fill(
-            ~(valid | ~in_range), -torch.inf
+        logits = logits + bias[:, :, None].to(logits.dtype)
+        # The extra slot: score 0, no message.
+        logits = torch.cat([logits, torch.zeros_like(logits[..., :1])], dim=-1)
+        lse = torch.logsumexp(logits, dim=-1).detach()
+        weights = torch.softmax(logits, dim=-1)[..., :-1]
+        message = torch.einsum("bnhk,bnkhd->bnhd", weights, value).flatten(-2)
+        edge_message = torch.einsum("bnhk,bnke->bnhe", weights, edge).flatten(-2)
+        return x + self.update(
+            torch.cat([normalized, message, edge_message, lse], dim=-1)
         )
-        y = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=bias[:, :, None, None].to(key.dtype)
-        )
-        return x + in_range * self.out(rearrange(y, "b n h 1 d -> b n (h d)"))
 
 
 class GeoTransolverPP(Module):
@@ -208,9 +248,11 @@ class GeoTransolverPP(Module):
     samples with a position, a normal, a measure (area) and that condition's
     own feature channels. Each condition has its own input layer, so
     conditions may carry different fields. A boundary encoder turns all
-    samples into context tokens. Each mesh point first attends over the
-    boundary tokens near it, and is then processed by FLARE++ blocks whose
-    latent tokens cross-attend to the whole context.
+    samples into context tokens: each sample first attends over the samples
+    near it on the boundary, then FLARE++ blocks mix all of them. Each mesh
+    point first attends over the boundary tokens near it, and is then
+    processed by FLARE++ blocks whose latent tokens cross-attend to the
+    whole context.
 
     Positions, normals and vector features are expected in the canonical,
     non-dimensional frame of the geometry, as
@@ -252,11 +294,11 @@ class GeoTransolverPP(Module):
     mlp_ratio : int, optional
         Ratio of MLP hidden dimension to ``n_hidden``. Default is 4.
     radius : float, optional
-        Range of the neighbor attention, in canonical units (the geometry's
-        RMS radius). Default is 0.5.
+        Range of the two neighbor attentions, in canonical units (the
+        geometry's RMS radius). Default is 0.5.
     n_neighbors : int, optional
-        Most boundary samples a point attends to within ``radius``.
-        Default is 32.
+        Each point or boundary sample attends to its nearest ``n_neighbors``
+        boundary samples within ``radius``. Default is 32.
     act : str, optional
         Activation function name. Default is ``"gelu"``.
 
@@ -269,7 +311,8 @@ class GeoTransolverPP(Module):
         names): ``"points"`` of shape :math:`(B, M, 3)`, unit ``"normals"``
         of shape :math:`(B, M, 3)`, positive ``"measure"`` of shape
         :math:`(B, M)`, and ``"features"`` of shape :math:`(B, M, C)` if the
-        condition declares any. Only relative measures matter.
+        condition declares any. Measures are areas in canonical units
+        (after the rescaling of positions).
     global_features : torch.Tensor | None, optional
         Shape :math:`(B, C_g)`. Required if ``global_features > 0``.
     point_measure : torch.Tensor | None, optional
@@ -354,6 +397,7 @@ class GeoTransolverPP(Module):
             )
 
         self.encoder = nn.ModuleList([block(False) for _ in range(n_encoder_layers)])
+        self.surface = _NeighborAttention(n_hidden, n_head, radius, n_neighbors, act)
         self.neighbors = _NeighborAttention(n_hidden, n_head, radius, n_neighbors, act)
         self.blocks = nn.ModuleList([block(True) for _ in range(n_layers)])
         self.out_norm = nn.LayerNorm(n_hidden)
@@ -406,20 +450,20 @@ class GeoTransolverPP(Module):
         )
         measure = torch.cat([boundaries[name]["measure"] for name in names], dim=1)
         boundary_log_measure = (measure / measure.sum(dim=-1, keepdim=True)).log()
+        log_area = measure.log()
         cond = self.cond_embed(
             torch.cat(
                 [global_features.new_ones(points.shape[0], 1), global_features], dim=-1
             )
         )
+        context = self.surface(
+            context, boundary_points, context, boundary_points, log_area
+        )
         for block in self.encoder:
             context = block(context, boundary_log_measure, cond)
 
         x = self.neighbors(
-            self.point_embed(points),
-            points,
-            context,
-            boundary_points,
-            boundary_log_measure,
+            self.point_embed(points), points, context, boundary_points, log_area
         )
         log_measure = (point_measure / point_measure.sum(dim=-1, keepdim=True)).log()
         for block in self.blocks:

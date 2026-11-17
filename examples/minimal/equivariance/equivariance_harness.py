@@ -74,7 +74,7 @@ def sample_surface(name, n, seed=0, refine=1, dtype=torch.float64):
 
     ``refine`` > 1 samples the half with (pre-deformation) x > 0 ``refine``
     times as densely and divides those samples' measure to match, as a mesher
-    refining one region would.
+    refining one region would. The measures sum to the body's area.
     """
     axes, deform = GEOMETRIES[name]
     axes = torch.tensor(axes, dtype=dtype)
@@ -98,7 +98,8 @@ def sample_surface(name, n, seed=0, refine=1, dtype=torch.float64):
         )[..., 0]
         area = area * torch.linalg.det(jac).abs() * normals.norm(dim=-1)
         points = deform(points)
-    return points, normalize(normals, dim=-1), weight * area
+    # Each sample stands for 4 pi / n of the unit sphere it was drawn on.
+    return points, normalize(normals, dim=-1), weight * area * (4 * torch.pi / n)
 
 
 def make_problem(
@@ -242,7 +243,7 @@ def canonical(problem):
         boundaries[name] = {
             "points": position(b["points"]),
             "normals": (b["normals"] @ axes.T)[None],
-            "measure": b["measure"][None],
+            "measure": (b["measure"] / length**2)[None],
             "features": torch.cat(features, dim=-1)[None],
         }
     inputs = {
@@ -380,29 +381,53 @@ def load_aerozoo(path, stride=1000):
     )
 
 
-def aerozoo_inputs(domain, n_boundary=2048, n_points=512, seed=0):
+def aerozoo_inputs(
+    domain, n_boundary=2048, n_points=512, seed=0, boundary_seed=None, systematic=True
+):
     """``GeoTransolverPP`` inputs from a canonical-frame AeroZoo sample.
 
-    Each boundary gives up to ``n_boundary`` random cells whose measures are
-    scaled to the boundary's full area. The inlet velocity is divided by its
-    area-weighted RMS speed, a scale taken from the sample itself.
+    The boundary tokens are ``n_boundary`` cells in total, each weighted to
+    stand for the cells left out. ``systematic`` draws them as ISLA does
+    (:func:`physicsnemo.experimental.models.isla._sampling.sample_boundary_cells`):
+    equal shares per boundary, probability proportional to area, spread
+    along a space-filling curve. Otherwise each boundary gets an equal share
+    of uniformly random cells. ``boundary_seed`` changes the draw only. The
+    inlet velocity is divided by its area-weighted RMS speed, a scale taken
+    from the sample itself.
     """
-    g = torch.Generator().manual_seed(seed)
+    from physicsnemo.experimental.models.isla._sampling import sample_boundary_cells
+
+    g = torch.Generator().manual_seed(seed if boundary_seed is None else boundary_seed)
+    meshes = {n: m for n, m in domain.boundaries.items() if m.n_cells}
+    areas = {n: _faces_float64(m)[1] for n, m in meshes.items()}
+    if systematic:
+        start = torch.rand((), dtype=torch.float64, generator=g)
+        centroids = [_faces_float64(m)[0] for m in meshes.values()]
+        kept, weight = sample_boundary_cells(
+            list(areas.values()), centroids, n_boundary, start
+        )
+        offsets = torch.tensor([0, *(len(a) for a in areas.values())]).cumsum(0)
     boundaries = {}
-    for name, mesh in domain.boundaries.items():
-        if mesh.n_cells == 0:
-            continue
-        keep = torch.randperm(mesh.n_cells, generator=g)[:n_boundary]
-        area = mesh.cell_areas
+    for i, (name, mesh) in enumerate(meshes.items()):
+        area = areas[name]
+        if systematic:
+            here = (kept >= offsets[i]) & (kept < offsets[i + 1])
+            keep, measure = kept[here] - offsets[i], weight[here]
+        else:
+            keep = torch.randperm(mesh.n_cells, generator=g)[
+                : n_boundary // len(meshes)
+            ]
+            measure = area[keep] * area.sum() / area[keep].sum()
         boundaries[name] = {
             "points": mesh.cell_centroids[keep][None],
             "normals": mesh.cell_normals[keep][None],
-            "measure": (area[keep] * area.sum() / area[keep].sum())[None],
+            "measure": measure.float()[None],
         }
         if name == "inlet":
             v = mesh.cell_data[AEROZOO_VELOCITY]
-            speed = ((area * v.square().sum(-1)).sum() / area.sum()).sqrt()
+            speed = ((area * v.square().sum(-1)).sum() / area.sum()).sqrt().float()
             boundaries[name]["features"] = (v[keep] / speed)[None]
+    g = torch.Generator().manual_seed(seed)
     keep = torch.randperm(domain.interior.n_points, generator=g)[:n_points]
     volume = domain.interior.point_data["_target_quadrature_measure"]
     return {
@@ -410,6 +435,13 @@ def aerozoo_inputs(domain, n_boundary=2048, n_points=512, seed=0):
         "boundaries": boundaries,
         "point_measure": volume[keep].reshape(1, -1),
     }
+
+
+def _faces_float64(mesh):
+    """Cell centroids and areas in float64 (float32 areas vanish on thin cells)."""
+    p = mesh.points.double()[mesh.cells]
+    area = torch.linalg.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]).norm(dim=-1) / 2
+    return p.mean(dim=1), area
 
 
 def aerozoo_moved(domain, rotation):

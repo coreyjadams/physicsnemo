@@ -106,7 +106,7 @@ def _predict(model: GeoTransolverPP, problem: dict):
         out = {
             "points": ((b["points"] - origin) @ axes.T / length)[None],
             "normals": (b["normals"] @ axes.T)[None],
-            "measure": b["measure"][None],
+            "measure": (b["measure"] / length**2)[None],
         }
         features = [
             b[k] @ (axes.T if k == "vectors" else torch.eye(1).double())

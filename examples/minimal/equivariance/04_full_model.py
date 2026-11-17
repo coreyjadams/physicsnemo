@@ -66,7 +66,7 @@ def _(h, mo):
     geometry = mo.ui.dropdown(list(h.GEOMETRIES), value="car", label="Body")
     global_vectors = mo.ui.dropdown(["0", "1", "2"], value="1", label="Global vectors")
     n_boundary = mo.ui.slider(
-        steps=[64, 256, 1024, 4096], value=256, label="Boundary samples"
+        steps=[64, 256, 1024], value=256, label="Boundary samples"
     )
     dtype = mo.ui.dropdown(["float64", "float32"], value="float64", label="Precision")
     seed = mo.ui.number(0, 100, value=0, label="Seed")
@@ -178,9 +178,9 @@ def _(h, mo, model, n_boundary, precision, problem, seed, torch):
 @app.cell
 def _(h, mo, model, problem):
     def resampling_rows():
-        reference = problem(4096, boundary_seed=12345)
+        reference = problem(2048, boundary_seed=12345)
         rows = []
-        for m in (64, 256, 1024):
+        for m in (128, 512):
             scalars, vectors = h.compare(model, reference, problem(m))
             rows.append(
                 {
@@ -194,7 +194,7 @@ def _(h, mo, model, problem):
 
     h.show(
         mo,
-        "Boundary resampling: difference from a 4096-sample boundary",
+        "Boundary resampling: difference from a 2048-sample boundary",
         resampling_rows(),
     )
     return
@@ -242,8 +242,10 @@ def _(h, mo, n_cases, seed, torch):
             moved = h.aerozoo_moved(domain, rotation)
             a, b = transform.apply_to_domain(domain), transform.apply_to_domain(moved)
             isla_a, isla_b = h.isla_predict(isla, domain), h.isla_predict(isla, moved)
-            out_a = model(**h.aerozoo_inputs(a, seed=seed.value))
-            out_b = model(**h.aerozoo_inputs(b, seed=seed.value))
+            # The same cells in both: a systematic draw follows the canonical
+            # coordinates, and their round-off can change the cells it keeps.
+            out_a = model(**h.aerozoo_inputs(a, seed=seed.value, systematic=False))
+            out_b = model(**h.aerozoo_inputs(b, seed=seed.value, systematic=False))
             rows.append(
                 {
                     "sample": path.parent.name[-12:],
@@ -259,6 +261,70 @@ def _(h, mo, n_cases, seed, torch):
     _rows = aerozoo_rows()
     (
         h.show(mo, "AeroZoo: rotation + translation + scale error", _rows)
+        if _rows
+        else mo.md(f"No AeroZoo samples under `{h.AEROZOO}`; set `AEROZOO_DIR`.")
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## AeroZoo: resampling the boundary tokens
+
+    The model reads a sample of the boundary cells, each weighted to stand
+    for the cells left out. A different draw should give nearly the same
+    answer, and more tokens should bring it closer. Below, the output with
+    fewer tokens is compared with a 32768-token draw of the same sample
+    (frame fixed, from the full mesh). `max` is the largest difference over
+    the largest output; `rms` is the root-mean-square difference over the
+    root-mean-square output.
+
+    - **random**: an equal share of uniformly random cells per boundary.
+    - **systematic**: ISLA's draw, probability proportional to area and
+      spread along a space-filling curve.
+
+    What is left is sampling noise in the neighbor attention: a point near
+    the boundary sees only the few tokens within the radius.
+    """)
+    return
+
+
+@app.cell
+def _(h, mo, n_cases, seed, torch):
+    @torch.no_grad()
+    def aerozoo_resampling_rows():
+        transform, model = h.aerozoo_transform(), h.aerozoo_model(seed=seed.value)
+        rows = []
+        for path in h.aerozoo_cases(n_cases.value):
+            domain = transform.apply_to_domain(h.load_aerozoo(path))
+            reference = model(**h.aerozoo_inputs(domain, 32768, boundary_seed=99))
+            for systematic in (False, True):
+                row = {
+                    "sample": path.parent.name[-12:],
+                    "draw": "systematic" if systematic else "random",
+                }
+                for m in (512, 2048, 8192):
+                    out = model(
+                        **h.aerozoo_inputs(
+                            domain,
+                            m,
+                            boundary_seed=seed.value + 1,
+                            systematic=systematic,
+                        )
+                    )
+                    worst = max(h.rel_err(a, b) for a, b in zip(out, reference))
+                    rms = max(
+                        ((a - b).norm() / b.norm()).item()
+                        for a, b in zip(out, reference)
+                    )
+                    row[f"{m} tokens: max / rms"] = f"{worst:.3f} / {rms:.3f}"
+                rows.append(row)
+        return rows
+
+    _rows = aerozoo_resampling_rows()
+    (
+        h.show(mo, "AeroZoo: difference from a 32768-token boundary", _rows)
         if _rows
         else mo.md(f"No AeroZoo samples under `{h.AEROZOO}`; set `AEROZOO_DIR`.")
     )
