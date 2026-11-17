@@ -53,6 +53,9 @@ from physicsnemo.mesh.calculus.measure import (
     scale_measures,
     set_point_measures,
 )
+from physicsnemo.mesh.utilities._duplicate_detection import (
+    vectorized_connected_components,
+)
 from physicsnemo.utils import weighted_multinomial
 
 
@@ -299,7 +302,7 @@ def canonical_frame(
     weights: Float[torch.Tensor, " n_points"] | None = None,
     tie_breakers: Sequence[Float[torch.Tensor, " spatial_dims"]] = (),
     min_gap: float = 1e-2,
-    min_component: float = 1e-9,
+    min_component: float = 1e-3,
 ) -> tuple[
     Float[torch.Tensor, " spatial_dims"],
     Float[torch.Tensor, "spatial_dims spatial_dims"],
@@ -341,8 +344,9 @@ def canonical_frame(
         Eigenvalues closer than this, relative to the largest, count as equal.
     min_component : float
         Smallest usable component of a vector. The third moment is divided by
-        the RMS radius cubed before this test. The default is just above
-        float64 roundoff, so only an exactly symmetric shape is skipped.
+        the RMS radius cubed before this test. A component this size is
+        reproduced to about 1e-4 after a rotation in float32 (roundoff 1e-7),
+        which bounds the error of the axis it fixes.
 
     Returns
     -------
@@ -423,6 +427,33 @@ def canonical_frame(
     return origin.to(dtype), axes.to(dtype), torch.tensor(source)
 
 
+def _faces(mesh: Mesh) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Cell centroids and areas in float64 (float32 areas vanish on thin cells)."""
+    if mesh.n_cells == 0:
+        return mesh.points.double(), None
+    mesh = Mesh(points=mesh.points.double(), cells=mesh.cells)
+    return mesh.cell_centroids, mesh.cell_areas
+
+
+def _detached_cells(domain: DomainMesh, wall_names: Sequence[str]) -> torch.Tensor:
+    """Mask over the wall cells, ``wall_names`` in order, of the detached pieces.
+
+    A piece is detached when no path along wall cells joins it to any other
+    boundary: a body inside its enclosure. Boundaries must share their seam
+    points exactly.
+    """
+    names = [*wall_names, *(n for n in domain.boundaries.keys() if n not in wall_names)]
+    points = torch.cat([domain.boundaries[n].points for n in names])
+    _, ids = torch.unique(points, dim=0, return_inverse=True)
+    parts = ids.split([domain.boundaries[n].n_points for n in names])
+    wall = torch.cat([p[domain.boundaries[n].cells] for p, n in zip(parts, wall_names)])
+    pairs = torch.cat([wall[:, i : i + 2] for i in range(wall.shape[1] - 1)])
+    label = vectorized_connected_components(pairs, int(ids.max()) + 1)
+    attached = torch.zeros_like(label, dtype=torch.bool)
+    attached[label[torch.cat(parts[len(wall_names) :])]] = True
+    return ~attached[label[wall[:, 0]]]
+
+
 @register()
 class CanonicalFrameMesh(MeshTransform):
     r"""Express a mesh in the canonical frame of its geometry.
@@ -430,13 +461,27 @@ class CanonicalFrameMesh(MeshTransform):
     Translates and rotates the mesh so the frame from :func:`canonical_frame`
     becomes the origin and coordinate axes. The frame is area-weighted when
     the geometry has cells. Place it after non-dimensionalization, so the
-    frame is built from non-dimensional coordinates.
+    frame is built from non-dimensional coordinates, and before any
+    subsampling: on a subsample the axes can flip.
+
+    For a :class:`DomainMesh` the geometry is the body: the boundary
+    ``boundary_name``, or the cells of ``wall_names`` that are detached from
+    every other boundary. A domain with no such cells uses all boundaries.
+    Axes the body's shape leaves open are settled by, in order, the mean
+    direction of each of ``direction_fields`` and the offset of the
+    boundaries' centroid from the body's.
 
     Parameters
     ----------
     boundary_name : str, optional
-        For a :class:`DomainMesh`, the boundary that defines the frame (the
-        body). Required for domains; ignored for a single :class:`Mesh`.
+        The boundary that is the body.
+    wall_names : Sequence[str], optional
+        Wall boundaries that hold the body among other walls. Give this or
+        ``boundary_name`` for a domain; both are ignored for a :class:`Mesh`.
+    direction_fields : Mapping[str, str | Sequence[str]], optional
+        Boundary name to the ``cell_data`` key of a vector field whose
+        area-weighted mean direction is a tie-breaker (an inlet's prescribed
+        velocity).
     store_frame_as : str, optional
         Store the frame in ``global_data`` as ``<name>_origin``,
         ``<name>_axes`` and ``<name>_source`` so results can be mapped back:
@@ -450,6 +495,8 @@ class CanonicalFrameMesh(MeshTransform):
     def __init__(
         self,
         boundary_name: str | None = None,
+        wall_names: Sequence[str] | None = None,
+        direction_fields: Mapping[str, str | Sequence[str]] | None = None,
         store_frame_as: str | None = None,
         transform_point_data: bool | dict = False,
         transform_cell_data: bool | dict = False,
@@ -457,18 +504,24 @@ class CanonicalFrameMesh(MeshTransform):
     ) -> None:
         super().__init__()
         self.boundary_name = boundary_name
+        self.wall_names = wall_names
+        self.direction_fields = dict(direction_fields or {})
         self.store_frame_as = store_frame_as
         self.transform_point_data = transform_point_data
         self.transform_cell_data = transform_cell_data
         self.transform_global_data = transform_global_data
 
-    def _apply(self, target: Mesh | DomainMesh, geometry: Mesh) -> Mesh | DomainMesh:
-        if geometry.n_cells > 0:
-            origin, axes, source = canonical_frame(
-                geometry.cell_centroids, geometry.cell_areas
-            )
-        else:
-            origin, axes, source = canonical_frame(geometry.points)
+    def _apply(
+        self,
+        target: Mesh | DomainMesh,
+        points: torch.Tensor,
+        weights: torch.Tensor | None,
+        tie_breakers: Sequence[torch.Tensor] = (),
+    ) -> Mesh | DomainMesh:
+        origin, axes, source = canonical_frame(points, weights, tie_breakers)
+        dtype = target.points.dtype if isinstance(target, Mesh) else None
+        dtype = dtype or target.interior.points.dtype
+        origin, axes = origin.to(dtype), axes.to(dtype)
         out = target.translate(-origin).transform(
             axes,
             transform_point_data=self.transform_point_data,
@@ -486,19 +539,52 @@ class CanonicalFrameMesh(MeshTransform):
         return out
 
     def __call__(self, mesh: Mesh) -> Mesh:
-        return self._apply(mesh, mesh)
+        return self._apply(mesh, *_faces(mesh))
 
     def apply_to_domain(self, domain: DomainMesh) -> DomainMesh:
-        """Put the interior and every boundary in the frame of ``boundary_name``."""
-        if self.boundary_name is None:
+        """Put the interior and every boundary in the frame of the body."""
+        boundaries = domain.boundaries
+        if self.boundary_name is not None:
+            body = boundaries[self.boundary_name]
+            x, w = _faces(body)
+            if body.n_cells == 0:  # a point cloud has no neighbors to compare to
+                return self._apply(domain, x, w)
+            others = [n for n in boundaries.keys() if n != self.boundary_name]
+            faces = [(x, w), *(_faces(boundaries[n]) for n in others)]
+            faces = [f for f in faces if f[1] is not None]
+            is_body = torch.zeros(sum(len(f[1]) for f in faces), dtype=torch.bool)
+            is_body[: len(w)] = True
+        elif self.wall_names is not None:
+            others = [n for n in boundaries.keys() if n not in self.wall_names]
+            faces = [_faces(boundaries[n]) for n in [*self.wall_names, *others]]
+            faces = [f for f in faces if f[1] is not None]
+            is_body = torch.zeros(sum(len(f[1]) for f in faces), dtype=torch.bool)
+            detached = _detached_cells(domain, self.wall_names)
+            is_body[: len(detached)] = detached
+        else:
             raise ValueError(
-                "CanonicalFrameMesh needs boundary_name to pick the geometry "
-                f"of a DomainMesh; available: {list(domain.boundaries.keys())}"
+                "CanonicalFrameMesh needs boundary_name or wall_names to find "
+                f"the body of a DomainMesh; available: {list(boundaries.keys())}"
             )
-        return self._apply(domain, domain.boundaries[self.boundary_name])
+        x, w = torch.cat([f[0] for f in faces]), torch.cat([f[1] for f in faces])
+
+        tie_breakers = []
+        for name, key in self.direction_fields.items():
+            key = key if isinstance(key, str) else tuple(key)
+            v, a = boundaries[name].cell_data[key].double(), _faces(boundaries[name])[1]
+            tie_breakers.append(
+                (a[:, None] * v).sum(0) / (a * v.norm(dim=-1)).sum().clamp_min(1e-300)
+            )
+        if not is_body.any():
+            return self._apply(domain, x, w, tie_breakers)
+        center = (w[:, None] * x).sum(0) / w.sum()
+        size = ((w * (x - center).square().sum(-1)).sum() / w.sum()).sqrt()
+        xb, wb = x[is_body], w[is_body]
+        tie_breakers.append((center - (wb[:, None] * xb).sum(0) / wb.sum()) / size)
+        return self._apply(domain, xb, wb, tie_breakers)
 
     def extra_repr(self) -> str:
-        return f"boundary_name={self.boundary_name!r}"
+        return f"boundary_name={self.boundary_name!r}, wall_names={self.wall_names!r}"
 
 
 def _compact_points(mesh: Mesh) -> Mesh:

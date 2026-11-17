@@ -132,3 +132,47 @@ def test_domain_uses_named_boundary_and_rotates_fields():
         query @ R.T + t,
         **kw,
     )
+
+
+def test_domain_finds_detached_body_among_walls():
+    from physicsnemo.mesh.primitives.surfaces import sphere_icosahedral
+
+    shell = sphere_icosahedral.load(subdivisions=2)
+    shell = Mesh(points=4.0 * shell.points, cells=shell.cells)
+    front = shell.cell_centroids[:, 0] < 0
+    body = sphere_icosahedral.load(subdivisions=1)
+    # A rod along z, off-center: equal variances in x-y, left to the tie-breakers.
+    body_points = body.points * torch.tensor([0.3, 0.3, 1.0]) + torch.tensor(
+        [0.5, 0.2, 0.0]
+    )
+    wall_points = torch.cat([shell.points, body_points])
+    wall_cells = torch.cat([shell.cells[~front], body.cells + shell.n_points])
+    velocity = torch.tensor([1.0, 0.3, 0.2]).expand(int(front.sum()), 3)
+    query = torch.randn(50, 3)
+
+    def run(rot, shift):
+        domain = DomainMesh(
+            interior=Mesh(points=query @ rot.T + shift),
+            boundaries={
+                "inlet": Mesh(
+                    points=shell.points @ rot.T + shift,
+                    cells=shell.cells[front],
+                    cell_data={"velocity": velocity @ rot.T},
+                ),
+                "no_slip": Mesh(points=wall_points @ rot.T + shift, cells=wall_cells),
+            },
+        )
+        return CanonicalFrameMesh(
+            wall_names=["no_slip"],
+            direction_fields={"inlet": "velocity"},
+            store_frame_as="frame",
+        ).apply_to_domain(domain)
+
+    a = run(torch.eye(3), torch.zeros(3))
+    b = run(_rotation(5).float(), torch.tensor([1.0, 2.0, 3.0]))
+    # The origin is the body's centroid, not the enclosure's.
+    torch.testing.assert_close(
+        a.global_data["frame_origin"], torch.tensor([0.5, 0.2, 0.0]), atol=1e-5, rtol=0
+    )
+    assert -2 not in a.global_data["frame_source"].tolist()
+    torch.testing.assert_close(a.interior.points, b.interior.points, atol=1e-4, rtol=0)
