@@ -91,12 +91,13 @@ already in the canonical frame and is an ordinary network.
 - **Boundary encoder.** One input MLP per named condition (position,
   normal, that condition's fields). Any subset of the declared conditions
   may be present.
-- **Neighbor attention.** DeFormer's `KNNAttentionBlock` update (edge bias on
+- **Neighbor attention.** DeFormer's local attention update (edge bias on
   the scores, attention-weighted edge aggregate, one MLP on state, message,
   edge aggregate and log-sum-exp), as cross-attention from points to
   boundary tokens and as self-attention on the boundary. Neighbors are the
-  nearest `n_neighbors` within `radius`. The scores carry the log of each
-  token's area and of a window that falls to zero at the radius, and the
+  tokens a radius search finds within `radius`, at most `n_neighbors`. The
+  scores carry the log of each token's area and of a window that falls to zero at the
+  radius, and the
   softmax has one extra empty slot, so the message is a quadrature over the
   boundary in range and fades in as boundary enters the range.
 - **Blocks.** Measure-weighted FLARE++ blocks. The latents cross-attend to
@@ -109,8 +110,8 @@ Known limits:
 
 - A point farther than `radius` from every boundary sees the boundary only
   through the latent tokens (and the wall-distance input).
-- Above `n_neighbors` tokens in range the nearest stand for the rest, which
-  depends on the token density.
+- Above `n_neighbors` tokens in range the search keeps the first it finds
+  in its hash grid, so the result depends on the tokens' order and density.
 - The neighbor attention gathers keys and values per neighbor: memory grows
   as points x neighbors x hidden. DeFormer's fused kernel is self-attention
   only and was not reused.

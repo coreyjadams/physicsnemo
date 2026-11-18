@@ -40,6 +40,7 @@ from jaxtyping import Float
 from physicsnemo.core.meta import ModelMetaData
 from physicsnemo.core.module import Module
 from physicsnemo.nn import Mlp
+from physicsnemo.nn.functional import radius_search
 
 
 @dataclass
@@ -157,33 +158,29 @@ class _Block(nn.Module):
         return x + self.mlp(self.norm_mlp(x, cond))
 
 
-# Largest distance matrix the neighbor search holds at once, in entries.
-_SEARCH_ENTRIES = 2**27
-
-
 @torch.no_grad()
-def _nearest(
-    tokens: Float[torch.Tensor, "B M 3"], points: Float[torch.Tensor, "B N 3"], k: int
-) -> torch.Tensor:
-    r"""Indices :math:`(B, N, k)` of the ``k`` tokens nearest each point.
+def _in_range(
+    tokens: Float[torch.Tensor, "B M 3"],
+    points: Float[torch.Tensor, "B N 3"],
+    radius: float,
+    limit: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Up to ``limit`` tokens within ``radius`` of each point, by radius search.
 
-    Brute force in chunks of points, so memory stays bounded at any size.
+    Returns their indices :math:`(B, N, \text{limit})` and a mask of the
+    slots that hold a token. The search fills unused slots with index 0, so
+    a zero is kept once per point; if token 0 is not in range, the window
+    in :class:`_NeighborAttention` gives it no weight.
     """
-    step = max(1, _SEARCH_ENTRIES // max(1, tokens.shape[0] * tokens.shape[1]))
-    tokens = tokens.float()
-    return torch.cat(
-        [
-            torch.cdist(points[:, a : a + step].float(), tokens)
-            .topk(k, dim=-1, largest=False)
-            .indices
-            for a in range(0, points.shape[1], step)
-        ],
-        dim=1,
-    )
+    index = radius_search(
+        tokens.float(), points.float(), radius, max_points=limit
+    ).long()
+    unused = index <= 0
+    return index.clamp_min(0), ~unused | (unused.cumsum(dim=-1) == 1)
 
 
 class _NeighborAttention(nn.Module):
-    r"""Each point attends over its nearest tokens within ``radius``.
+    r"""Each point attends over the tokens within ``radius`` of it.
 
     The update follows DeFormer's ``KNNAttentionBlock``: the encoded offset
     from token to point enters the attention scores as a per-head bias and
@@ -203,11 +200,11 @@ class _NeighborAttention(nn.Module):
     slot a single token at the edge of the range would count as much as a
     full neighborhood.
 
-    The neighbors are the ``n_neighbors`` nearest tokens, dropped beyond
-    ``radius``, so they do not depend on the order of the tokens. While
-    every token in range fits in ``n_neighbors`` the result does not depend
-    on the token density either; above that the nearest ones stand for the
-    rest. The log-sum-exp is the log of one plus the integral in range.
+    The neighbors come from a radius search, so with every token in range
+    the result depends on neither the order nor the density of the tokens.
+    With more than ``n_neighbors`` tokens in range the search keeps
+    ``n_neighbors`` of them, the first it finds in its spatial hash grid,
+    and the result then depends on the order and density of the tokens. The log-sum-exp is the log of one plus the integral in range.
     """
 
     def __init__(
@@ -246,13 +243,15 @@ class _NeighborAttention(nn.Module):
         token_points: Float[torch.Tensor, "B M 3"],
         token_log_measure: Float[torch.Tensor, "B M"],
     ) -> Float[torch.Tensor, "B N C"]:
-        k = min(self.n_neighbors, token_points.shape[1])
-        index = _nearest(token_points, points, k)  # (B, N, k)
+        index, found = _in_range(  # (B, N, k)
+            token_points, points, self.radius, self.n_neighbors
+        )
         batch = torch.arange(points.shape[0], device=points.device)[:, None, None]
         offsets = (points[:, :, None] - token_points[batch, index]) / self.radius
         distance = offsets.norm(dim=-1, keepdim=True)
         # Smooth window: 1 at the point, 0 from the radius on.
         window = (1 - distance[..., 0].square()).clamp_min(0).square()
+        window = window * found
         edge = self.edge(torch.cat([offsets, distance], dim=-1))  # (B, N, k, E)
 
         normalized = self.norm(x)
@@ -339,8 +338,8 @@ class GeoTransolverPP(Module):
         Range of the two neighbor attentions, in canonical units (the
         geometry's RMS radius). Default is 0.5.
     n_neighbors : int, optional
-        Each point or boundary sample attends to its nearest ``n_neighbors``
-        boundary samples within ``radius``. Default is 32.
+        Most boundary samples within ``radius`` that a point or boundary
+        sample attends to. Default is 32.
     routing_temperature : float or None, optional
         Attention scores in the FLARE++ blocks are this temperature times
         the cosine between query and key, which bounds them. ``None`` uses

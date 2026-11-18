@@ -59,13 +59,15 @@ def _(mo):
       it must change something.
 
     The second table does the same for the neighbor attention that
-    replaces GeoTransolver's ball query + MLP. It follows DeFormer's kNN
-    attention block, with the tokens' measures added to the scores: each
-    point attends over its nearest boundary tokens within a radius. The
-    neighbors are the nearest ones, so the order of the tokens never
-    matters. Refinement changes nothing while every token in range fits in
-    the neighbor limit. Above the limit the copies of a split token use up
-    neighbor slots, so the result changes.
+    replaces GeoTransolver's ball query + MLP: each point attends over the
+    boundary tokens a radius search finds within a radius of it. The update
+    is that of DeFormer's local attention block, with the tokens' measures
+    added to the scores. While every token in range fits in the neighbor
+    limit, neither the order nor the refinement of the tokens matters.
+    Above the limit the search keeps the first tokens it finds, so the
+    result changes with the order of the tokens and with their refinement
+    (the copies of a split token use up slots). Set the limit above the
+    number of tokens expected in range.
 
     The attention also has one extra slot with score 0 and no message, and a
     window that falls to zero at the radius. A token entering the range
@@ -276,7 +278,7 @@ def _(
             ),
             (
                 "limit of 8 neighbors: tokens shuffled",
-                "round-off",
+                "not zero",
                 run(limited, *shuffled),
                 run(limited, tokens, token_points, measure),
             ),
