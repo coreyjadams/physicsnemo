@@ -214,8 +214,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`domain_parallelism.domain_size`), reading samples sharded and running the
   model on ShardTensors over a domain x data-parallel device mesh.
 
+- `physicsnemo.mesh.repair` adds `stitch_t_junctions`, which closes the
+  zero-width gaps where a vertex lies on another triangle's edge, and
+  `split_nonmanifold_edges`, which pairs the triangles at each edge shared by
+  three or more of them and drops the unpaired fins and the pillows (coincident
+  triangles wound opposite ways).
+- `physicsnemo.mesh.validation` adds `find_self_intersections`, which finds the
+  pairs of crossing triangles in a 3D surface. `validate` runs it when
+  `check_self_intersection=True` and skips meshes it does not apply to.
+
 ### Changed
 
+- `repair_mesh` also removes duplicate cells and stitches T-junctions of
+  triangle meshes by default, and `split_nonmanifold_edges=True` also drops fins.
+  Its default tolerances are now relative to the mesh's size, and an explicit
+  `tolerance` also sets the stitching distance, with `area_tolerance` then
+  defaulting to its square on surfaces.
 - Renames the body-in-white crash recipes `crash_geoflare_oneshot` and
   `crash_geotransolver_oneshot` of `examples/structural_mechanics/crash` to
   `biw_yaris_geoflare_oneshot` and `biw_yaris_geotransolver_oneshot`: every
@@ -492,6 +506,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package's only export. Legacy import shims keep the old
   `physicsnemo.experimental.models.globe` paths and saved checkpoints working
   and emit a `LegacyFeatureWarning`.
+- `physicsnemo.mesh.generate.marching_cubes` keeps a CUDA field on its GPU and
+  returns the mesh on the field's device, so a CUDA field no longer makes a
+  round trip through host memory and `coords` on a CUDA device no longer raise
+  a device error. CPU fields run as before.
 
 ### Deprecated
 
@@ -563,6 +581,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `from_pyvista` splits again each polygon that VTK splits wrongly, into a fan
+  of triangles around one new point at its center, so its output can have more
+  points than the input. A closed polygon surface used to convert with holes,
+  repeated triangles or stray triangles.
+- `fill_holes` winds each fill like the surrounding surface, fills holes that
+  pass through a shared vertex, leaves zero-area slits to
+  `stitch_t_junctions`, and fills flat holes without folded triangles.
 - `Mesh.save` and `DomainMesh.save` can write a mesh read from disk to a new
   path. They used to raise unless `copy_existing=True` was passed, because the
   loaded tensors are memory-mapped to the original files.
@@ -771,6 +796,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Loop subdivision keeps float16 and bfloat16 points in their dtype, and no
   longer overflows on float16 meshes far from the origin. Before, it returned
   float32 points.
+- `cell_areas`, `cell_normals`, and Butterfly subdivision compute in at least
+  float32 and cast back once, so float16 results that fit in float16 are
+  finite. Before, their cross products, determinants, and sums of positions
+  overflowed float16 to `inf` or `nan`, and `scale` gave finite areas only if
+  they were cached before the call.
+- `cell_areas` of n-simplices in n-space with n >= 4, such as 4-simplices in
+  4D, take the determinant of the edge vectors directly. Before, the Gram
+  determinant squared the condition number of the edge vectors, so nearly flat
+  cells lost their float32 volume to cancellation.
 - `sample_random_points_on_cells` with `alpha` other than 1 works on float16
   and bfloat16 meshes on CPU. Before, it raised an error.
 - Anisotropic maps with a small overall scale are no longer taken for
@@ -1007,6 +1041,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The transient conjugate heat transfer tank filling example trains again, on
   one GPU or several. Before, its `train.py` stopped with a `TypeError` before
   the first step.
+- The XAeroNet volume example's `compute_stats.py` starts again, and reads the
+  training voxel grids from the `h5_path` of its config. Before, it stopped
+  with an `ImportError`, and then looked for a `partitions_path` key that only
+  the surface recipe's config has.
+- The transient conjugate heat transfer tank filling example's `compute_stats`
+  no longer leaves a file out of the volume minimum and maximum when that
+  file's `surface_fields` array is empty.
 - Importing `physicsnemo.domain_parallel` no longer breaks `torch.compile` for
   the whole process when nothing has imported `torch._dynamo` before it.
 - `MeshReader` and `DomainMeshReader` implement `close()`, so
