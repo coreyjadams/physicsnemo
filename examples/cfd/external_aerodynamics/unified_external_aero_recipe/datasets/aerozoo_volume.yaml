@@ -24,7 +24,8 @@
 # prescribed values, density and viscosity. Every scale comes from the
 # sample itself:
 #   length  the RMS radius of the body (of all boundaries if there is none)
-#   speed   the area-weighted RMS prescribed inlet speed
+#   speed   the area-weighted RMS prescribed inlet speed (for pressure, see
+#           pressure_speed below)
 #
 # Splits: run datasets/aerozoo_manifest.py once to write manifest.json, then
 # pass e.g. train_split=full_train val_split=full_val.
@@ -36,6 +37,9 @@ boundary_tokens: 4096
 # false keeps the stored axes: only the origin and the length are set by the
 # body. Use it to train a model without the canonical rotation.
 canonical_axes: true
+# Speed in the pressure scale 0.5 rho U^2: `inlet`, or `max` for the larger of
+# the inlet speed and the outlet speed (inlet flux over outlet area).
+pressure_speed: inlet
 
 pipeline:
   reader:
@@ -72,6 +76,7 @@ pipeline:
       transform_point_data: true
       transform_cell_data: true
     - _target_: ${dp:NonDimensionalizeByInlet}
+      pressure_speed: ${pressure_speed}
       interior_fields:
         velocity: velocity
         pressure: pressure

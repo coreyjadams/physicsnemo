@@ -180,6 +180,9 @@ def test_aerozoo_pipeline_scales_and_frame() -> None:
     inlet_speed = a.boundaries["inlet_tokens"].point_data["velocity"].norm(dim=-1)
     torch.testing.assert_close(inlet_speed, torch.ones(64), atol=1e-5, rtol=0)
     assert (a.interior.point_data["sdf"] >= 0).all()
+    # Inlet and outlet are equal halves of a sphere crossed by a uniform flow.
+    assert a.global_data["conditions"].shape == (5,)
+    assert 0.3 < a.global_data["conditions"][4] < 0.7
 
 
 def test_aerozoo_lab_axes_override() -> None:
@@ -189,3 +192,19 @@ def test_aerozoo_lab_axes_override() -> None:
     )
     out = _run(transforms, _sample())
     torch.testing.assert_close(out.global_data["frame_axes"], torch.eye(3))
+
+
+def test_rms_metric_is_the_error_vectors_rms_length() -> None:
+    """``rms`` weights by measure and sums a vector's components."""
+    from metrics import MetricCalculator
+    from tensordict import TensorDict
+
+    target = TensorDict({"velocity": torch.zeros(1, 2, 3)}, batch_size=[1, 2])
+    pred = TensorDict(
+        {"velocity": torch.tensor([[[3.0, 4.0, 0.0], [0.0, 0.0, 0.0]]])},
+        batch_size=[1, 2],
+    )
+    calc = MetricCalculator({"velocity": "vector"}, metrics=["rms"])
+    # |error| = 5 on the first point, which holds 1/4 of the volume.
+    out = calc(pred, target, torch.tensor([[1.0, 3.0]]))
+    torch.testing.assert_close(out["velocity_rms"], torch.tensor(2.5))

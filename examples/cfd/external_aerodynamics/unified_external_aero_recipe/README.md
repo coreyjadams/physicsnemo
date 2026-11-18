@@ -895,7 +895,7 @@ scale comes from the sample itself:
 |---|---|
 | `SplitDetachedCells` | AeroZoo stores the body inside the `no_slip` and `slip` boundaries. The wall cells not connected to any other boundary are the body; they move to `body_no_slip` and `body_slip`. |
 | `CanonicalFrameMesh` | Origin at the body's centroid, axes along its principal axes, lengths in units of its RMS radius. A sample with no body uses all boundaries. Axes the shape leaves open go to the mean inlet velocity, then to the offset of the enclosure from the body. |
-| `NonDimensionalizeByInlet` | Velocities over the area-weighted RMS inlet speed `U`, pressures over `0.5 rho U^2`. Adds `global_data.conditions`: `log10(U L / nu)` and the mean inlet velocity over `U`. |
+| `NonDimensionalizeByInlet` | Velocities over the area-weighted RMS inlet speed `U`, pressures over `0.5 rho U^2`. Adds `global_data.conditions`: `log10(U L / nu)`, the mean inlet velocity over `U`, and the outlet speed (inlet flux over outlet area) over `U`. |
 | `ComputeSDFFromBoundary` | Distance and direction from each interior point to the nearest wall. |
 | `BoundaryCellsToPoints` | `boundary_tokens` random cells of each of the six conditions, as point clouds with normals, the prescribed velocity where the condition has one, and each point's share of the area. |
 | `MergeBoundaryPoints` | The same tokens as one set (`boundaries.tokens`) with a one-hot code of the condition, for GeoTransolver. |
@@ -908,8 +908,16 @@ Things to know:
   cheaper.
 - **Cell volume.** The benchmark withholds it from model inputs. It weights
   the loss and the metrics only.
-- **Metrics.** The logged errors are relative L2 in the units above, not
-  the benchmark's `epsilon_U` and `epsilon_p`.
+- **Metrics.** The configs log `l2` (relative) and `rms`: the
+  volume-weighted RMS error in the units above, which is the form of the
+  benchmark's `epsilon_U` and `epsilon_p`. The units differ from the
+  benchmark's reference units on cases with several inlets (the RMS inlet
+  speed is not the reference speed there).
+- **Pressure scale.** Where the outlet is narrower than the inlet (ducts,
+  confined and dual-inlet boxes) the flow speeds up and the pressure is
+  several times `0.5 rho U^2`. `+dataset_overrides.pressure_speed=max`
+  uses the larger of the inlet and outlet speeds in the pressure scale
+  instead. `pressure_rms` is then in that unit, not the benchmark's.
 - **GeoTransolver++ memory.** Its neighbor attention gathers
   `n_neighbors` boundary tokens per interior point, so memory grows with
   `sampling_resolution * n_neighbors * n_hidden`. The config uses 50,000

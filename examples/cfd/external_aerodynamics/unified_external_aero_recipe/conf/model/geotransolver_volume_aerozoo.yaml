@@ -26,6 +26,10 @@
 # Add `dataset_overrides.canonical_axes=false` to train without the
 # canonical rotation (origin and length still come from the body).
 
+# rms: volume-weighted RMS error in the dataset's units (inlet speed,
+# dynamic pressure), the form of the AeroZoo benchmark's metrics.
+metrics: [l2, rms]
+
 input_type: tensors
 output_type: tensors
 
@@ -43,7 +47,7 @@ model:
   out_dim: ${out_dim}
   functional_dim: 7       # coords (3) + wall distance (1) + its direction (3)
   geometry_dim: 3
-  global_dim: 4           # log10 Re, mean inlet velocity (3)
+  global_dim: 5           # log10 Re, mean inlet velocity (3), outlet speed ratio
   n_layers: 12
   n_hidden: 256
   dropout: 0.0

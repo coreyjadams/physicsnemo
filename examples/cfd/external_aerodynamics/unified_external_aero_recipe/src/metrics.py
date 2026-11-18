@@ -20,7 +20,7 @@ Mirrors the TensorDict-based interface of :class:`LossCalculator`. Each
 named target field declared in ``target_config`` produces:
 
 - For ``"scalar"`` types: per-metric values (``l1``, ``l2``, ``mae`` by
-  default), keyed ``"<prefix>/<name>_<metric>"``.
+  default; ``rms`` on request), keyed ``"<prefix>/<name>_<metric>"``.
 - For ``"vector"`` types: per-component values
   (``"<prefix>/<name>_x_<metric>"`` etc.) plus aggregate values over all
   components jointly (``"<prefix>/<name>_<metric>"``).
@@ -53,7 +53,7 @@ from utils import (
 from physicsnemo.datapipes.keys import NestedKey, as_nested_key
 
 ### Recipe-wide alias for the metric-name enum that the dataset YAMLs use.
-MetricName: TypeAlias = Literal["mae", "l1", "l2"]
+MetricName: TypeAlias = Literal["mae", "l1", "l2", "rms"]
 
 
 ### ---------------------------------------------------------------------------
@@ -117,6 +117,22 @@ def _relative_l2(
     return torch.mean(num / (denom + eps))
 
 
+def _rms_error(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    weights: torch.Tensor | None = None,
+) -> Float[torch.Tensor, ""]:
+    """``sqrt(mean (pred - target)^2)`` over the spatial axis: an absolute
+    error in the targets' units. For a vector field's aggregate, the squared
+    error is summed over the components (the error vector's RMS length)."""
+    diff_sq = (pred - target) ** 2
+    if pred.ndim == 0:
+        return torch.sqrt(diff_sq)
+    if weights is not None:
+        diff_sq = diff_sq * weights
+    return torch.mean(torch.sqrt(torch.mean(diff_sq, dim=-1)))
+
+
 def _point_weights(
     target_measure: torch.Tensor | TensorDict | None,
     key: NestedKey,
@@ -132,6 +148,7 @@ METRIC_FUNCTIONS: dict[MetricName, Callable[..., torch.Tensor]] = {
     "mae": _mean_absolute_error,
     "l1": _relative_l1,
     "l2": _relative_l2,
+    "rms": _rms_error,
 }
 
 ### Default metrics computed when the user doesn't override `metrics:` in
@@ -281,6 +298,8 @@ class MetricCalculator:
         if fraction is not None:
             if "mae" in values:
                 values["mae"] = values["mae"] / fraction
+            if "rms" in values:
+                values["rms"] = values["rms"] / fraction.sqrt()
             values = {
                 m: torch.where(fraction > 0, v, torch.nan) for m, v in values.items()
             }
@@ -358,11 +377,15 @@ class MetricCalculator:
                     ### The weights repeat per component, staying mean-one.
                     if weights is not None:
                         weights = weights.unsqueeze(-1).expand_as(p).flatten(-2)
-                    out.update(
-                        self._metrics_for_tensor(
-                            p.flatten(-2), t.flatten(-2), (name,), weights, fraction
-                        )
+                    aggregate = self._metrics_for_tensor(
+                        p.flatten(-2), t.flatten(-2), (name,), weights, fraction
                     )
+                    ### The flattened mean divides by the component count;
+                    ### the error vector's RMS length sums over components.
+                    rms_key = self._make_key(name, "rms")
+                    if rms_key in aggregate:
+                        aggregate[rms_key] = aggregate[rms_key] * n_components**0.5
+                    out.update(aggregate)
 
         return TensorDict(out)
 

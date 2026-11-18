@@ -26,6 +26,10 @@
 # `point_measure` is not passed: interior points count alike in the model.
 # (The loss and the metrics are still volume-weighted.)
 
+# rms: volume-weighted RMS error in the dataset's units (inlet speed,
+# dynamic pressure), the form of the AeroZoo benchmark's metrics.
+metrics: [l2, rms]
+
 input_type: tensors
 output_type: tensors
 sampling_resolution: 50000     # interior points per case
@@ -79,7 +83,7 @@ model:
     body_no_slip: 3
     body_slip: 0
   point_features: 4
-  global_features: 4
+  global_features: 5
   n_hidden: 256
   n_layers: 12
   n_encoder_layers: 2

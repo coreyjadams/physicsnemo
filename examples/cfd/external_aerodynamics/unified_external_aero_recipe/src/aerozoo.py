@@ -79,17 +79,30 @@ class SubsampleInteriorPoints(MeshTransform):
         return _with(domain, interior=self._sampler(interior))
 
 
+def _area_vectors(mesh: Mesh) -> torch.Tensor:
+    """Each triangle's normal times its area, in float64."""
+    p = mesh.points.double()[mesh.cells]
+    return torch.linalg.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]) / 2
+
+
 @register()
 class NonDimensionalizeByInlet(MeshTransform):
     r"""Scale fields by a speed taken from the sample's own inlet.
 
     The speed :math:`U` is the area-weighted RMS magnitude of the inlet's
-    prescribed velocity. Velocities are divided by :math:`U` and gauge
-    pressures by :math:`\tfrac12 \rho U^2`. ``global_data`` gets
+    prescribed velocity. The outlet speed :math:`U_o` is the inlet's volume
+    flux over the outlet's area, which mass conservation fixes. Velocities
+    are divided by :math:`U` and gauge pressures by
+    :math:`\tfrac12 \rho U_p^2`, with :math:`U_p = U` or, for
+    ``pressure_speed="max"``, the larger of :math:`U` and :math:`U_o`: where
+    the outlet is narrower than the inlet the flow speeds up, and the
+    pressure in the domain follows the faster speed. ``global_data`` gets
 
-    - ``speed``: :math:`U`, to map predictions back;
-    - ``conditions``: :math:`\log_{10}(U L / \nu)` and the area-weighted
-      mean inlet velocity over :math:`U` (four numbers), as model inputs.
+    - ``speed`` and ``dynamic_pressure``: :math:`U` and
+      :math:`\tfrac12 \rho U_p^2`, to map predictions back;
+    - ``conditions``: :math:`\log_{10}(U L / \nu)`, the area-weighted mean
+      inlet velocity over :math:`U`, and :math:`U_o / U` (five numbers), as
+      model inputs.
 
     :math:`L` is ``global_data[length]``, the length the coordinates were
     divided by (``CanonicalFrameMesh(rescale=True, store_frame_as=...)``).
@@ -103,6 +116,10 @@ class NonDimensionalizeByInlet(MeshTransform):
     inlet : str
         Boundary whose velocity field (from ``boundary_velocities``)
         defines the speed.
+    outlet : str
+        Boundary the inlet's flux leaves through.
+    pressure_speed : {"inlet", "max"}
+        The speed in the pressure scale, see above.
     length, density, viscosity : str
         ``global_data`` keys.
     """
@@ -112,6 +129,8 @@ class NonDimensionalizeByInlet(MeshTransform):
         interior_fields: Mapping[str, str],
         boundary_velocities: Mapping[str, str],
         inlet: str = "inlet",
+        outlet: str = "outlet",
+        pressure_speed: str = "inlet",
         length: str = "frame_length",
         density: str = "physics.density",
         viscosity: str = "physics.kinematic_viscosity",
@@ -124,7 +143,11 @@ class NonDimensionalizeByInlet(MeshTransform):
         self.boundary_velocities = {
             k: as_nested_key(v) for k, v in boundary_velocities.items()
         }
-        self.inlet = inlet
+        if pressure_speed not in ("inlet", "max"):
+            raise ValueError(
+                f"pressure_speed: expected inlet or max, got {pressure_speed!r}"
+            )
+        self.inlet, self.outlet, self.pressure_speed = inlet, outlet, pressure_speed
         self.length, self.density, self.viscosity = (
             as_nested_key(k) for k in (length, density, viscosity)
         )
@@ -137,13 +160,19 @@ class NonDimensionalizeByInlet(MeshTransform):
         inlet = domain.boundaries[self.inlet]
         velocity = inlet.cell_data[self.boundary_velocities[self.inlet]].double()
         # float64 areas: float32 areas vanish on thin cells
-        p = inlet.points.double()[inlet.cells]
-        area = torch.linalg.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]).norm(dim=-1)
+        area_vector = _area_vectors(inlet)
+        area = area_vector.norm(dim=-1)
         speed = ((area * velocity.square().sum(-1)).sum() / area.sum()).sqrt()
         mean = (area[:, None] * velocity).sum(0) / area.sum() / speed
+        flux = (area_vector * velocity).sum().abs()
+        outlet_area = _area_vectors(domain.boundaries[self.outlet]).norm(dim=-1).sum()
+        outlet_ratio = flux / outlet_area.clamp_min(1e-300) / speed
         g = domain.global_data
         reynolds = speed * g[self.length].double() / g[self.viscosity].double()
-        dynamic_pressure = 0.5 * g[self.density].double() * speed**2
+        pressure_speed = speed
+        if self.pressure_speed == "max":
+            pressure_speed = speed * outlet_ratio.clamp_min(1.0)
+        dynamic_pressure = 0.5 * g[self.density].double() * pressure_speed**2
         scale = {"velocity": speed.float(), "pressure": dynamic_pressure.float()}
 
         point_data = domain.interior.point_data.clone()
@@ -156,7 +185,10 @@ class NonDimensionalizeByInlet(MeshTransform):
             boundaries[name] = boundaries[name].with_data(cell_data=cell_data)
         global_data = g.clone()
         global_data["speed"] = speed.float()
-        global_data["conditions"] = torch.cat([reynolds.log10()[None], mean]).float()
+        global_data["dynamic_pressure"] = dynamic_pressure.float()
+        global_data["conditions"] = torch.cat(
+            [reynolds.log10()[None], mean, outlet_ratio[None]]
+        ).float()
         return _with(
             domain,
             interior=domain.interior.with_data(point_data=point_data),
