@@ -92,3 +92,4 @@ model:
   mlp_ratio: 4
   radius: 0.5                  # in body RMS radii
   n_neighbors: 32
+  routing_temperature: 10.0    # bounded cosine scores; null for plain dot product

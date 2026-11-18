@@ -75,6 +75,12 @@ class _Block(nn.Module):
     domain and not sums over mesh points. With ``use_context``, the latents
     then cross-attend to context tokens and the result is added residually.
     Finally the latents are scattered back to the tokens.
+
+    With ``temperature`` set, every attention score is that temperature times
+    the cosine between query and key (as ISLA's routing), so it stays within
+    ``[-temperature, temperature]`` however the weights grow and no layer can
+    send every token to one latent. ``None`` uses the plain scaled dot
+    product.
     """
 
     def __init__(
@@ -86,9 +92,11 @@ class _Block(nn.Module):
         cond_dim: int,
         act: str,
         use_context: bool,
+        temperature: float | None = 10.0,
     ) -> None:
         super().__init__()
         self.heads = heads
+        self.temperature = temperature
         dim_head = dim // heads
         self.norm_attn = _AdaLayerNorm(dim, cond_dim)
         self.norm_mlp = _AdaLayerNorm(dim, cond_dim)
@@ -107,6 +115,17 @@ class _Block(nn.Module):
             for t in x.chunk(chunks, dim=-1)
         )
 
+    def _attend(self, query, key, value, bias=None) -> torch.Tensor:
+        if self.temperature is None:
+            return F.scaled_dot_product_attention(query, key, value, attn_mask=bias)
+        return F.scaled_dot_product_attention(
+            F.normalize(query, dim=-1),
+            F.normalize(key, dim=-1),
+            value,
+            attn_mask=bias,
+            scale=self.temperature,
+        )
+
     def forward(
         self,
         x: Float[torch.Tensor, "B N C"],
@@ -122,19 +141,19 @@ class _Block(nn.Module):
         # into a quadrature-weighted average.
         bias = log_measure[:, None, None, :].to(key.dtype)
         seeds = self.seeds.to(key.dtype).expand(x.shape[0], -1, -1, -1)
-        latent_q = F.scaled_dot_product_attention(seeds, seed_k, seed_v, attn_mask=bias)
-        latent_v = F.scaled_dot_product_attention(latent_q, key, value, attn_mask=bias)
+        latent_q = self._attend(seeds, seed_k, seed_v, bias)
+        latent_v = self._attend(latent_q, key, value, bias)
 
         if context is not None:
             context_k, context_v = self._split_heads(self.cross_kv(context), 2)
-            latent_v = latent_v + F.scaled_dot_product_attention(
+            latent_v = latent_v + self._attend(
                 self.cross_q(latent_v),
                 context_k,
                 context_v,
-                attn_mask=context_log_measure[:, None, None, :].to(key.dtype),
+                context_log_measure[:, None, None, :].to(key.dtype),
             )
 
-        y = F.scaled_dot_product_attention(key, latent_q, latent_v)
+        y = self._attend(key, latent_q, latent_v)
         x = x + self.out(rearrange(y, "b h n d -> b n (h d)"))
         return x + self.mlp(self.norm_mlp(x, cond))
 
@@ -300,6 +319,10 @@ class GeoTransolverPP(Module):
     n_neighbors : int, optional
         Each point or boundary sample attends to its nearest ``n_neighbors``
         boundary samples within ``radius``. Default is 32.
+    routing_temperature : float or None, optional
+        Attention scores in the FLARE++ blocks are this temperature times
+        the cosine between query and key, which bounds them. ``None`` uses
+        the unbounded scaled dot product. Default is 10.
     act : str, optional
         Activation function name. Default is ``"gelu"``.
 
@@ -372,6 +395,7 @@ class GeoTransolverPP(Module):
         mlp_ratio: int = 4,
         radius: float = 0.5,
         n_neighbors: int = 32,
+        routing_temperature: float | None = 10.0,
         act: str = "gelu",
     ) -> None:
         super().__init__(meta=GeoTransolverPPMetaData())
@@ -397,7 +421,14 @@ class GeoTransolverPP(Module):
 
         def block(use_context: bool) -> _Block:
             return _Block(
-                n_hidden, n_head, n_latents, mlp_ratio, n_hidden, act, use_context
+                n_hidden,
+                n_head,
+                n_latents,
+                mlp_ratio,
+                n_hidden,
+                act,
+                use_context,
+                routing_temperature,
             )
 
         self.encoder = nn.ModuleList([block(False) for _ in range(n_encoder_layers)])
