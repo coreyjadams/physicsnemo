@@ -40,7 +40,6 @@ from jaxtyping import Float
 from physicsnemo.core.meta import ModelMetaData
 from physicsnemo.core.module import Module
 from physicsnemo.nn import Mlp
-from physicsnemo.nn.functional import knn
 
 
 @dataclass
@@ -158,6 +157,31 @@ class _Block(nn.Module):
         return x + self.mlp(self.norm_mlp(x, cond))
 
 
+# Largest distance matrix the neighbor search holds at once, in entries.
+_SEARCH_ENTRIES = 2**27
+
+
+@torch.no_grad()
+def _nearest(
+    tokens: Float[torch.Tensor, "B M 3"], points: Float[torch.Tensor, "B N 3"], k: int
+) -> torch.Tensor:
+    r"""Indices :math:`(B, N, k)` of the ``k`` tokens nearest each point.
+
+    Brute force in chunks of points, so memory stays bounded at any size.
+    """
+    step = max(1, _SEARCH_ENTRIES // max(1, tokens.shape[0] * tokens.shape[1]))
+    tokens = tokens.float()
+    return torch.cat(
+        [
+            torch.cdist(points[:, a : a + step].float(), tokens)
+            .topk(k, dim=-1, largest=False)
+            .indices
+            for a in range(0, points.shape[1], step)
+        ],
+        dim=1,
+    )
+
+
 class _NeighborAttention(nn.Module):
     r"""Each point attends over its nearest tokens within ``radius``.
 
@@ -223,9 +247,7 @@ class _NeighborAttention(nn.Module):
         token_log_measure: Float[torch.Tensor, "B M"],
     ) -> Float[torch.Tensor, "B N C"]:
         k = min(self.n_neighbors, token_points.shape[1])
-        index = torch.stack(
-            [knn(t, p, k)[0] for t, p in zip(token_points, points)]
-        ).long()  # (B, N, k)
+        index = _nearest(token_points, points, k)  # (B, N, k)
         batch = torch.arange(points.shape[0], device=points.device)[:, None, None]
         offsets = (points[:, :, None] - token_points[batch, index]) / self.radius
         distance = offsets.norm(dim=-1, keepdim=True)
@@ -455,7 +477,8 @@ class GeoTransolverPP(Module):
             )
         if global_features is None:
             global_features = points.new_zeros(points.shape[0], 0)
-        global_features = global_features.flatten(1)
+        # Datapipes compute per-case scales in float64; the model runs in the points' dtype.
+        global_features = global_features.flatten(1).to(points.dtype)
         if global_features.shape[-1] != self.n_global_features:
             raise ValueError(
                 f"Expected {self.n_global_features} global_features, "

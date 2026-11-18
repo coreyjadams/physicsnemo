@@ -176,6 +176,27 @@ def test_domain_finds_detached_body_among_walls():
         ).apply_to_domain(domain)
 
     a = run(torch.eye(3), torch.zeros(3))
+    # detached_from finds the same body and leaves the boundaries alone.
+    same = CanonicalFrameMesh(
+        detached_from=["no_slip"],
+        direction_fields={"inlet": "velocity"},
+        rescale=True,
+    ).apply_to_domain(
+        DomainMesh(
+            interior=Mesh(points=query),
+            boundaries={
+                "inlet": Mesh(
+                    points=shell.points,
+                    cells=shell.cells[front],
+                    cell_data={"velocity": velocity},
+                ),
+                "no_slip": Mesh(points=wall_points, cells=wall_cells),
+            },
+        )
+    )
+    torch.testing.assert_close(same.interior.points, a.interior.points)
+    assert same.boundary_names == ["inlet", "no_slip"]
+    assert same.boundaries["no_slip"].n_cells == len(wall_cells)
     # Moved, rotated and three times the size: same canonical coordinates.
     b = run(3 * _rotation(5).float(), torch.tensor([1.0, 2.0, 3.0]))
     torch.testing.assert_close(

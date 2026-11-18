@@ -522,8 +522,13 @@ class CanonicalFrameMesh(MeshTransform):
     Parameters
     ----------
     boundary_name : str or Sequence[str], optional
-        The boundary, or boundaries, that make up the body. Required for a
-        domain; ignored for a :class:`Mesh`.
+        The boundary, or boundaries, that make up the body. Ignored for a
+        :class:`Mesh`.
+    detached_from : Sequence[str], optional
+        Wall boundaries that hold the body among other walls: the body is
+        their cells that are detached from every other boundary, as
+        :class:`SplitDetachedCells` finds them. The boundaries themselves
+        are left as they are. Give this or ``boundary_name`` for a domain.
     direction_fields : Mapping[str, str | Sequence[str]], optional
         Boundary name to the ``cell_data`` field of a vector whose
         area-weighted mean direction is a tie-breaker (an inlet's prescribed
@@ -549,6 +554,7 @@ class CanonicalFrameMesh(MeshTransform):
     def __init__(
         self,
         boundary_name: str | Sequence[str] | None = None,
+        detached_from: Sequence[str] | None = None,
         direction_fields: Mapping[str, str | Sequence[str]] | None = None,
         rotate: bool = True,
         rescale: bool = False,
@@ -561,13 +567,21 @@ class CanonicalFrameMesh(MeshTransform):
         if isinstance(boundary_name, str):
             boundary_name = [boundary_name]
         self.boundary_name = None if boundary_name is None else list(boundary_name)
+        self.detached_from = None if detached_from is None else list(detached_from)
         self.direction_fields = dict(direction_fields or {})
         self.rotate = rotate
         self.rescale = rescale
         self.store_frame_as = store_frame_as
-        self.transform_point_data = transform_point_data
-        self.transform_cell_data = transform_cell_data
-        self.transform_global_data = transform_global_data
+        # A config mapping (OmegaConf) becomes the plain dict the mesh expects.
+        self.transform_point_data, self.transform_cell_data = (
+            dict(t) if isinstance(t, Mapping) else t
+            for t in (transform_point_data, transform_cell_data)
+        )
+        self.transform_global_data = (
+            dict(transform_global_data)
+            if isinstance(transform_global_data, Mapping)
+            else transform_global_data
+        )
 
     def _apply(
         self,
@@ -613,19 +627,27 @@ class CanonicalFrameMesh(MeshTransform):
 
     def apply_to_domain(self, domain: DomainMesh) -> DomainMesh:
         """Put the interior and every boundary in the frame of the body."""
-        if self.boundary_name is None:
-            raise ValueError(
-                "CanonicalFrameMesh needs boundary_name to find the body of a "
-                f"DomainMesh; available: {domain.boundary_names}"
+        if self.detached_from is not None:
+            prefix = "_detached_"
+            source = SplitDetachedCells(self.detached_from, prefix).apply_to_domain(
+                domain
             )
-        boundaries = domain.boundaries
-        body = [boundaries[n] for n in self.boundary_name]
+            body_names = [prefix + name for name in self.detached_from]
+        elif self.boundary_name is not None:
+            source, body_names = domain, self.boundary_name
+        else:
+            raise ValueError(
+                "CanonicalFrameMesh needs boundary_name or detached_from to find "
+                f"the body of a DomainMesh; available: {domain.boundary_names}"
+            )
+        boundaries = source.boundaries
+        body = [boundaries[n] for n in body_names]
         if all(b.n_cells == 0 for b in body) and any(b.n_points for b in body):
             # A point-cloud body has no areas and no neighbors to compare to.
             return self._apply(
                 domain, torch.cat([b.points.double() for b in body]), None
             )
-        others = [n for n in domain.boundary_names if n not in self.boundary_name]
+        others = [n for n in source.boundary_names if n not in body_names]
         faces = [_faces(b) for b in [*body, *(boundaries[n] for n in others)]]
         n_body = sum(b.n_cells for b in body)
         faces = [f for f in faces if f[1] is not None and len(f[1])]
